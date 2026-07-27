@@ -8,10 +8,15 @@ import {
   formatBytesPerSec,
   formatUptime,
   isPgStatusCompatibilityError,
+  KINGBASE_STATUS_SQL,
+  KINGBASE_VARIABLES_SQL,
+  OPENGAUSS_STATUS_SQL,
+  OPENGAUSS_VARIABLES_SQL,
   parsePgStatusRow,
   pgCacheHitRatio,
   PG_STATUS_LEGACY_SQL,
   PG_STATUS_SQL,
+  resolveServerDashboardDriver,
   statusNumber,
   supportsServerDashboard,
   type StatusSample,
@@ -132,6 +137,40 @@ describe("PG_STATUS_LEGACY_SQL", () => {
   });
 });
 
+describe("PostgreSQL-family status drivers", () => {
+  it("uses openGauss's pg catalog with xlog location functions", () => {
+    const driver = resolveServerDashboardDriver("opengauss");
+    expect(driver?.statusSql).toBe(OPENGAUSS_STATUS_SQL);
+    expect(driver?.variablesSql).toBe(OPENGAUSS_VARIABLES_SQL);
+    expect(OPENGAUSS_STATUS_SQL).toContain("FROM pg_catalog.pg_stat_database");
+    expect(OPENGAUSS_STATUS_SQL).toContain("FROM pg_catalog.pg_stat_activity");
+    expect(OPENGAUSS_STATUS_SQL).toContain("pg_current_xlog_location()");
+    expect(OPENGAUSS_STATUS_SQL).toContain("(pg_last_xlog_replay_location()).lsn");
+    expect(OPENGAUSS_STATUS_SQL).not.toContain("pg_xlog_location_diff(pg_last_xlog_replay_location()");
+    expect(OPENGAUSS_STATUS_SQL).not.toContain("pg_current_wal_lsn()");
+  });
+
+  it("uses KingbaseES's sys catalog and sys backend functions", () => {
+    const driver = resolveServerDashboardDriver("kingbase");
+    expect(driver?.statusSql).toBe(KINGBASE_STATUS_SQL);
+    expect(driver?.variablesSql).toBe(KINGBASE_VARIABLES_SQL);
+    expect(KINGBASE_STATUS_SQL).toContain("FROM sys_catalog.sys_stat_database");
+    expect(KINGBASE_STATUS_SQL).toContain("FROM sys_catalog.sys_stat_activity");
+    expect(KINGBASE_STATUS_SQL).toContain("sys_backend_pid()");
+    expect(KINGBASE_STATUS_SQL).toContain("sys_current_wal_lsn()");
+    expect(KINGBASE_STATUS_SQL).toContain("extract(epoch FROM CAST(CURRENT_TIMESTAMP AS TIMESTAMP))");
+    expect(KINGBASE_STATUS_SQL).toContain("extract(epoch FROM CAST(sys_postmaster_start_time() AS TIMESTAMP))");
+    expect(KINGBASE_STATUS_SQL).not.toContain("CURRENT_TIMESTAMP - sys_postmaster_start_time()");
+  });
+
+  it("keeps PostgreSQL's version fallback isolated to the PostgreSQL driver", () => {
+    expect(resolveServerDashboardDriver("postgres")?.fallbackStatusSql).toBe(PG_STATUS_LEGACY_SQL);
+    expect(resolveServerDashboardDriver("opengauss")?.fallbackStatusSql).toBeUndefined();
+    expect(resolveServerDashboardDriver("kingbase")?.fallbackStatusSql).toBeUndefined();
+    expect(resolveServerDashboardDriver("mysql")).toBeNull();
+  });
+});
+
 describe("isPgStatusCompatibilityError", () => {
   it("detects the WAL-function-not-found message on servers without a code field", () => {
     expect(isPgStatusCompatibilityError(new Error("function pg_current_wal_lsn() does not exist"))).toBe(true);
@@ -158,16 +197,20 @@ describe("isPgStatusCompatibilityError", () => {
 });
 
 describe("supportsServerDashboard", () => {
-  it("is true for postgres only", () => {
+  it("covers the validated PostgreSQL-kernel engines", () => {
     expect(supportsServerDashboard("postgres")).toBe(true);
     expect(supportsServerDashboard("mysql")).toBe(false);
-    expect(supportsServerDashboard("opengauss")).toBe(false);
-    expect(supportsServerDashboard("kingbase")).toBe(false);
+    expect(supportsServerDashboard("opengauss")).toBe(true);
+    expect(supportsServerDashboard("kingbase")).toBe(true);
     expect(supportsServerDashboard(undefined)).toBe(false);
   });
 
   it("gates on the connection's effective db type", () => {
     expect(connectionSupportsServerDashboard({ id: "pg", name: "Postgres", db_type: "postgres" } as any)).toBe(true);
+    expect(connectionSupportsServerDashboard({ id: "og", name: "openGauss", db_type: "opengauss" } as any)).toBe(true);
+    expect(connectionSupportsServerDashboard({ id: "og-import", name: "Imported openGauss", db_type: "gaussdb", driver_profile: "opengauss" } as any)).toBe(true);
+    expect(connectionSupportsServerDashboard({ id: "gauss", name: "GaussDB", db_type: "gaussdb", driver_profile: "gaussdb" } as any)).toBe(false);
+    expect(connectionSupportsServerDashboard({ id: "kb", name: "KingbaseES", db_type: "kingbase" } as any)).toBe(true);
     expect(connectionSupportsServerDashboard({ id: "jdbc-pg", name: "JDBC Postgres", db_type: "jdbc", connection_string: "jdbc:postgresql://localhost/db" } as any)).toBe(true);
     expect(connectionSupportsServerDashboard({ id: "mysql", name: "MySQL", db_type: "mysql" } as any)).toBe(false);
     expect(connectionSupportsServerDashboard(undefined)).toBe(false);

@@ -1,7 +1,21 @@
 import type { ConnectionConfig, DatabaseType, QueryResult } from "@/types/database";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { buildKillSql as buildMysqlKillSql, mapProcessRows as mapMysqlProcessRows, PROCESS_LIST_SQL as MYSQL_PROCESS_LIST_SQL, supportsProcessList as supportsMysqlProcessList } from "./mysqlProcessList";
-import { buildPgKillSql, isPgProcessListCompatibilityError, mapPgProcessRows, pgKillResultError, PG_OWN_SESSION_SQL, PG_PROCESS_LIST_LEGACY_SQL, PG_PROCESS_LIST_SQL, supportsPgProcessList } from "./postgresProcessList";
+import {
+  buildKingbaseKillSql,
+  buildPgKillSql,
+  isPgProcessListCompatibilityError,
+  kingbaseKillResultError,
+  KINGBASE_OWN_SESSION_SQL,
+  KINGBASE_PROCESS_LIST_SQL,
+  mapPgProcessRows,
+  OPENGAUSS_OWN_SESSION_SQL,
+  OPENGAUSS_PROCESS_LIST_SQL,
+  pgKillResultError,
+  PG_OWN_SESSION_SQL,
+  PG_PROCESS_LIST_LEGACY_SQL,
+  PG_PROCESS_LIST_SQL,
+} from "./postgresProcessList";
 
 /**
  * Engine-agnostic process-list model. Each supported engine contributes a driver
@@ -95,10 +109,34 @@ const POSTGRES_DRIVER: ProcessListDriver = {
   killResultError: pgKillResultError,
 };
 
+const OPENGAUSS_DRIVER: ProcessListDriver = {
+  listSql: OPENGAUSS_PROCESS_LIST_SQL,
+  ownSessionSql: OPENGAUSS_OWN_SESSION_SQL,
+  columns: POSTGRES_COLUMNS,
+  defaultSortKey: "time",
+  maxRows: 5000,
+  mapRows: (result) => mapPgProcessRows(result) as unknown as ProcessRow[],
+  buildKillSql: buildPgKillSql,
+  killResultError: pgKillResultError,
+};
+
+const KINGBASE_DRIVER: ProcessListDriver = {
+  listSql: KINGBASE_PROCESS_LIST_SQL,
+  ownSessionSql: KINGBASE_OWN_SESSION_SQL,
+  columns: POSTGRES_COLUMNS,
+  defaultSortKey: "time",
+  maxRows: 5000,
+  mapRows: (result) => mapPgProcessRows(result) as unknown as ProcessRow[],
+  buildKillSql: buildKingbaseKillSql,
+  killResultError: kingbaseKillResultError,
+};
+
 /** Resolve the process-list driver for a connection, or null if unsupported. */
 export function resolveProcessListDriver(dbType: DatabaseType | undefined): ProcessListDriver | null {
   if (supportsMysqlProcessList(dbType)) return MYSQL_DRIVER;
-  if (supportsPgProcessList(dbType)) return POSTGRES_DRIVER;
+  if (dbType === "postgres") return POSTGRES_DRIVER;
+  if (dbType === "opengauss") return OPENGAUSS_DRIVER;
+  if (dbType === "kingbase") return KINGBASE_DRIVER;
   return null;
 }
 
@@ -124,7 +162,9 @@ export function resolveProcessListDriverForConnection(connection: ConnectionConf
     const profile = [connection.driver_profile, connection.connection_string, connection.jdbc_driver_class, ...(connection.jdbc_driver_paths ?? [])].filter(Boolean).join("\n");
     if (MYSQL_LOOKALIKE_JDBC.test(profile)) return null;
   }
-  return resolveProcessListDriver(effectiveDatabaseTypeForConnection(connection));
+  const dbType = effectiveDatabaseTypeForConnection(connection);
+  if (dbType === "gaussdb" && connection.driver_profile?.toLowerCase() === "opengauss") return OPENGAUSS_DRIVER;
+  return resolveProcessListDriver(dbType);
 }
 
 /** Connection-aware process-list gate (mirrors the server-dashboard gate). */
