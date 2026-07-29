@@ -349,6 +349,7 @@ fn query_result(
         columns: result.columns,
         column_types: Vec::new(),
         column_sortables: vec![],
+        spatial_columns: vec![],
         rows: result.rows,
         affected_rows,
         execution_time_ms,

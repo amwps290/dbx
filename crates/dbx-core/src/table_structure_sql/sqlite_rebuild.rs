@@ -679,6 +679,7 @@ fn execute_change_transaction(
             columns: Vec::new(),
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: Vec::new(),
             affected_rows: 0,
             execution_time_ms: started_at.elapsed().as_millis(),
