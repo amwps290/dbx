@@ -3911,7 +3911,8 @@ mod tests {
         assert!(is_sqlserver_variant_column(&wildcard_columns[7]));
 
         let wildcard_rewritten = build_sqlserver_unsafe_type_query(wildcard_sql, &wildcard_columns).unwrap();
-        let wildcard_rows = client.query(wildcard_rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let wildcard_rows =
+            client.query(wildcard_rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(wildcard_rows.len(), 1);
         assert_eq!(wildcard_rows[0].columns()[0].name(), "ybbz");
         assert_eq!(wildcard_rows[0].columns()[4].name(), "ybbz");
