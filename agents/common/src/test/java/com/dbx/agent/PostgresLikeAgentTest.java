@@ -184,6 +184,27 @@ class PostgresLikeAgentTest {
         assertEquals(1, result.getRows().size());
         assertEquals(1, result.getRows().get(0).get(0));
         assertEquals("POINT(116.397 39.908)", result.getRows().get(0).get(1));
+        assertEquals(1, result.getSpatial_columns().size());
+        assertEquals(1, result.getSpatial_columns().get(0).getColumn_index());
+        assertEquals(4326, result.getSpatial_columns().get(0).getSrid());
+    }
+
+    @Test
+    void normalizeCollapsesFirstNonNullSridPerColumn() {
+        List<Object> firstRow = java.util.Arrays.asList(new SpatialValue("POINT(1 2)", null), "keep");
+        List<Object> secondRow = java.util.Arrays.asList(new SpatialValue("POINT(3 4)", 4326), "keep");
+        List<Object> thirdRow = java.util.Arrays.asList(new SpatialValue("POINT(5 6)", 3857), "keep");
+        List<List<Object>> rows = java.util.Arrays.asList(firstRow, secondRow, thirdRow);
+
+        QueryResult result = new QueryResult(
+            java.util.Arrays.asList("geom", "note"),
+            java.util.Arrays.asList("geometry", "text"),
+            rows, 0L, 0L, false);
+
+        assertEquals(
+            java.util.Collections.singletonList(new SpatialColumn(0, 4326)),
+            result.getSpatial_columns());
+        assertEquals("POINT(1 2)", result.getRows().get(0).get(0));
     }
 
     private static final class TestPostgresLikeAgent extends PostgresLikeAgent {
@@ -224,7 +245,7 @@ class PostgresLikeAgentTest {
                     if (rs.wasNull() || raw == null) {
                         return null;
                     }
-                    return EwkbWktDecoder.decode(raw);
+                    return EwkbWktDecoder.decodeSpatial(raw);
                 }
                 if (sqlType == Types.INTEGER) {
                     return rs.getInt(index);

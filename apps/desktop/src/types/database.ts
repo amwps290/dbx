@@ -552,6 +552,8 @@ export interface OwnerInfo {
 
 export interface QueryResult {
   columns: string[];
+  /** One SRID per geometry/geography column (first non-null observed). */
+  spatial_columns?: SpatialColumn[];
   /** Internal marker for a result built by appending a page to existing rows. */
   appended_from_row_count?: number;
   /** Set for synthesized query execution failures. */
@@ -624,6 +626,11 @@ export interface BatchSqlExecution {
   startedAt: number;
   finishedAt?: number;
   items: BatchStatementExecutionItem[];
+}
+
+export interface SpatialColumn {
+  column_index: number;
+  srid: number | null;
 }
 
 export interface QueryResultRun {

@@ -1,8 +1,8 @@
 use crate::query::MAX_ROWS;
 use crate::sql::starts_with_executable_sql_keyword;
 use crate::types::{
-    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryResult, TableInfo,
-    TriggerInfo,
+    ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, LinkedServerInfo, ObjectStatistics, QueryResult,
+    SpatialColumnBuilder, TableInfo, TriggerInfo,
 };
 use futures::{FutureExt, TryStreamExt};
 use sqlparser::ast::{Expr, Ident, SelectItem, SetExpr, Statement};
@@ -248,6 +248,56 @@ fn row_to_json(row: &tiberius::Row) -> Vec<serde_json::Value> {
     row.cells().map(|(_, cell)| sqlserver_cell_to_json(cell)).collect()
 }
 
+fn sqlserver_spatial_marker(value: serde_json::Value) -> (serde_json::Value, Option<u32>) {
+    let serde_json::Value::String(text) = value else {
+        return (value, None);
+    };
+    let Some(rest) = text.strip_prefix("SRID=") else {
+        return (serde_json::Value::String(text), None);
+    };
+    let Some((srid, wkt)) = rest.split_once(';') else {
+        return (serde_json::Value::String(text), None);
+    };
+    let Ok(srid) = srid.parse::<i64>() else {
+        return (serde_json::Value::String(wkt.to_string()), None);
+    };
+    let srid = u32::try_from(srid).ok().filter(|value| *value != 0);
+    (serde_json::Value::String(wkt.to_string()), srid)
+}
+
+fn row_to_json_with_spatial_metadata(
+    row: &tiberius::Row,
+    spatial_columns: &[SqlServerSpatialColumn],
+    on_srid: impl FnMut(usize, Option<u32>),
+) -> Vec<serde_json::Value> {
+    let mut values = row_to_json(row);
+    decode_sqlserver_spatial_values(&mut values, spatial_columns, on_srid);
+    values
+}
+
+fn decode_sqlserver_spatial_values(
+    values: &mut [serde_json::Value],
+    spatial_columns: &[SqlServerSpatialColumn],
+    mut on_srid: impl FnMut(usize, Option<u32>),
+) {
+    for spatial_column in spatial_columns {
+        let Some(value) = values.get_mut(spatial_column.column_index) else {
+            continue;
+        };
+        let (wkt, srid) = sqlserver_spatial_marker(std::mem::take(value));
+        *value = wkt;
+        on_srid(spatial_column.column_index, srid);
+    }
+}
+
+fn restore_sqlserver_spatial_column_types(column_types: &mut [String], spatial_columns: &[SqlServerSpatialColumn]) {
+    for spatial_column in spatial_columns {
+        if let Some(column_type) = column_types.get_mut(spatial_column.column_index) {
+            column_type.clone_from(&spatial_column.column_type);
+        }
+    }
+}
+
 fn columns_from_metadata(metadata: &tiberius::ResultMetadata) -> Vec<String> {
     metadata.columns().iter().map(|c| c.name().to_string()).collect()
 }
@@ -347,6 +397,7 @@ fn server_messages_query_result(messages: Vec<String>, start: Instant) -> Option
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -363,11 +414,13 @@ async fn collect_first_result_limited(
     mut stream: QueryStream<'_>,
     start: Instant,
     max_rows: Option<usize>,
+    spatial_columns: &[SqlServerSpatialColumn],
 ) -> Result<QueryResult, String> {
     let row_limit = query_result_row_limit(max_rows);
     let mut columns: Vec<String> = vec![];
     let mut column_types: Vec<String> = vec![];
     let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values = SpatialColumnBuilder::new(spatial_columns.iter().map(|column| column.column_index));
     let mut truncated = false;
 
     while let Some(item) = stream.try_next().await.map_err(|e| e.to_string())? {
@@ -375,11 +428,15 @@ async fn collect_first_result_limited(
             QueryItem::Metadata(metadata) if metadata.result_index() == 0 => {
                 columns = columns_from_metadata(&metadata);
                 column_types = column_types_from_metadata(&metadata);
+                restore_sqlserver_spatial_column_types(&mut column_types, spatial_columns);
             }
             QueryItem::Metadata(_) => {}
             QueryItem::Row(row) if row.result_index() == 0 => {
                 if rows.len() < row_limit {
-                    rows.push(row_to_json(&row));
+                    let values = row_to_json_with_spatial_metadata(&row, spatial_columns, |column_index, srid| {
+                        spatial_values.observe(column_index, srid);
+                    });
+                    rows.push(values);
                 } else {
                     truncated = true;
                 }
@@ -388,10 +445,13 @@ async fn collect_first_result_limited(
         }
     }
 
+    restore_sqlserver_spatial_column_types(&mut column_types, spatial_columns);
+
     Ok(QueryResult {
         columns,
         column_types,
         column_sortables: vec![],
+        spatial_columns: spatial_values.finish(),
         rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -425,6 +485,24 @@ struct SqlServerDescribedColumn {
     system_type_name: Option<String>,
     user_type_schema: Option<String>,
     user_type_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerSpatialColumn {
+    column_index: usize,
+    column_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SqlServerUnsafeTypeQuery {
+    sql: String,
+    spatial_columns: Vec<SqlServerSpatialColumn>,
+}
+
+impl SqlServerUnsafeTypeQuery {
+    fn plain(sql: &str) -> Self {
+        Self { sql: sql.to_string(), spatial_columns: Vec::new() }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -559,7 +637,10 @@ fn is_blocking_sqlserver_unsafe_probe_error(error: &str) -> bool {
     error.starts_with(SQLSERVER_UNSAFE_PROBE_BLOCK_ERROR_PREFIX)
 }
 
-async fn sqlserver_unsafe_type_query(client: &mut SqlServerClient, sql: &str) -> Result<Option<String>, String> {
+async fn sqlserver_unsafe_type_query(
+    client: &mut SqlServerClient,
+    sql: &str,
+) -> Result<Option<SqlServerUnsafeTypeQuery>, String> {
     if !is_single_sqlserver_select(sql) {
         return Ok(None);
     }
@@ -656,7 +737,10 @@ fn sqlserver_wildcard_projection_probe(statement: &str, nonce: &str) -> Option<S
     Some(SqlServerWildcardProjectionProbe { statement: query.to_string(), output_name_overrides })
 }
 
-fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedColumn]) -> Option<String> {
+fn build_sqlserver_unsafe_type_query(
+    sql: &str,
+    columns: &[SqlServerDescribedColumn],
+) -> Option<SqlServerUnsafeTypeQuery> {
     if columns.is_empty() || !columns.iter().any(is_sqlserver_unsafe_column) {
         return None;
     }
@@ -674,7 +758,9 @@ fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedCol
             let source_column = quote_sqlserver_identifier(&source_columns[index]);
             let value_ref = format!("{source_alias}.{source_column}");
             if is_sqlserver_spatial_column(column) {
-                format!("{quoted_output} = CASE WHEN {value_ref} IS NULL THEN NULL ELSE {value_ref}.STAsText() END")
+                format!(
+                    "{quoted_output} = CASE WHEN {value_ref} IS NULL THEN NULL ELSE N'SRID=' + CONVERT(nvarchar(20), {value_ref}.STSrid) + N';' + {value_ref}.STAsText() END"
+                )
             } else if is_sqlserver_variant_column(column) {
                 format!("{quoted_output} = CAST({value_ref} AS NVARCHAR(MAX))")
             } else {
@@ -684,7 +770,18 @@ fn build_sqlserver_unsafe_type_query(sql: &str, columns: &[SqlServerDescribedCol
         .collect::<Vec<_>>()
         .join(", ");
 
-    Some(format!("SELECT {select_list} FROM ({statement}) AS {source_alias}({source_alias_list})"))
+    let spatial_columns = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(column_index, column)| {
+            sqlserver_spatial_column_type(column)
+                .map(|column_type| SqlServerSpatialColumn { column_index, column_type: column_type.to_string() })
+        })
+        .collect();
+    Some(SqlServerUnsafeTypeQuery {
+        sql: format!("SELECT {select_list} FROM ({statement}) AS {source_alias}({source_alias_list})"),
+        spatial_columns,
+    })
 }
 
 fn is_sqlserver_unsafe_column(column: &SqlServerDescribedColumn) -> bool {
@@ -692,12 +789,19 @@ fn is_sqlserver_unsafe_column(column: &SqlServerDescribedColumn) -> bool {
 }
 
 fn is_sqlserver_spatial_column(column: &SqlServerDescribedColumn) -> bool {
-    [&column.system_type_name, &column.user_type_name].into_iter().flatten().any(|name| {
+    sqlserver_spatial_column_type(column).is_some()
+}
+
+fn sqlserver_spatial_column_type(column: &SqlServerDescribedColumn) -> Option<&'static str> {
+    [&column.system_type_name, &column.user_type_name].into_iter().flatten().find_map(|name| {
         let normalized = name.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-        normalized == "geometry"
-            || normalized == "geography"
-            || normalized.ends_with(".geometry")
-            || normalized.ends_with(".geography")
+        if normalized == "geometry" || normalized.ends_with(".geometry") {
+            Some("geometry")
+        } else if normalized == "geography" || normalized.ends_with(".geography") {
+            Some("geography")
+        } else {
+            None
+        }
     })
 }
 
@@ -913,6 +1017,7 @@ fn push_sqlserver_result_set(results: &mut Vec<QueryResult>, result: Option<SqlS
             columns: result.columns,
             column_types: result.column_types,
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: result.rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -971,13 +1076,13 @@ pub async fn stream_first_result_set(
     cancel_token: Option<CancellationToken>,
     mut on_item: impl for<'a> FnMut(SqlServerStreamItem<'a>) -> Result<(), String>,
 ) -> Result<SqlServerStreamExportSummary, String> {
-    let query_sql = match sqlserver_unsafe_type_query(client, sql).await {
-        Ok(Some(sql)) => sql,
-        Ok(None) => sql.to_string(),
+    let query = match sqlserver_unsafe_type_query(client, sql).await {
+        Ok(Some(query)) => query,
+        Ok(None) => SqlServerUnsafeTypeQuery::plain(sql),
         Err(error) if is_blocking_sqlserver_unsafe_probe_error(&error) => return Err(error),
-        Err(_) => sql.to_string(),
+        Err(_) => SqlServerUnsafeTypeQuery::plain(sql),
     };
-    let mut stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
+    let mut stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
     let mut active_result_index: Option<usize> = None;
     let mut columns: Vec<String> = Vec::new();
     let mut column_types: Vec<String> = Vec::new();
@@ -1007,6 +1112,7 @@ pub async fn stream_first_result_set(
                     active_result_index = Some(metadata.result_index());
                     columns = columns_from_metadata(&metadata);
                     column_types = column_types_from_metadata(&metadata);
+                    restore_sqlserver_spatial_column_types(&mut column_types, &query.spatial_columns);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
                     columns_emitted = true;
                 }
@@ -1016,6 +1122,7 @@ pub async fn stream_first_result_set(
                     active_result_index = Some(row.result_index());
                     columns = row.columns().iter().map(|c| c.name().to_string()).collect();
                     column_types = row.columns().iter().map(sqlserver_column_type_name).collect();
+                    restore_sqlserver_spatial_column_types(&mut column_types, &query.spatial_columns);
                     on_item(SqlServerStreamItem::Columns { columns: &columns, column_types: &column_types })?;
                     columns_emitted = true;
                 }
@@ -1025,7 +1132,7 @@ pub async fn stream_first_result_set(
                 if row_limit.is_some_and(|limit| rows_exported as usize >= limit) {
                     break;
                 }
-                let values = row_to_json(&row);
+                let values = row_to_json_with_spatial_metadata(&row, &query.spatial_columns, |_, _| {});
                 on_item(SqlServerStreamItem::Row(&values))?;
                 rows_exported += 1;
             }
@@ -2146,15 +2253,15 @@ pub async fn execute_query_with_max_rows(
     let start = Instant::now();
 
     if starts_with_executable_sql_keyword(sql, &["SELECT", "EXEC", "WITH", "TABLE"]) {
-        let query_sql = match sqlserver_unsafe_type_query(client, sql).await {
-            Ok(Some(sql)) => sql,
-            Ok(None) => sql.to_string(),
+        let query = match sqlserver_unsafe_type_query(client, sql).await {
+            Ok(Some(query)) => query,
+            Ok(None) => SqlServerUnsafeTypeQuery::plain(sql),
             Err(error) if is_blocking_sqlserver_unsafe_probe_error(&error) => return Err(error),
-            Err(_) => sql.to_string(),
+            Err(_) => SqlServerUnsafeTypeQuery::plain(sql),
         };
         let (result, messages) = capture_sqlserver_messages(async {
-            let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-            sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await
+            let stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
+            sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows, &query.spatial_columns)).await
         })
         .await;
         let mut result = query_result_with_server_messages(result?, messages);
@@ -2172,6 +2279,7 @@ pub async fn execute_query_with_max_rows(
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
                 rows: vec![],
                 affected_rows: 0,
                 execution_time_ms: start.elapsed().as_millis(),
@@ -2190,6 +2298,7 @@ pub async fn execute_query_with_max_rows(
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
                 rows: vec![],
                 affected_rows: result.rows_affected().iter().sum::<u64>(),
                 execution_time_ms: start.elapsed().as_millis(),
@@ -2221,6 +2330,7 @@ pub async fn execute_batch_with_max_rows(
                 columns: vec![],
                 column_types: Vec::new(),
                 column_sortables: vec![],
+                spatial_columns: vec![],
                 rows: vec![],
                 affected_rows: result.rows_affected().iter().sum::<u64>(),
                 execution_time_ms: start.elapsed().as_millis(),
@@ -2235,10 +2345,16 @@ pub async fn execute_batch_with_max_rows(
 
     if is_single_sqlserver_select(sql) {
         match sqlserver_unsafe_type_query(client, sql).await {
-            Ok(Some(query_sql)) => {
+            Ok(Some(query)) => {
                 let (result, messages) = capture_sqlserver_messages(async {
-                    let stream = sqlserver_driver_result(client.query(query_sql.as_str(), &[])).await?;
-                    sqlserver_driver_result(collect_first_result_limited(stream, start, max_rows)).await
+                    let stream = sqlserver_driver_result(client.query(query.sql.as_str(), &[])).await?;
+                    sqlserver_driver_result(collect_first_result_limited(
+                        stream,
+                        start,
+                        max_rows,
+                        &query.spatial_columns,
+                    ))
+                    .await
                 })
                 .await;
                 return result.map(|result| {
@@ -2282,6 +2398,7 @@ pub async fn execute_simple_batch_with_max_rows(
             columns: vec![],
             column_types: Vec::new(),
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -2478,17 +2595,18 @@ fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, format_sqlserver_numeric,
-        is_blocking_sqlserver_unsafe_probe_error, is_sqlserver_spatial_column, is_sqlserver_variant_column,
-        query_result_with_server_messages, requires_simple_query_batch, restore_sqlserver_legacy_probe_output_names,
+        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, decode_sqlserver_spatial_values,
+        format_sqlserver_numeric, is_blocking_sqlserver_unsafe_probe_error, is_sqlserver_spatial_column,
+        is_sqlserver_variant_column, query_result_with_server_messages, requires_simple_query_batch,
+        restore_sqlserver_legacy_probe_output_names, restore_sqlserver_spatial_column_types,
         sqlserver_batch_can_use_execute, sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql,
         sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_filter_definition_error,
         sqlserver_hidden_schema_names, sqlserver_indexes_sql, sqlserver_legacy_indexes_sql, sqlserver_legacy_probe,
         sqlserver_legacy_probe_with_nonce, sqlserver_list_objects_sql, sqlserver_list_schemas_sql,
         sqlserver_list_tables_sql, sqlserver_probe_explicit_alias, sqlserver_schema_name_predicate,
-        sqlserver_table_comment_sql, sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column,
-        SqlServerDescribedColumn, SqlServerProbeOutputNameOverride, SqlServerResultSet,
-        SQLSERVER_RESULT_TYPE_PROBE_SQL,
+        sqlserver_spatial_marker, sqlserver_table_comment_sql, sqlserver_visible_object_predicate,
+        strip_dbx_sqlserver_row_number_column, SqlServerDescribedColumn, SqlServerProbeOutputNameOverride,
+        SqlServerResultSet, SqlServerSpatialColumn, SQLSERVER_RESULT_TYPE_PROBE_SQL,
     };
     use crate::types::{
         CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest, QueryResult,
@@ -2523,6 +2641,7 @@ mod tests {
             columns: vec![],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -2539,6 +2658,7 @@ mod tests {
             columns: vec!["id".to_string()],
             column_types: vec!["int".to_string()],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![vec![serde_json::json!(1)]],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -3253,6 +3373,7 @@ mod tests {
             columns: vec!["id".to_string(), "__dbx_row_num".to_string()],
             column_types: vec!["int".to_string(), "bigint".to_string()],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![vec![serde_json::json!(42), serde_json::json!(101)]],
             affected_rows: 0,
             execution_time_ms: 1,
@@ -3313,9 +3434,60 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            rewritten,
-            "SELECT [landId] = [dbx_unsafe_source].[dbx_col_1], [polygon] = CASE WHEN [dbx_unsafe_source].[dbx_col_2] IS NULL THEN NULL ELSE [dbx_unsafe_source].[dbx_col_2].STAsText() END FROM (SELECT * FROM dbo.tLandPolygon) AS [dbx_unsafe_source]([dbx_col_1], [dbx_col_2])"
+            rewritten.sql,
+            "SELECT [landId] = [dbx_unsafe_source].[dbx_col_1], [polygon] = CASE WHEN [dbx_unsafe_source].[dbx_col_2] IS NULL THEN NULL ELSE N'SRID=' + CONVERT(nvarchar(20), [dbx_unsafe_source].[dbx_col_2].STSrid) + N';' + [dbx_unsafe_source].[dbx_col_2].STAsText() END FROM (SELECT * FROM dbo.tLandPolygon) AS [dbx_unsafe_source]([dbx_col_1], [dbx_col_2])"
         );
+        assert_eq!(
+            rewritten.spatial_columns,
+            vec![SqlServerSpatialColumn { column_index: 1, column_type: "geometry".to_string() }]
+        );
+    }
+
+    #[test]
+    fn sqlserver_spatial_marker_keeps_wkt_and_extracts_srid() {
+        let (value, srid) = sqlserver_spatial_marker(serde_json::json!("SRID=3857;POINT(1 2)"));
+        assert_eq!(value, serde_json::json!("POINT(1 2)"));
+        assert_eq!(srid, Some(3857));
+    }
+
+    #[test]
+    fn sqlserver_spatial_marker_treats_non_positive_srid_as_unknown_without_leaking_ewkt() {
+        for marker in ["SRID=0;POINT(1 2)", "SRID=-1;POINT(1 2)"] {
+            let (value, srid) = sqlserver_spatial_marker(serde_json::json!(marker));
+            assert_eq!(value, serde_json::json!("POINT(1 2)"));
+            assert_eq!(srid, None);
+        }
+    }
+
+    #[test]
+    fn sqlserver_only_decodes_described_spatial_columns() {
+        let mut values = vec![serde_json::json!("SRID=4326;POINT(1 2)"), serde_json::json!("SRID=3857;POINT(3 4)")];
+        let mut srids = Vec::new();
+        decode_sqlserver_spatial_values(
+            &mut values,
+            &[SqlServerSpatialColumn { column_index: 1, column_type: "geography".to_string() }],
+            |column_index, srid| srids.push((column_index, srid)),
+        );
+
+        assert_eq!(values[0], serde_json::json!("SRID=4326;POINT(1 2)"));
+        assert_eq!(values[1], serde_json::json!("POINT(3 4)"));
+        assert_eq!(srids, vec![(1, Some(3857))]);
+    }
+
+    #[test]
+    fn sqlserver_restores_geography_type_even_when_all_values_are_null() {
+        let spatial_columns = vec![SqlServerSpatialColumn { column_index: 1, column_type: "geography".to_string() }];
+        let mut column_types = vec!["int".to_string(), "nvarchar".to_string()];
+        restore_sqlserver_spatial_column_types(&mut column_types, &spatial_columns);
+
+        assert_eq!(column_types, vec!["int", "geography"]);
+        let mut values = vec![serde_json::json!(1), serde_json::Value::Null];
+        let mut srids = Vec::new();
+        decode_sqlserver_spatial_values(&mut values, &spatial_columns, |column_index, srid| {
+            srids.push((column_index, srid));
+        });
+        assert_eq!(srids, vec![(1, None)]);
+        assert_eq!(values[1], serde_json::Value::Null);
     }
 
     #[test]
@@ -3357,9 +3529,9 @@ mod tests {
 
         // ORDER BY is stripped from the inner query so it can be used as a
         // derived table subquery across all SQL Server versions (2008–2022).
-        assert!(!rewritten.contains("ORDER BY"));
-        assert!(rewritten.contains("FROM dbo.tLandPolygon"));
-        assert!(rewritten.contains(".STAsText()"));
+        assert!(!rewritten.sql.contains("ORDER BY"));
+        assert!(rewritten.sql.contains("FROM dbo.tLandPolygon"));
+        assert!(rewritten.sql.contains(".STAsText()"));
     }
 
     #[test]
@@ -3589,11 +3761,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rewritten.contains("CAST("));
-        assert!(rewritten.contains("AS NVARCHAR(MAX))"));
-        assert!(rewritten.contains("FROM sys.extended_properties"));
+        assert!(rewritten.sql.contains("CAST("));
+        assert!(rewritten.sql.contains("AS NVARCHAR(MAX))"));
+        assert!(rewritten.sql.contains("FROM sys.extended_properties"));
         // The name column should not be cast
-        assert_eq!(rewritten.matches("CAST(").count(), 1);
+        assert_eq!(rewritten.sql.matches("CAST(").count(), 1);
     }
 
     #[test]
@@ -3639,10 +3811,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(rewritten.contains(".STAsText()"));
-        assert!(rewritten.contains("CAST("));
-        assert!(rewritten.contains("AS NVARCHAR(MAX))"));
-        assert!(rewritten.contains("FROM dbo.t"));
+        assert!(rewritten.sql.contains(".STAsText()"));
+        assert!(rewritten.sql.contains("CAST("));
+        assert!(rewritten.sql.contains("AS NVARCHAR(MAX))"));
+        assert!(rewritten.sql.contains("FROM dbo.t"));
     }
 
     #[tokio::test]
@@ -3684,7 +3856,7 @@ mod tests {
         assert!(is_sqlserver_variant_column(&legacy_columns[1]));
 
         let rewritten = build_sqlserver_unsafe_type_query(sql, &legacy_columns).unwrap();
-        let legacy_rows = client.query(rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let legacy_rows = client.query(rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(legacy_rows[0].get::<i32, _>(0), Some(1));
         assert_eq!(legacy_rows[0].get::<&str, _>(1), Some("legacy"));
 
@@ -3705,7 +3877,8 @@ mod tests {
         assert!(is_sqlserver_variant_column(&duplicate_columns[1]));
 
         let duplicate_rewritten = build_sqlserver_unsafe_type_query(duplicate_sql, &duplicate_columns).unwrap();
-        let duplicate_rows = client.query(duplicate_rewritten, &[]).await.unwrap().into_first_result().await.unwrap();
+        let duplicate_rows =
+            client.query(duplicate_rewritten.sql.as_str(), &[]).await.unwrap().into_first_result().await.unwrap();
         assert_eq!(duplicate_rows[0].columns()[0].name(), "HJRQ");
         assert_eq!(duplicate_rows[0].columns()[1].name(), "HJRQ");
         assert_eq!(duplicate_rows[0].get::<i32, _>(0), Some(1));

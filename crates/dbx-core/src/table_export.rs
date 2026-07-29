@@ -375,6 +375,7 @@ async fn fetch_table_export_batch(
             columns: col_names.to_vec(),
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: Vec::new(),
             affected_rows: 0,
             execution_time_ms: 0,

@@ -144,6 +144,22 @@ describe("tab result cache statement execution metadata", () => {
     });
   });
 
+  it("preserves spatial metadata", () => {
+    const encoded = encodeTabResultSnapshot({
+      result: {
+        columns: ["geom"],
+        column_types: ["geometry"],
+        spatial_columns: [{ column_index: 0, srid: 4326 }],
+        rows: [["POINT(116.397 39.908)"], ["POINT(12957255 4852583)"], [null]],
+        affected_rows: 0,
+        execution_time_ms: 1,
+      },
+      cachedAt: 1,
+    });
+
+    expect(decodeTabResultSnapshot(encoded).result?.spatial_columns).toEqual([{ column_index: 0, srid: 4326 }]);
+  });
+
   it("restores multi-result, pagination, local-sort, and editable metadata fixtures", () => {
     const restored = decodeTabResultSnapshot(encodeTabResultSnapshot(queryResultLifecycleSnapshot()));
 

@@ -2885,6 +2885,7 @@ mod tests {
             columns: vec!["table_name".to_string(), "table_type".to_string()],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![
                 vec![serde_json::json!("daily_revenue"), serde_json::json!("BASE TABLE")],
                 vec![serde_json::json!("revenue_view"), serde_json::json!("VIEW")],
@@ -2918,6 +2919,7 @@ mod tests {
             ],
             column_types: vec![],
             column_sortables: vec![],
+            spatial_columns: vec![],
             rows: vec![
                 vec![
                     serde_json::json!("amount"),
@@ -3102,6 +3104,7 @@ mod tests {
             columns: vec!["COMMENTS".to_string()],
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: vec![vec![serde_json::json!("Customer table")]],
             affected_rows: 0,
             execution_time_ms: 0,
@@ -3117,6 +3120,7 @@ mod tests {
             columns: vec!["COMMENTS".to_string()],
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: vec![vec![serde_json::json!("  ")]],
             affected_rows: 0,
             execution_time_ms: 0,
@@ -3147,6 +3151,7 @@ mod tests {
             columns: vec!["TABLE_NAME".to_string(), "COMMENTS".to_string()],
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: vec![
                 vec![serde_json::json!("ORDERS"), serde_json::json!("Orders table")],
                 vec![serde_json::json!("PRODUCTS"), serde_json::json!(" ")],
@@ -3245,6 +3250,7 @@ mod tests {
             ],
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: vec![
                 vec![
                     serde_json::json!("id"),
@@ -3359,6 +3365,7 @@ mod tests {
             ],
             column_types: Vec::new(),
             column_sortables: Vec::new(),
+            spatial_columns: vec![],
             rows: vec![
                 vec![
                     serde_json::json!("ORDERS"),
