@@ -2,9 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { QueryResult } from "@/types/database";
 import {
   buildKingbaseKillSql,
+  buildKingbasePgKillSql,
   buildPgKillSql,
+  isKingbaseOwnSessionCatalogCompatibilityError,
+  isKingbaseProcessListCatalogCompatibilityError,
+  isKingbaseTerminateCatalogCompatibilityError,
   isPgProcessListCompatibilityError,
   KINGBASE_OWN_SESSION_SQL,
+  KINGBASE_PG_OWN_SESSION_SQL,
+  KINGBASE_PG_PROCESS_LIST_SQL,
   KINGBASE_PROCESS_LIST_SQL,
   mapPgProcessRows,
   OPENGAUSS_OWN_SESSION_SQL,
@@ -90,6 +96,25 @@ describe("PostgreSQL-family process SQL", () => {
     expect(KINGBASE_PROCESS_LIST_SQL).toContain("extract(epoch FROM CAST(coalesce(query_start, xact_start, backend_start) AS TIMESTAMP))");
     expect(KINGBASE_PROCESS_LIST_SQL).not.toContain("CURRENT_TIMESTAMP - coalesce(query_start");
     expect(driver?.buildKillSql(7)).toBe("SELECT sys_terminate_backend(7)");
+  });
+
+  it("provides pg_catalog fallbacks for pg-compatible KingbaseES servers", () => {
+    const driver = resolveProcessListDriver("kingbase");
+    expect(driver?.fallbackListSql).toBe(KINGBASE_PG_PROCESS_LIST_SQL);
+    expect(driver?.fallbackOwnSessionSql).toBe(KINGBASE_PG_OWN_SESSION_SQL);
+    expect(driver?.buildFallbackKillSql?.(7)).toBe("SELECT pg_terminate_backend(7)");
+    expect(KINGBASE_PG_PROCESS_LIST_SQL).toContain("FROM pg_catalog.pg_stat_activity");
+    expect(KINGBASE_PG_PROCESS_LIST_SQL).not.toContain("sys_catalog");
+    expect(buildKingbasePgKillSql(4211)).toBe("SELECT pg_terminate_backend(4211)");
+  });
+
+  it("retries only missing sys relation/function errors", () => {
+    expect(isKingbaseProcessListCatalogCompatibilityError(new Error('relation "sys_catalog.sys_stat_activity" does not exist (SQLSTATE 42P01)'))).toBe(true);
+    expect(isKingbaseOwnSessionCatalogCompatibilityError(Object.assign(new Error("function sys_backend_pid() does not exist"), { code: "42883" }))).toBe(true);
+    expect(isKingbaseTerminateCatalogCompatibilityError(new Error("function sys_terminate_backend(integer) does not exist (SQLSTATE 42883)"))).toBe(true);
+    expect(isKingbaseProcessListCatalogCompatibilityError(Object.assign(new Error("permission denied for relation sys_catalog.sys_stat_activity"), { code: "42501" }))).toBe(false);
+    expect(isKingbaseOwnSessionCatalogCompatibilityError(new Error("authentication failed for sys_backend_pid"))).toBe(false);
+    expect(isKingbaseTerminateCatalogCompatibilityError(new Error("connection refused"))).toBe(false);
   });
 });
 

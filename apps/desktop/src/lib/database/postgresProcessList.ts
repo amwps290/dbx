@@ -1,4 +1,5 @@
 import type { QueryResult } from "@/types/database";
+import { isMissingKingbaseSysFunction, isMissingKingbaseSysRelation } from "@/lib/database/kingbaseCatalogCompatibility";
 
 /**
  * PostgreSQL "current activity / process list" helpers. Pure and framework-free
@@ -72,10 +73,13 @@ export const KINGBASE_PROCESS_LIST_SQL = `SELECT pid,
 FROM sys_catalog.sys_stat_activity
 ORDER BY time DESC NULLS LAST`;
 
+export const KINGBASE_PG_PROCESS_LIST_SQL = KINGBASE_PROCESS_LIST_SQL.replace("sys_catalog.sys_stat_activity", "pg_catalog.pg_stat_activity");
+
 /** Scalar query that returns the viewer's own backend pid. */
 export const PG_OWN_SESSION_SQL = "SELECT pg_backend_pid()";
 export const OPENGAUSS_OWN_SESSION_SQL = "SELECT pg_backend_pid()";
 export const KINGBASE_OWN_SESSION_SQL = "SELECT sys_backend_pid()";
+export const KINGBASE_PG_OWN_SESSION_SQL = "SELECT pg_backend_pid()";
 
 export interface PgProcessRow {
   id: number;
@@ -165,6 +169,11 @@ export function buildKingbaseKillSql(pid: number): string {
   return `SELECT sys_terminate_backend(${pid})`;
 }
 
+export function buildKingbasePgKillSql(pid: number): string {
+  validateBackendPid(pid);
+  return `SELECT pg_terminate_backend(${pid})`;
+}
+
 /** Return an error when PostgreSQL declines to terminate the target backend. */
 export function pgKillResultError(results: QueryResult[]): string | null {
   return backendKillResultError(results, "pg_terminate_backend");
@@ -172,6 +181,10 @@ export function pgKillResultError(results: QueryResult[]): string | null {
 
 export function kingbaseKillResultError(results: QueryResult[]): string | null {
   return backendKillResultError(results, "sys_terminate_backend");
+}
+
+export function kingbasePgKillResultError(results: QueryResult[]): string | null {
+  return backendKillResultError(results, "pg_terminate_backend");
 }
 
 function backendKillResultError(results: QueryResult[], functionName: string): string | null {
@@ -187,4 +200,16 @@ export function isPgProcessListCompatibilityError(error: unknown): boolean {
   if (code === "42703") return true;
   const message = error instanceof Error ? error.message : String(error);
   return /(?:wait_event_type|wait_event).*(?:does not exist|42703)|(?:does not exist|42703).*(?:wait_event_type|wait_event)/i.test(message);
+}
+
+export function isKingbaseProcessListCatalogCompatibilityError(error: unknown): boolean {
+  return isMissingKingbaseSysRelation(error, ["sys_catalog.sys_stat_activity"]);
+}
+
+export function isKingbaseOwnSessionCatalogCompatibilityError(error: unknown): boolean {
+  return isMissingKingbaseSysFunction(error, ["sys_backend_pid"]);
+}
+
+export function isKingbaseTerminateCatalogCompatibilityError(error: unknown): boolean {
+  return isMissingKingbaseSysFunction(error, ["sys_terminate_backend"]);
 }

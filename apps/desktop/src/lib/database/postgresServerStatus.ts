@@ -1,5 +1,6 @@
 import type { ConnectionConfig, DatabaseType, QueryResult } from "@/types/database";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { isMissingKingbaseSysFunction, isMissingKingbaseSysRelation } from "@/lib/database/kingbaseCatalogCompatibility";
 import { computeRate, formatBytes, formatBytesPerSec, formatNumber, formatRate, formatUptime, statusEntries, statusNumber, type StatusEntry, type StatusMap, type StatusSample } from "@/lib/database/serverMetrics";
 
 /**
@@ -146,7 +147,8 @@ export const OPENGAUSS_VARIABLES_SQL = "SELECT current_setting('max_connections'
  * numerically because MySQL mode types CURRENT_TIMESTAMP as datetime while the
  * monitoring functions return timestamp with time zone.
  */
-export const KINGBASE_STATUS_SQL = `WITH db_stats AS (
+function buildKingbaseStatusSql(catalog: "sys_catalog" | "pg_catalog", prefix: "sys" | "pg"): string {
+  return `WITH db_stats AS (
   SELECT
     coalesce(sum(xact_commit),0) AS xact_commit,
     coalesce(sum(xact_rollback),0) AS xact_rollback,
@@ -159,28 +161,32 @@ export const KINGBASE_STATUS_SQL = `WITH db_stats AS (
     coalesce(sum(tup_deleted),0) AS tup_deleted,
     coalesce(sum(deadlocks),0) AS deadlocks,
     coalesce(sum(temp_files),0) AS temp_files
-  FROM sys_catalog.sys_stat_database
+  FROM ${catalog}.${prefix}_stat_database
 ), activity_stats AS (
   SELECT
     coalesce(sum(CASE WHEN state IS NOT NULL THEN 1 ELSE 0 END),0) AS connections,
     coalesce(sum(CASE WHEN state = 'active' THEN 1 ELSE 0 END),0) AS active_connections,
     coalesce(sum(CASE WHEN state = 'idle' THEN 1 ELSE 0 END),0) AS idle_connections
-  FROM sys_catalog.sys_stat_activity
-  WHERE pid <> sys_backend_pid()
+  FROM ${catalog}.${prefix}_stat_activity
+  WHERE pid <> ${prefix}_backend_pid()
 )
 SELECT
   db_stats.*,
   activity_stats.*,
-  coalesce(CASE WHEN sys_is_in_recovery()
-    THEN sys_wal_lsn_diff(sys_last_wal_replay_lsn(), '0/0')
-    ELSE sys_wal_lsn_diff(sys_current_wal_lsn(), '0/0')
+  coalesce(CASE WHEN ${prefix}_is_in_recovery()
+    THEN ${prefix}_wal_lsn_diff(${prefix}_last_wal_replay_lsn(), '0/0')
+    ELSE ${prefix}_wal_lsn_diff(${prefix}_current_wal_lsn(), '0/0')
   END, 0) AS wal_bytes,
   CAST(floor(
     extract(epoch FROM CAST(CURRENT_TIMESTAMP AS TIMESTAMP))
-    - extract(epoch FROM CAST(sys_postmaster_start_time() AS TIMESTAMP))
+    - extract(epoch FROM CAST(${prefix}_postmaster_start_time() AS TIMESTAMP))
   ) AS BIGINT) AS uptime_seconds
 FROM db_stats
 CROSS JOIN activity_stats`;
+}
+
+export const KINGBASE_STATUS_SQL = buildKingbaseStatusSql("sys_catalog", "sys");
+export const KINGBASE_PG_STATUS_SQL = buildKingbaseStatusSql("pg_catalog", "pg");
 
 export const KINGBASE_VARIABLES_SQL = "SELECT current_setting('max_connections') AS max_connections, version() AS version";
 
@@ -222,6 +228,10 @@ export function isOpenGaussReplayRecordError(error: unknown): boolean {
   return /\blsn\b/i.test(message) && /(?:composite|record data type|column notation|identify column)/i.test(message);
 }
 
+export function isKingbaseStatusCatalogCompatibilityError(error: unknown): boolean {
+  return isMissingKingbaseSysRelation(error, ["sys_catalog.sys_stat_database", "sys_catalog.sys_stat_activity"]) || isMissingKingbaseSysFunction(error, ["sys_backend_pid", "sys_is_in_recovery", "sys_wal_lsn_diff", "sys_last_wal_replay_lsn", "sys_current_wal_lsn", "sys_postmaster_start_time"]);
+}
+
 const POSTGRES_STATUS_DRIVER: PgServerStatusDriver = {
   statusSql: PG_STATUS_SQL,
   variablesSql: PG_VARIABLES_SQL,
@@ -239,6 +249,8 @@ const OPENGAUSS_STATUS_DRIVER: PgServerStatusDriver = {
 const KINGBASE_STATUS_DRIVER: PgServerStatusDriver = {
   statusSql: KINGBASE_STATUS_SQL,
   variablesSql: KINGBASE_VARIABLES_SQL,
+  fallbackStatusSql: KINGBASE_PG_STATUS_SQL,
+  shouldUseFallbackStatusSql: isKingbaseStatusCatalogCompatibilityError,
 };
 
 /** Resolve the SQL contract used by the shared PostgreSQL-family dashboard. */
