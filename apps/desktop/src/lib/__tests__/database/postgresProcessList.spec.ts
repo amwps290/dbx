@@ -12,7 +12,6 @@ import {
   pgKillResultError,
   PG_PROCESS_LIST_LEGACY_SQL,
   PG_PROCESS_LIST_SQL,
-  supportsPgProcessList,
 } from "@/lib/database/postgresProcessList";
 import { connectionSupportsProcessList, resolveProcessListDriver, resolveProcessListDriverForConnection, supportsProcessList } from "@/lib/database/processListDrivers";
 import type { ConnectionConfig } from "@/types/database";
@@ -112,18 +111,6 @@ describe("Postgres compatibility", () => {
   });
 });
 
-describe("supportsPgProcessList", () => {
-  it("covers the Postgres-kernel family and excludes divergent wire-protocol engines", () => {
-    expect(supportsPgProcessList("postgres")).toBe(true);
-    expect(supportsPgProcessList("opengauss")).toBe(true);
-    expect(supportsPgProcessList("kingbase")).toBe(true);
-    expect(supportsPgProcessList("redshift")).toBe(false);
-    expect(supportsPgProcessList("questdb")).toBe(false);
-    expect(supportsPgProcessList("mysql")).toBe(false);
-    expect(supportsPgProcessList(undefined)).toBe(false);
-  });
-});
-
 describe("resolveProcessListDriver", () => {
   it("routes MySQL and Postgres engines to distinct drivers", () => {
     const mysql = resolveProcessListDriver("mysql");
@@ -141,6 +128,9 @@ describe("resolveProcessListDriver", () => {
     expect(supportsProcessList("postgres")).toBe(true);
     expect(supportsProcessList("opengauss")).toBe(true);
     expect(supportsProcessList("kingbase")).toBe(true);
+    // Postgres wire-protocol lookalikes with divergent catalogs stay excluded.
+    expect(supportsProcessList("redshift")).toBe(false);
+    expect(supportsProcessList("questdb")).toBe(false);
     expect(supportsProcessList("sqlite")).toBe(false);
     expect(supportsProcessList(undefined)).toBe(false);
   });

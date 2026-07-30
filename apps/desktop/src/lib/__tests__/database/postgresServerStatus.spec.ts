@@ -7,9 +7,11 @@ import {
   formatBytes,
   formatBytesPerSec,
   formatUptime,
+  isOpenGaussReplayRecordError,
   isPgStatusCompatibilityError,
   KINGBASE_STATUS_SQL,
   KINGBASE_VARIABLES_SQL,
+  OPENGAUSS_STATUS_FALLBACK_SQL,
   OPENGAUSS_STATUS_SQL,
   OPENGAUSS_VARIABLES_SQL,
   parsePgStatusRow,
@@ -18,7 +20,6 @@ import {
   PG_STATUS_SQL,
   resolveServerDashboardDriver,
   statusNumber,
-  supportsServerDashboard,
   type StatusSample,
 } from "@/lib/database/postgresServerStatus";
 
@@ -148,6 +149,13 @@ describe("PostgreSQL-family status drivers", () => {
     expect(OPENGAUSS_STATUS_SQL).toContain("(pg_last_xlog_replay_location()).lsn");
     expect(OPENGAUSS_STATUS_SQL).not.toContain("pg_xlog_location_diff(pg_last_xlog_replay_location()");
     expect(OPENGAUSS_STATUS_SQL).not.toContain("pg_current_wal_lsn()");
+    // The record-notation replay form has a scalar-text fallback for builds whose
+    // pg_last_xlog_replay_location() returns text rather than a (term, lsn) record.
+    expect(driver?.fallbackStatusSql).toBe(OPENGAUSS_STATUS_FALLBACK_SQL);
+    expect(driver?.shouldUseFallbackStatusSql?.(new Error('could not identify column "lsn" in record data type'))).toBe(true);
+    expect(OPENGAUSS_STATUS_FALLBACK_SQL).toContain("CAST(pg_last_xlog_replay_location() AS text)");
+    expect(OPENGAUSS_STATUS_FALLBACK_SQL).toContain("pg_current_xlog_location()");
+    expect(OPENGAUSS_STATUS_FALLBACK_SQL).not.toContain(".lsn");
   });
 
   it("uses KingbaseES's sys catalog and sys backend functions", () => {
@@ -163,9 +171,12 @@ describe("PostgreSQL-family status drivers", () => {
     expect(KINGBASE_STATUS_SQL).not.toContain("CURRENT_TIMESTAMP - sys_postmaster_start_time()");
   });
 
-  it("keeps PostgreSQL's version fallback isolated to the PostgreSQL driver", () => {
+  it("wires the engine-specific status fallback and leaves Kingbase without one", () => {
+    // PostgreSQL falls back to the pre-PG10 xlog-named query; openGauss falls back
+    // to the scalar-text replay form. Kingbase's replay function is already scalar
+    // (sys_last_wal_replay_lsn returns pg_lsn), so it needs no fallback.
     expect(resolveServerDashboardDriver("postgres")?.fallbackStatusSql).toBe(PG_STATUS_LEGACY_SQL);
-    expect(resolveServerDashboardDriver("opengauss")?.fallbackStatusSql).toBeUndefined();
+    expect(resolveServerDashboardDriver("opengauss")?.fallbackStatusSql).toBe(OPENGAUSS_STATUS_FALLBACK_SQL);
     expect(resolveServerDashboardDriver("kingbase")?.fallbackStatusSql).toBeUndefined();
     expect(resolveServerDashboardDriver("mysql")).toBeNull();
   });
@@ -196,15 +207,21 @@ describe("isPgStatusCompatibilityError", () => {
   });
 });
 
-describe("supportsServerDashboard", () => {
-  it("covers the validated PostgreSQL-kernel engines", () => {
-    expect(supportsServerDashboard("postgres")).toBe(true);
-    expect(supportsServerDashboard("mysql")).toBe(false);
-    expect(supportsServerDashboard("opengauss")).toBe(true);
-    expect(supportsServerDashboard("kingbase")).toBe(true);
-    expect(supportsServerDashboard(undefined)).toBe(false);
+describe("isOpenGaussReplayRecordError", () => {
+  it("detects the .lsn-on-non-composite failure some openGauss builds raise", () => {
+    expect(isOpenGaussReplayRecordError(new Error('could not identify column "lsn" in record data type'))).toBe(true);
+    expect(isOpenGaussReplayRecordError(new Error("column notation .lsn applied to type text, which is not a composite type"))).toBe(true);
+    expect(isOpenGaussReplayRecordError(Object.assign(new Error("column notation .lsn applied to type text"), { code: "42809" }))).toBe(true);
   });
 
+  it("does not misclassify unrelated errors", () => {
+    expect(isOpenGaussReplayRecordError(new Error("connection refused"))).toBe(false);
+    // Names an LSN function but is the pre-PG10 WAL-rename failure, not the record issue.
+    expect(isOpenGaussReplayRecordError(new Error("function pg_current_wal_lsn() does not exist"))).toBe(false);
+  });
+});
+
+describe("connectionSupportsServerDashboard", () => {
   it("gates on the connection's effective db type", () => {
     expect(connectionSupportsServerDashboard({ id: "pg", name: "Postgres", db_type: "postgres" } as any)).toBe(true);
     expect(connectionSupportsServerDashboard({ id: "og", name: "openGauss", db_type: "opengauss" } as any)).toBe(true);

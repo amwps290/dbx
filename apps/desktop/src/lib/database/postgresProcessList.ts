@@ -1,4 +1,4 @@
-import type { DatabaseType, QueryResult } from "@/types/database";
+import type { QueryResult } from "@/types/database";
 
 /**
  * PostgreSQL "current activity / process list" helpers. Pure and framework-free
@@ -8,8 +8,6 @@ import type { DatabaseType, QueryResult } from "@/types/database";
  * The MySQL family lives in `./mysqlProcessList`; the generic, engine-agnostic
  * bits (coordinator, interval clamping, session counting) are shared from there.
  */
-
-const PG_PROCESS_LIST_DB_TYPES = new Set<DatabaseType>(["postgres", "opengauss", "kingbase"]);
 
 /**
  * One row per server-side backend. `now() - query_start` gives the age of the
@@ -189,9 +187,4 @@ export function isPgProcessListCompatibilityError(error: unknown): boolean {
   if (code === "42703") return true;
   const message = error instanceof Error ? error.message : String(error);
   return /(?:wait_event_type|wait_event).*(?:does not exist|42703)|(?:does not exist|42703).*(?:wait_event_type|wait_event)/i.test(message);
-}
-
-/** Whether the given database type exposes the Postgres process-list viewer. */
-export function supportsPgProcessList(dbType: DatabaseType | undefined): boolean {
-  return !!dbType && PG_PROCESS_LIST_DB_TYPES.has(dbType);
 }

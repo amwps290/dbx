@@ -129,6 +129,16 @@ SELECT
 FROM db_stats
 CROSS JOIN activity_stats`;
 
+/**
+ * Some openGauss builds return `text` (not a `(term, lsn)` record) from
+ * `pg_last_xlog_replay_location()`, which makes the `.lsn` field access in
+ * `OPENGAUSS_STATUS_SQL` fail to *parse* — and both CASE branches are planned,
+ * so it fails even on a primary. This fallback drops the record notation and
+ * reads the replay location as scalar text; the driver retries with it only
+ * after the primary query raises `isOpenGaussReplayRecordError`.
+ */
+export const OPENGAUSS_STATUS_FALLBACK_SQL = OPENGAUSS_STATUS_SQL.replace("(pg_last_xlog_replay_location()).lsn", "pg_last_xlog_replay_location()");
+
 export const OPENGAUSS_VARIABLES_SQL = "SELECT current_setting('max_connections') AS max_connections, version() AS version";
 
 /**
@@ -184,9 +194,6 @@ export interface PgServerStatusDriver {
 /** Max samples retained for the live charts (~ a few minutes at 5s cadence). */
 export const MAX_SAMPLES = 60;
 
-/** Engines with a validated PostgreSQL-kernel server monitoring query. */
-const SERVER_DASHBOARD_DB_TYPES = new Set<DatabaseType>(["postgres", "opengauss", "kingbase"]);
-
 /** Detect the undefined-function failure produced by pre-10 servers lacking `pg_current_wal_lsn`/`pg_last_wal_replay_lsn`/`pg_wal_lsn_diff`. */
 export function isPgStatusCompatibilityError(error: unknown): boolean {
   const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
@@ -200,6 +207,21 @@ export function isPgStatusCompatibilityError(error: unknown): boolean {
   return /(?:pg_current_wal_lsn|pg_last_wal_replay_lsn|pg_wal_lsn_diff)/i.test(message) && /does not exist/i.test(message);
 }
 
+/**
+ * Detect the failure raised when an openGauss build's `pg_last_xlog_replay_location()`
+ * returns `text` instead of a `(term, lsn)` record, so the `.lsn` field access in
+ * `OPENGAUSS_STATUS_SQL` is invalid. SQLSTATE 42809 is `wrong_object_type` (column
+ * notation on a non-composite value); some builds report it as 42703 with an
+ * "identify column" message instead. Gates the retry with `OPENGAUSS_STATUS_FALLBACK_SQL`.
+ * NOTE: confirm the exact message/SQLSTATE on the target openGauss build.
+ */
+export function isOpenGaussReplayRecordError(error: unknown): boolean {
+  const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code ?? "") : "";
+  if (code === "42809") return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /\blsn\b/i.test(message) && /(?:composite|record data type|column notation|identify column)/i.test(message);
+}
+
 const POSTGRES_STATUS_DRIVER: PgServerStatusDriver = {
   statusSql: PG_STATUS_SQL,
   variablesSql: PG_VARIABLES_SQL,
@@ -210,6 +232,8 @@ const POSTGRES_STATUS_DRIVER: PgServerStatusDriver = {
 const OPENGAUSS_STATUS_DRIVER: PgServerStatusDriver = {
   statusSql: OPENGAUSS_STATUS_SQL,
   variablesSql: OPENGAUSS_VARIABLES_SQL,
+  fallbackStatusSql: OPENGAUSS_STATUS_FALLBACK_SQL,
+  shouldUseFallbackStatusSql: isOpenGaussReplayRecordError,
 };
 
 const KINGBASE_STATUS_DRIVER: PgServerStatusDriver = {
@@ -261,11 +285,6 @@ export function pgCacheHitRatio(status: StatusMap): number | null {
   const ratio = (hits / total) * 100;
   if (!Number.isFinite(ratio)) return null;
   return Math.max(0, Math.min(100, ratio));
-}
-
-/** Whether the given database type exposes the Postgres server dashboard. */
-export function supportsServerDashboard(dbType: DatabaseType | undefined): boolean {
-  return !!dbType && SERVER_DASHBOARD_DB_TYPES.has(dbType);
 }
 
 /** Connection-aware gate (mirrors the MySQL server-dashboard gate). */
