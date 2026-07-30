@@ -618,7 +618,7 @@ fn decode_pg_text_wkb(value: &str) -> Option<super::wkb::DecodedGeometry> {
         .or_else(|| trimmed.strip_prefix("\\x"))
         .or_else(|| trimmed.strip_prefix("\\X"))
         .unwrap_or(trimmed);
-    if hex.len() < 10 || hex.len() % 2 != 0 || !matches!(&hex[..2], "00" | "01") || !hex.is_ascii() {
+    if hex.len() < 10 || !hex.len().is_multiple_of(2) || !matches!(&hex[..2], "00" | "01") || !hex.is_ascii() {
         return None;
     }
     let bytes = hex
