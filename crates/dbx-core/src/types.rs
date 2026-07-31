@@ -103,6 +103,7 @@ pub enum ObjectSourceKind {
     Function,
     Trigger,
     Sequence,
+    Synonym,
     Package,
     PackageBody,
     Type,
@@ -433,7 +434,7 @@ pub struct OwnerInfo {
 
 #[cfg(test)]
 mod tests {
-    use super::{ObjectInfo, SpatialColumn, SpatialColumnBuilder};
+    use super::{ObjectInfo, ObjectSourceKind, SpatialColumn, SpatialColumnBuilder};
 
     #[test]
     fn list_objects_payload_preserves_optional_validity() {
@@ -469,5 +470,13 @@ mod tests {
         builder.observe(0, Some(0)); // SRID 0 -> unknown
         assert_eq!(builder.finish(), vec![SpatialColumn { column_index: 0, srid: None }]);
         assert!(SpatialColumnBuilder::default().finish().is_empty());
+    }
+
+    #[test]
+    fn object_source_kind_accepts_synonym_wire_value() {
+        let kind: ObjectSourceKind = serde_json::from_str("\"SYNONYM\"").unwrap();
+
+        assert_eq!(kind, ObjectSourceKind::Synonym);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"SYNONYM\"");
     }
 }
