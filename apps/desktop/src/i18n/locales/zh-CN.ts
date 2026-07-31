@@ -1092,6 +1092,7 @@ export default withEnglishFallback({
     copyColumnNamesTitle: "复制列名（{count} 列）",
     copyColumnNamesSeparator: "列分隔符",
     copyColumnNamesQuote: "转义列名",
+    copyColumnNamesShowComment: "按注释显示",
     copyColumnNamesPreview: "预览",
     copyAll: "复制全部 (TSV)",
     selectionSum: "SUM: {value}",
@@ -1457,7 +1458,6 @@ export default withEnglishFallback({
     truncatedHint: "结果已截断，已加载前 {count} 行。可通过底部分页浏览已加载数据；导出完整结果时会重新查询数据库。",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX 最多支持 {limit} 行数据，请改用 CSV 导出完整结果。",
     streamingUnsupported: "当前查询暂不支持流式导出，请简化查询或使用受支持的驱动。",
     agentSessionMissing: "流式导出需要结果集会话，但当前驱动未返回 session_id。",
     title: "导出表数据",
@@ -1690,6 +1690,8 @@ export default withEnglishFallback({
     importSuccess: "已导入 {count} 个连接",
     importNavicatSuccess: "已导入 {count} 个 Navicat 连接，若个别连接密码为空请补填后测试连接",
     importDatagripSuccess: "已导入 {count} 个 DataGrip 连接，已自动读取 {filled} 个密码（来自 macOS 钥匙串）",
+    importDatagripSelectFiles: "请选择 dataSources.xml（必需），可同时选择 dataSources.local.xml 和 db-forest-config.xml",
+    importDatagripDialogTitle: "选择 DataGrip 配置文件",
     importDbeaverSuccess: "已导入 {count} 个 DBeaver 连接，若个别连接密码为空请补填后测试连接",
     importNone: "没有新的连接需要导入",
     importLayoutConfirm: "导入文件包含连接分组信息，是否一并应用？",
@@ -1976,6 +1978,8 @@ export default withEnglishFallback({
     templateSelectorLoading: "加载中...",
     templateSelectorEmpty: "暂无模板，请点击管理添加。",
     templateSelectorTooLong: "已选模板内容合计超过限制（最多 {max} 字符），请取消部分勾选。",
+    exportMarkdown: "导出为 Markdown",
+    analysis: "AI 分析",
   },
   contextMenu: {
     openConnection: "打开连接",

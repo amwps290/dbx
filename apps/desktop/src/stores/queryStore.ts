@@ -374,6 +374,20 @@ function isSapHanaSetSchemaStatement(statement: string | undefined): boolean {
   return /^SET\s+SCHEMA\s+(?:"(?:[^"]|"")*"|[A-Za-z_][\w$#]*)\s*;?\s*$/i.test(sqlStatementWithoutLeadingComments(statement));
 }
 
+function sqlServerUseDatabaseFromStatement(statement: string | undefined): string | undefined {
+  const match = /^USE\s+(?:\[((?:[^\]]|\]\])*)\]|"((?:[^"]|"")*)"|([A-Za-z_][\w@$#]*))\s*;?\s*$/i.exec(sqlStatementWithoutLeadingComments(statement));
+  if (!match) return undefined;
+  if (match[1] !== undefined) return match[1].replaceAll("]]", "]");
+  if (match[2] !== undefined) return match[2].replaceAll('""', '"');
+  return match[3];
+}
+
+function isSqlServerBatchErrorResult(result: QueryResult): boolean {
+  // SQL Server batch errors can arrive without execution_error metadata.
+  // A standalone USE statement cannot legitimately return an Error column.
+  return result.execution_error === true || (result.columns.length === 1 && result.columns[0] === "Error" && result.rows.length > 0);
+}
+
 function sapHanaCurrentSchemaFromResult(result: QueryResult): string | undefined {
   const schema = result.rows[0]?.[0];
   return typeof schema === "string" && schema.trim() ? schema.trim() : undefined;
@@ -2784,6 +2798,7 @@ export const useQueryStore = defineStore("query", () => {
     source: EditableQuerySource;
     analysis: EditableQueryInfo;
     request: TableMetadataRequest;
+    writeSchema?: string;
   };
 
   interface EditableQueryExecutionPreparation {
@@ -2807,7 +2822,11 @@ export const useQueryStore = defineStore("query", () => {
     // with a qualified source.
     const qualifiedSourceDatabase = dbType === "sqlserver" ? source.catalog : connectionUsesDatabaseObjectTreeMode(conn) ? source.schema : undefined;
     const metadataDatabase = qualifiedSourceDatabase || executionDatabase || conn?.database || tab.database;
-    let schema = source.schema || tab.schema;
+    // SQL Server does not apply the query tab's selected schema to an
+    // unqualified object reference. Resolve metadata through the login's
+    // default schema (with the driver's dbo fallback) so metadata and writes
+    // target the same object as the original SELECT.
+    let schema = source.schema || (dbType === "sqlserver" ? "" : tab.schema);
     if (!schema) {
       if (dbType === "postgres" || dbType === "kwdb") schema = "public";
       else schema = "";
@@ -2815,7 +2834,7 @@ export const useQueryStore = defineStore("query", () => {
     // Oracle-family connection databases are service names, not schemas. When
     // the query does not qualify a schema, let the driver resolve the current
     // login user's schema instead of looking up metadata under the service name.
-    const resolvedSchema = ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
+    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema) ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
     const metadataSchema = normalizeOracleLikeMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
     const metadataTableName = normalizeOracleLikeMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
     const metadataCatalog = normalizeOracleLikeMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
@@ -2825,10 +2844,14 @@ export const useQueryStore = defineStore("query", () => {
       schema: metadataSchema || undefined,
       tableName: metadataTableName,
     };
+    // Keep SQL Server writes unqualified unless the SELECT source explicitly
+    // named a schema, so SELECT and UPDATE resolve the same object.
+    const writeSchema = dbType === "sqlserver" && !source.schema ? undefined : metadataSchema || undefined;
     const knownTableType = tab.tableMeta?.tableName.toLowerCase() === metadataTableName.toLowerCase() && normalizeOptionalSchema(tab.tableMeta.schema) === normalizeOptionalSchema(metadataSchema) ? tab.tableMeta.tableType : undefined;
     return {
       source: metadataSource,
       analysis: normalizeOracleLikeQueryAnalysis(dbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
+      writeSchema,
       request: {
         connectionId: tab.connectionId!,
         database: metadataDatabase,
@@ -2849,7 +2872,7 @@ export const useQueryStore = defineStore("query", () => {
       tableMeta: {
         catalog: target.request.catalog,
         database: target.request.database,
-        schema: target.request.schema || undefined,
+        schema: target.writeSchema,
         tableName: target.request.tableName,
         tableType: metadata.tableType,
         columns: metadata.columns,
@@ -3956,6 +3979,7 @@ export const useQueryStore = defineStore("query", () => {
       reconcileBatchSqlResults(tab, executionId, results);
       const successfulOracleSchemaChanges = effectiveDbType === "oracle" ? results.filter((result) => result.execution_error !== true && isOracleCurrentSchemaStatement(result.sourceStatement)).length : 0;
       const successfulSapHanaSchemaChanges = effectiveDbType === "saphana" ? results.filter((result) => result.execution_error !== true && isSapHanaSetSchemaStatement(result.sourceStatement)).length : 0;
+      const sqlServerUseDatabase = effectiveDbType === "sqlserver" && !results.some(isSqlServerBatchErrorResult) ? sqlServerUseDatabaseFromStatement(sql) : undefined;
       if (hiddenPrimaryKeys.length > 0 && results.length === 1) {
         const hiddenIndexes = hiddenResultColumnIndexes(results[0]!.columns, hiddenPrimaryKeys);
         if (hiddenIndexes.length > 0) results[0]!.hidden_column_indexes = hiddenIndexes;
@@ -3991,6 +4015,12 @@ export const useQueryStore = defineStore("query", () => {
         if (resolvedSapHanaSchema) {
           current.schema = resolvedSapHanaSchema;
           current.completionContextVersion = (current.completionContextVersion ?? 0) + successfulSapHanaSchemaChanges;
+        }
+        if (sqlServerUseDatabase && current.database !== sqlServerUseDatabase) {
+          rollbackTabTransaction(current);
+          void closeClientConnectionSession(current);
+          current.database = sqlServerUseDatabase;
+          current.schema = undefined;
         }
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;

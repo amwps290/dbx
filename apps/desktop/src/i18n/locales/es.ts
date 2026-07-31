@@ -1399,7 +1399,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "Encabezado usando comentarios",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX admite como máximo {limit} filas de datos. Use la exportación CSV para obtener el resultado completo.",
     streamingUnsupported: "La exportación en streaming no es compatible con esta consulta. Simplifíquela o use un controlador compatible.",
     agentSessionMissing: "La exportación en streaming requiere una sesión de conjunto de resultados, pero este controlador no devolvió session_id.",
     title: "Exportando datos de la tabla",
@@ -1637,6 +1636,8 @@ export default withEnglishFallback({
     importLayoutConfirm: "El archivo importado contiene grupos de conexiones. ¿Deseas aplicarlos?",
     importLayoutTitle: "Importar grupos",
     importLayoutApply: "Aplicar",
+    importDatagripSelectFiles: "Seleccione dataSources.xml (obligatorio); también puede seleccionar dataSources.local.xml y db-forest-config.xml.",
+    importDatagripDialogTitle: "Seleccionar archivos de configuración de DataGrip",
   },
   ai: {
     placeholder: "Describe tu consulta en lenguaje natural...",
@@ -1843,6 +1844,8 @@ export default withEnglishFallback({
     templateSelectorLoading: "Cargando...",
     templateSelectorEmpty: "Sin plantillas. Haz clic en Gestionar para añadir.",
     templateSelectorTooLong: "Las plantillas seleccionadas superan el límite total de contenido ({max} caracteres). Deselecciona algunas para continuar.",
+    exportMarkdown: "Exportar como Markdown",
+    analysis: "AI Analysis",
     agentSteps: {
       generated: "SQL generado",
       noSql: "No se encontró SQL",

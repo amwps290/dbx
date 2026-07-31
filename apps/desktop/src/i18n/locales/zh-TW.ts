@@ -1398,7 +1398,6 @@ export default withEnglishFallback({
     xlsxHeaderComment: "表頭使用註解",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX 最多支援 {limit} 列資料，請改用 CSV 匯出完整結果。",
     streamingUnsupported: "目前查詢暫不支援串流匯出，請簡化查詢或使用支援的驅動程式。",
     agentSessionMissing: "串流匯出需要結果集工作階段，但目前驅動程式未回傳 session_id。",
     title: "匯出資料表資料",
@@ -1631,6 +1630,8 @@ export default withEnglishFallback({
     importSuccess: "已匯入 {count} 個連線",
     importNavicatSuccess: "已匯入 {count} 個 Navicat 連線，若個別連線密碼為空請補填後測試連線",
     importDatagripSuccess: "已匯入 {count} 個 DataGrip 連線，已自動讀取 {filled} 個密碼（來自 macOS 鑰匙圈）",
+    importDatagripSelectFiles: "請選擇 dataSources.xml（必需），可同時選擇 dataSources.local.xml 和 db-forest-config.xml",
+    importDatagripDialogTitle: "選擇 DataGrip 設定檔",
     importDbeaverSuccess: "已匯入 {count} 個 DBeaver 連線，若個別連線密碼為空請補填後測試連線",
     importNone: "沒有新的連線需要匯入",
     importLayoutConfirm: "匯入檔案包含連線群組資訊，是否一併套用？",
@@ -1784,6 +1785,8 @@ export default withEnglishFallback({
     templateSelectorLoading: "載入中...",
     templateSelectorEmpty: "尚無範本，請點擊管理以新增。",
     templateSelectorTooLong: "已選範本內容合計超過限制（最多 {max} 字元），請取消部分選取。",
+    exportMarkdown: "匯出為 Markdown",
+    analysis: "AI 分析",
     agentSteps: {
       generated: "已產生 SQL",
       noSql: "未找到 SQL",

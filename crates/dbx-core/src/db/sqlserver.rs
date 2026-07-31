@@ -92,6 +92,56 @@ pub struct SqlServerColumnMetadata {
     pub generated_always_type: i32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SqlServerCompletionContext {
+    pub default_schema: String,
+    pub supports_session_database_switch: bool,
+}
+
+const SQLSERVER_COMPLETION_CONTEXT_SQL: &str = "\
+    SELECT COALESCE(\
+        (SELECT default_schema.name \
+         FROM sys.schemas default_schema \
+         WHERE default_schema.name = SCHEMA_NAME()), \
+        N'dbo'\
+    ) AS default_schema, \
+    CONVERT(int, SERVERPROPERTY(N'EngineEdition')) AS engine_edition";
+
+fn sqlserver_supports_session_database_switch(engine_edition: i32) -> bool {
+    // Only known boxed SQL Server, Managed Instance, and SQL Edge editions are
+    // allowed to switch databases. Cloud single-database endpoints and future
+    // editions default to opening a connection directly to the target database.
+    matches!(engine_edition, 1 | 2 | 3 | 4 | 8 | 9)
+}
+
+fn sqlserver_completion_context(
+    default_schema: Option<&str>,
+    engine_edition: Option<i32>,
+) -> Result<SqlServerCompletionContext, String> {
+    let default_schema = default_schema.map(str::trim).filter(|schema| !schema.is_empty()).unwrap_or("dbo");
+    let engine_edition = engine_edition.ok_or_else(|| "SQL Server EngineEdition is unavailable".to_string())?;
+    Ok(SqlServerCompletionContext {
+        default_schema: default_schema.to_string(),
+        supports_session_database_switch: sqlserver_supports_session_database_switch(engine_edition),
+    })
+}
+
+pub fn completion_context_sql() -> &'static str {
+    SQLSERVER_COMPLETION_CONTEXT_SQL
+}
+
+pub fn completion_context_from_query_result(result: QueryResult) -> Result<SqlServerCompletionContext, String> {
+    let row = result.rows.first().ok_or_else(|| "SQL Server completion context query returned no rows".to_string())?;
+    let default_schema = row.first().and_then(serde_json::Value::as_str);
+    let engine_edition = row.get(1).and_then(|value| {
+        value
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok())
+            .or_else(|| value.as_str()?.trim().parse::<i32>().ok())
+    });
+    sqlserver_completion_context(default_schema, engine_edition)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct SqlServerEndpoint<'a> {
     host: &'a str,
@@ -1383,6 +1433,15 @@ pub async fn list_databases(client: &mut SqlServerClient) -> Result<Vec<Database
     Ok(rows.iter().map(|row| DatabaseInfo { name: row.get::<&str, _>(0).unwrap_or("").to_string() }).collect())
 }
 
+pub async fn get_completion_context(client: &mut SqlServerClient) -> Result<SqlServerCompletionContext, String> {
+    let stream = client.query(SQLSERVER_COMPLETION_CONTEXT_SQL, &[]).await.map_err(|e| e.to_string())?;
+    let rows = stream.into_first_result().await.map_err(|e| e.to_string())?;
+    let row = rows.first().ok_or_else(|| "SQL Server completion context query returned no rows".to_string())?;
+    let default_schema = row.try_get::<&str, _>(0).map_err(|e| e.to_string())?;
+    let engine_edition = row.try_get::<i32, _>(1).map_err(|e| e.to_string())?;
+    sqlserver_completion_context(default_schema, engine_edition)
+}
+
 pub async fn test_connection(client: &mut SqlServerClient) -> Result<(), String> {
     crate::db::with_connection_timeout("SQL Server", crate::db::connection_timeout(), async {
         let stream = client.simple_query("SELECT 1").await.map_err(|e| e.to_string())?;
@@ -1905,6 +1964,27 @@ fn sqlserver_schema_name_predicate(schema: &str, schema_name_expression: &str) -
     format!("{schema_name_expression} = N'{}'", schema.replace('\'', "''"))
 }
 
+fn sqlserver_object_id_expression(schema: &str, table: &str) -> String {
+    let table = table.replace('\'', "''");
+    if schema.trim().is_empty() {
+        return format!("OBJECT_ID(QUOTENAME(N'{table}'))");
+    }
+
+    let schema = schema.replace('\'', "''");
+    format!("OBJECT_ID(QUOTENAME(N'{schema}') + N'.' + QUOTENAME(N'{table}'))")
+}
+
+fn sqlserver_object_schema_name_predicate(schema: &str, table: &str, schema_name_expression: &str) -> String {
+    if schema.trim().is_empty() {
+        return format!(
+            "{schema_name_expression} = OBJECT_SCHEMA_NAME({})",
+            sqlserver_object_id_expression(schema, table)
+        );
+    }
+
+    sqlserver_schema_name_predicate(schema, schema_name_expression)
+}
+
 fn escape_like_literal(value: &str) -> String {
     value.replace('\\', "\\\\").replace('\'', "''").replace('%', "\\%").replace('_', "\\_").replace('[', "\\[")
 }
@@ -2120,7 +2200,7 @@ fn sqlserver_column_metadata_from_row(row: &Row) -> SqlServerColumnMetadata {
 
 fn sqlserver_columns_sql(schema: &str, table: &str) -> String {
     let t = table.replace('\'', "''");
-    let schema_filter = sqlserver_schema_name_predicate(schema, "s.name");
+    let schema_filter = sqlserver_object_schema_name_predicate(schema, table, "s.name");
     // COLUMNPROPERTY keeps hidden/generated flags separate and returns NULL on
     // SQL Server versions that do not expose a newer property.
     format!(
@@ -2224,6 +2304,7 @@ fn sqlserver_indexes_sql_with_filter_definition(schema: &str, table: &str, inclu
     } else {
         "CAST(NULL AS NVARCHAR(MAX)) AS filter_definition"
     };
+    let object_id = sqlserver_object_id_expression(schema, table);
     format!(
         "SELECT i.name, \
          STUFF((SELECT ',' + c2.name \
@@ -2243,10 +2324,8 @@ fn sqlserver_indexes_sql_with_filter_definition(schema: &str, table: &str, inclu
          ep.value AS index_comment \
          FROM sys.indexes i \
          OUTER APPLY (SELECT CAST(ep.value AS NVARCHAR(MAX)) AS value FROM sys.extended_properties ep WHERE ep.major_id = i.object_id AND ep.minor_id = i.index_id AND ep.name = N'MS_Description' AND ep.class = 7) ep \
-         WHERE i.object_id = OBJECT_ID('{s}.{t}') AND i.name IS NOT NULL \
+         WHERE i.object_id = {object_id} AND i.name IS NOT NULL \
          ORDER BY i.name",
-        s = schema.replace('\'', "''"),
-        t = table.replace('\'', "''")
     )
 }
 
@@ -2747,18 +2826,20 @@ fn first_sql_tokens(sql: &str, limit: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, decode_sqlserver_spatial_values,
-        format_sqlserver_numeric, is_blocking_sqlserver_unsafe_probe_error, is_sqlserver_spatial_column,
-        is_sqlserver_variant_column, query_result_with_server_messages, requires_simple_query_batch,
-        restore_sqlserver_legacy_probe_output_names, restore_sqlserver_spatial_column_types,
-        sqlserver_batch_can_use_execute, sqlserver_bulk_token_row, sqlserver_cell_to_json, sqlserver_columns_sql,
-        sqlserver_completion_assistant_sql, sqlserver_dml_output_returns_rows, sqlserver_filter_definition_error,
-        sqlserver_hidden_schema_names, sqlserver_indexes_sql, sqlserver_legacy_indexes_sql, sqlserver_legacy_probe,
-        sqlserver_legacy_probe_with_nonce, sqlserver_list_objects_sql, sqlserver_list_schemas_sql,
-        sqlserver_list_tables_sql, sqlserver_probe_explicit_alias, sqlserver_schema_name_predicate,
-        sqlserver_spatial_marker, sqlserver_table_comment_sql, sqlserver_triggers_sql,
+        build_sqlserver_unsafe_type_query, capture_sqlserver_messages, completion_context_from_query_result,
+        decode_sqlserver_spatial_values, format_sqlserver_numeric, is_blocking_sqlserver_unsafe_probe_error,
+        is_sqlserver_spatial_column, is_sqlserver_variant_column, query_result_with_server_messages,
+        requires_simple_query_batch, restore_sqlserver_legacy_probe_output_names,
+        restore_sqlserver_spatial_column_types, sqlserver_batch_can_use_execute, sqlserver_bulk_token_row,
+        sqlserver_cell_to_json, sqlserver_columns_sql, sqlserver_completion_assistant_sql,
+        sqlserver_dml_output_returns_rows, sqlserver_filter_definition_error, sqlserver_hidden_schema_names,
+        sqlserver_indexes_sql, sqlserver_legacy_indexes_sql, sqlserver_legacy_probe, sqlserver_legacy_probe_with_nonce,
+        sqlserver_list_objects_sql, sqlserver_list_schemas_sql, sqlserver_list_tables_sql,
+        sqlserver_probe_explicit_alias, sqlserver_schema_name_predicate, sqlserver_spatial_marker,
+        sqlserver_supports_session_database_switch, sqlserver_table_comment_sql, sqlserver_triggers_sql,
         sqlserver_visible_object_predicate, strip_dbx_sqlserver_row_number_column, SqlServerDescribedColumn,
-        SqlServerProbeOutputNameOverride, SqlServerResultSet, SqlServerSpatialColumn, SQLSERVER_RESULT_TYPE_PROBE_SQL,
+        SqlServerProbeOutputNameOverride, SqlServerResultSet, SqlServerSpatialColumn, SQLSERVER_COMPLETION_CONTEXT_SQL,
+        SQLSERVER_RESULT_TYPE_PROBE_SQL,
     };
     use crate::types::{
         CompletionAssistantMatchMode, CompletionAssistantObjectKind, CompletionAssistantRequest, QueryResult,
@@ -3104,7 +3185,7 @@ mod tests {
 
         assert!(!sql.contains("STRING_AGG"));
         assert!(sql.contains("FOR XML PATH"));
-        assert!(sql.contains("OBJECT_ID('dbo.DF_Rule')"));
+        assert!(sql.contains("OBJECT_ID(QUOTENAME(N'dbo') + N'.' + QUOTENAME(N'DF_Rule'))"));
     }
 
     #[test]
@@ -3198,7 +3279,7 @@ mod tests {
         assert!(columns_sql.contains("s.name = N'd''bo'"));
         assert!(columns_sql.contains("o.name = 't''able'"));
         assert!(columns_sql.contains("sys.identity_columns"));
-        assert!(indexes_sql.contains("OBJECT_ID('d''bo.t''able')"));
+        assert!(indexes_sql.contains("OBJECT_ID(QUOTENAME(N'd''bo') + N'.' + QUOTENAME(N't''able'))"));
     }
 
     #[test]
@@ -3210,7 +3291,51 @@ mod tests {
             "s.name = COALESCE((SELECT default_schema.name FROM sys.schemas default_schema WHERE default_schema.name = SCHEMA_NAME()), N'dbo')"
         );
         assert!(sqlserver_list_tables_sql("", None, None, None).contains(&predicate));
-        assert!(sqlserver_columns_sql("\t", "orders").contains(&predicate));
+        assert!(sqlserver_columns_sql("\t", "orders")
+            .contains("s.name = OBJECT_SCHEMA_NAME(OBJECT_ID(QUOTENAME(N'orders')))"),);
+        assert!(sqlserver_indexes_sql("", "orders").contains("OBJECT_ID(QUOTENAME(N'orders'))"));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_uses_the_database_user_default_schema() {
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("SCHEMA_NAME()"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("sys.schemas"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("N'dbo'"));
+        assert!(SQLSERVER_COMPLETION_CONTEXT_SQL.contains("EngineEdition"));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_disables_use_for_azure_database_endpoints() {
+        assert!(!sqlserver_supports_session_database_switch(5));
+        assert!(!sqlserver_supports_session_database_switch(6));
+        assert!(!sqlserver_supports_session_database_switch(11));
+        assert!(!sqlserver_supports_session_database_switch(12));
+        assert!(!sqlserver_supports_session_database_switch(99));
+        assert!(sqlserver_supports_session_database_switch(3));
+        assert!(sqlserver_supports_session_database_switch(8));
+        assert!(sqlserver_supports_session_database_switch(9));
+    }
+
+    #[test]
+    fn sqlserver_completion_context_parses_agent_query_results() {
+        let context = completion_context_from_query_result(QueryResult {
+            columns: vec!["default_schema".to_string(), "engine_edition".to_string()],
+            column_types: vec![],
+            column_sortables: vec![],
+            spatial_columns: vec![],
+            spatial_values: vec![],
+            rows: vec![vec![serde_json::json!("app_user"), serde_json::json!("8")]],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+        })
+        .unwrap();
+
+        assert_eq!(context.default_schema, "app_user");
+        assert!(context.supports_session_database_switch);
     }
 
     #[test]

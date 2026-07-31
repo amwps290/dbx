@@ -1091,6 +1091,7 @@ export default {
     copyColumnNamesTitle: "Copy Column Names ({count})",
     copyColumnNamesSeparator: "Column Separator",
     copyColumnNamesQuote: "Quote Column Names",
+    copyColumnNamesShowComment: "Show by Comment",
     copyColumnNamesPreview: "Preview",
     copyAll: "Copy All (TSV)",
     selectionSum: "SUM: {value}",
@@ -1456,7 +1457,6 @@ export default {
     truncatedHint: "Results were truncated after loading {count} rows. Use the footer pagination to browse loaded data; exporting the full result reruns the database query.",
   },
   exportProgress: {
-    xlsxRowLimit: "XLSX supports at most {limit} data rows. Use CSV export for the full result.",
     streamingUnsupported: "Streaming export is unsupported for this query. Simplify it or use a supported driver.",
     agentSessionMissing: "Streaming export needs a result-set session, but this driver returned no session_id.",
     title: "Exporting Table Data",
@@ -1689,6 +1689,8 @@ export default {
     importSuccess: "Imported {count} connection(s)",
     importNavicatSuccess: "Imported {count} Navicat connection(s). Fill in any connection whose password is still empty before testing.",
     importDatagripSuccess: "Imported {count} DataGrip connection(s), filled {filled} password(s) from macOS Keychain.",
+    importDatagripSelectFiles: "Please select dataSources.xml (required), and optionally dataSources.local.xml / db-forest-config.xml",
+    importDatagripDialogTitle: "Select DataGrip configuration files",
     importDbeaverSuccess: "Imported {count} DBeaver connection(s). Fill in any connection whose password is still empty before testing.",
     importNone: "No new connections to import",
     importLayoutConfirm: "The imported file contains connection groups. Apply them?",
@@ -1975,6 +1977,8 @@ export default {
     templateSelectorLoading: "Loading...",
     templateSelectorEmpty: "No templates. Click Manage to add.",
     templateSelectorTooLong: "Selected templates exceed the total content limit ({max} characters). Deselect some to continue.",
+    exportMarkdown: "Export as Markdown",
+    analysis: "AI Analysis",
   },
   contextMenu: {
     openConnection: "Open Connection",
