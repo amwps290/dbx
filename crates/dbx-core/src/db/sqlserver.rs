@@ -796,10 +796,10 @@ fn build_sqlserver_unsafe_type_query(
     // keys cannot be safely migrated, refuse the rewrite rather than silently
     // dropping order semantics (callers fall back to the plain statement).
     let order_by = match &statement.order_by {
-        Some(order_by) => match sqlserver_outer_order_by(order_by, columns) {
-            Some(outer_order_by) => format!(" {outer_order_by}"),
-            None => return None,
-        },
+        Some(order_by) => {
+            let outer_order_by = sqlserver_outer_order_by(order_by, columns)?;
+            format!(" {outer_order_by}")
+        }
         None => String::new(),
     };
 
