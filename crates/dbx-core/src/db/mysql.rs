@@ -526,8 +526,9 @@ fn mysql_spatial_column_builder(columns: &[mysql_async::Column]) -> SpatialColum
 fn mysql_row_to_json_with_srids(
     row: &mysql_async::Row,
     spatial_columns: &mut SpatialColumnBuilder,
-) -> Vec<serde_json::Value> {
-    (0..row.len())
+) -> (Vec<serde_json::Value>, Vec<Option<u32>>) {
+    let mut srids = vec![None; row.len()];
+    let values = (0..row.len())
         .map(|idx| {
             let is_geometry = row
                 .columns_ref()
@@ -543,6 +544,7 @@ fn mysql_row_to_json_with_srids(
             match decode_mysql_geometry(&bytes) {
                 Some(geometry) => {
                     spatial_columns.observe(idx, geometry.srid);
+                    srids[idx] = geometry.srid;
                     serde_json::Value::String(geometry.wkt)
                 }
                 None => {
@@ -551,7 +553,8 @@ fn mysql_row_to_json_with_srids(
                 }
             }
         })
-        .collect()
+        .collect();
+    (values, srids)
 }
 
 fn mysql_temporal_value_to_json(
@@ -3578,6 +3581,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
             column_types: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: result.affected_rows(),
             execution_time_ms: start.elapsed().as_millis(),
@@ -3594,14 +3598,23 @@ async fn execute_result_set_with_text_protocol_on_conn(
     if should_collect_text_result_set(sql, row_limit, max_rows) {
         let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
         let truncated = rows.len() > row_limit;
-        let result_rows =
-            rows.iter().take(row_limit).map(|row| mysql_row_to_json_with_srids(row, &mut spatial_columns)).collect();
+        let mut spatial_values = Vec::new();
+        let result_rows = rows
+            .iter()
+            .take(row_limit)
+            .map(|row| {
+                let (values, srids) = mysql_row_to_json_with_srids(row, &mut spatial_columns);
+                spatial_values.push(srids);
+                values
+            })
+            .collect();
 
         return Ok(QueryResult {
             columns,
             column_types,
             column_sortables: vec![],
             spatial_columns: spatial_columns.finish(),
+            spatial_values,
             rows: result_rows,
             affected_rows: 0,
             execution_time_ms: start.elapsed().as_millis(),
@@ -3613,6 +3626,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
     }
 
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
     let mut truncated = false;
     let mut stream = result
         .stream::<mysql_async::Row>()
@@ -3626,7 +3640,9 @@ async fn execute_result_set_with_text_protocol_on_conn(
             truncated = true;
             break;
         }
-        result_rows.push(mysql_row_to_json_with_srids(&row, &mut spatial_columns));
+        let (values, srids) = mysql_row_to_json_with_srids(&row, &mut spatial_columns);
+        result_rows.push(values);
+        spatial_values.push(srids);
     }
 
     Ok(QueryResult {
@@ -3634,6 +3650,7 @@ async fn execute_result_set_with_text_protocol_on_conn(
         column_types,
         column_sortables: vec![],
         spatial_columns: spatial_columns.finish(),
+        spatial_values,
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -3668,6 +3685,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
     let mut spatial_columns = mysql_spatial_column_builder(result.columns_ref());
 
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
     let mut truncated = false;
     let mut stream = result
         .stream::<mysql_async::Row>()
@@ -3681,7 +3699,9 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
             truncated = true;
             break;
         }
-        result_rows.push(mysql_row_to_json_with_srids(&row, &mut spatial_columns));
+        let (values, srids) = mysql_row_to_json_with_srids(&row, &mut spatial_columns);
+        result_rows.push(values);
+        spatial_values.push(srids);
     }
 
     Ok(QueryResult {
@@ -3689,6 +3709,7 @@ async fn execute_result_set_with_prepared_protocol_on_conn(
         column_types,
         column_sortables: vec![],
         spatial_columns: spatial_columns.finish(),
+        spatial_values,
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -3949,6 +3970,7 @@ pub async fn execute_query_on_conn_with_max_rows(
             column_types: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows,
             execution_time_ms: start.elapsed().as_millis(),

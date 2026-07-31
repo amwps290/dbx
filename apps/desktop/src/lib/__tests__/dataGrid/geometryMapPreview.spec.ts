@@ -43,4 +43,34 @@ describe("buildGeometryMapFeatureCollection", () => {
     const collection = buildGeometryMapFeatureCollection(ctx);
     expect(collection?.detectedSrid).toBeNull();
   });
+
+  it("binds each feature to its own per-cell SRID when the column mixes SRIDs", () => {
+    const ctx = context();
+    ctx.result.spatial_columns = [{ column_index: 0, srid: 4326 }];
+    // Per-cell SRIDs, parallel to rows: wgs84=4326, mercator=3857, unknown=null.
+    ctx.result.spatial_values = [
+      [4326, null],
+      [3857, null],
+      [null, null],
+    ];
+
+    const collection = buildGeometryMapFeatureCollection(ctx);
+    // displayRowRefs order is [mercator, wgs84, unknown]; the unknown cell falls
+    // back to the column-level default 4326.
+    expect(collection?.features.map((feature) => feature.properties._srid)).toEqual([3857, 4326, 4326]);
+  });
+
+  it("prefers per-cell SRIDs over column-level hints", () => {
+    const ctx = context();
+    ctx.result.spatial_columns = [{ column_index: 0, srid: 3857 }];
+    ctx.result.spatial_values = [
+      [4326, null],
+      [null, null],
+      [null, null],
+    ];
+
+    const collection = buildGeometryMapFeatureCollection(ctx);
+    // wgs84 row carries its own 4326 even though the column hint says 3857.
+    expect(collection?.features.find((f) => f.properties.name === "wgs84")?.properties._srid).toBe(4326);
+  });
 });

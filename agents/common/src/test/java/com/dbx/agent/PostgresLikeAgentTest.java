@@ -205,6 +205,14 @@ class PostgresLikeAgentTest {
             java.util.Collections.singletonList(new SpatialColumn(0, 4326)),
             result.getSpatial_columns());
         assertEquals("POINT(1 2)", result.getRows().get(0).get(0));
+        // Per-cell SRIDs are preserved for every row instead of collapsing:
+        // unknown, then 4326, then 3857 in the same column.
+        assertEquals(
+            java.util.Arrays.asList(
+                java.util.Arrays.asList(null, null),
+                java.util.Arrays.asList(4326, null),
+                java.util.Arrays.asList(3857, null)),
+            result.getSpatial_values());
     }
 
     private static final class TestPostgresLikeAgent extends PostgresLikeAgent {

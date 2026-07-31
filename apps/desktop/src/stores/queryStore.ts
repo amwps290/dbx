@@ -182,6 +182,7 @@ export function appendQueryResultSegment(previous: QueryResult, segment: QueryRe
     appended_from_row_count: previous.rows.length,
     rows: [...previous.rows, ...segment.rows.slice(0, appendedRowCount)],
     spatial_columns: spatial_columns.length > 0 ? spatial_columns : undefined,
+    spatial_values: appendParallelValues(previous.spatial_values, segment.spatial_values),
     mongo_documents: appendParallelValues(previous.mongo_documents, segment.mongo_documents),
     mongo_copy_documents: appendParallelValues(previous.mongo_copy_documents, segment.mongo_copy_documents),
     execution_time_ms: (previous.execution_time_ms ?? 0) + (segment.execution_time_ms ?? 0),

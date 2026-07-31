@@ -952,6 +952,7 @@ async fn execute_select_prepared(
     );
     tokio::pin!(stream);
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
     let mut spatial_columns = SpatialColumnBuilder::new(
         column_classes
             .iter()
@@ -968,15 +969,18 @@ async fn execute_select_prepared(
         }
         let row = row_result?;
         let mut values = Vec::with_capacity(row.columns().len());
-        for i in 0..row.columns().len() {
+        let mut row_srids = vec![None; row.columns().len()];
+        for (i, row_srid) in row_srids.iter_mut().enumerate() {
             let col_type = column_classes.get(i).copied().unwrap_or(PgColType::Other);
             let (value, srid) = pg_value_to_json_with_srid(&row, i, col_type);
             if col_type == PgColType::Geometry {
                 spatial_columns.observe(i, srid);
+                *row_srid = srid;
             }
             values.push(value);
         }
         result_rows.push(values);
+        spatial_values.push(row_srids);
     }
     log::info!(
         "[postgres][select:rows:done] elapsed_ms={} total_ms={} row_count={} truncated={}",
@@ -991,6 +995,7 @@ async fn execute_select_prepared(
         column_types,
         column_sortables: Vec::new(),
         spatial_columns: spatial_columns.finish(),
+        spatial_values,
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -1016,6 +1021,7 @@ async fn execute_select_text(
     tokio::pin!(stream);
     let mut columns: Vec<String> = Vec::new();
     let mut result_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut spatial_values: Vec<Vec<Option<u32>>> = Vec::new();
     let column_classes =
         prepared_column_types.as_ref().map(|types| classify_pg_column_types(types)).unwrap_or_default();
     let mut spatial_columns = SpatialColumnBuilder::new(
@@ -1040,7 +1046,8 @@ async fn execute_select_text(
                     break;
                 }
                 let mut values = Vec::with_capacity(row.len());
-                for i in 0..row.len() {
+                let mut row_srids = vec![None; row.len()];
+                for (i, row_srid) in row_srids.iter_mut().enumerate() {
                     match row.try_get(i).map_err(pg_error_to_string)? {
                         Some(value) => {
                             let (decoded, srid, is_spatial) =
@@ -1048,6 +1055,7 @@ async fn execute_select_text(
                             values.push(decoded);
                             if is_spatial {
                                 spatial_columns.observe(i, srid);
+                                *row_srid = srid;
                             }
                         }
                         None => {
@@ -1056,6 +1064,7 @@ async fn execute_select_text(
                     }
                 }
                 result_rows.push(values);
+                spatial_values.push(row_srids);
             }
             Err(_) if result_rows.len() >= row_limit => {
                 truncated = true;
@@ -1072,6 +1081,7 @@ async fn execute_select_text(
         columns,
         column_sortables: Vec::new(),
         spatial_columns: spatial_columns.finish(),
+        spatial_values,
         rows: result_rows,
         affected_rows: 0,
         execution_time_ms: start.elapsed().as_millis(),
@@ -2974,6 +2984,7 @@ pub async fn execute_query_with_max_rows(
             column_types: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: affected,
             execution_time_ms: start.elapsed().as_millis(),
@@ -3483,6 +3494,7 @@ async fn execute_query_with_max_rows_inner(
             column_types: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            spatial_values: vec![],
             rows: vec![],
             affected_rows: affected,
             execution_time_ms: start.elapsed().as_millis(),

@@ -4967,6 +4967,7 @@ mod tests {
             column_types: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
+            spatial_values: vec![],
             rows,
             affected_rows: 0,
             execution_time_ms: 0,

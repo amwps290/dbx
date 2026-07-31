@@ -28,4 +28,15 @@ describe("appendQueryResultSegment spatial merge", () => {
     const merged = appendQueryResultSegment(previous, segment, 100);
     expect(merged.spatial_columns).toEqual([{ column_index: 0, srid: 4490 }]);
   });
+
+  it("concatenates per-cell SRIDs across pages without collapsing", () => {
+    const previous = make(2, [{ column_index: 0, srid: 4326 }]);
+    previous.spatial_values = [[4326], [3857]];
+    const segment = make(2, [{ column_index: 0, srid: null }]);
+    segment.spatial_values = [[3857], [4490]];
+
+    const merged = appendQueryResultSegment(previous, segment, 100);
+    // Every row keeps its own SRID; a later page does not overwrite earlier cells.
+    expect(merged.spatial_values).toEqual([[4326], [3857], [3857], [4490]]);
+  });
 });

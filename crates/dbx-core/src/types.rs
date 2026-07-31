@@ -281,6 +281,12 @@ pub struct QueryResult {
     /// `rows` so displayed, copied, exported, and edited values remain WKT.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spatial_columns: Vec<SpatialColumn>,
+    /// Per-cell SRID metadata, parallel to `rows`: `spatial_values[row][column]`
+    /// is the SRID of that cell's geometry value (`None` for non-spatial cells
+    /// or unknown SRID). Unlike `spatial_columns` (a column-level hint), every
+    /// geometry value keeps its own SRID so mixed-SRID results stay correct.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spatial_values: Vec<Vec<Option<u32>>>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub affected_rows: u64,
     pub execution_time_ms: u128,

@@ -113,12 +113,22 @@ let tileLayer: L.TileLayer | null = null;
 let mapResizeObserver: ResizeObserver | null = null;
 let _geojsonData: any = null;
 let mapGeneration = 0;
-let coordinateConverter: CoordinateToLatLng | null = null;
+let coordinateConverters = new globalThis.Map<number, CoordinateToLatLng>();
 
 interface PreviewFeature {
   type: "Feature";
   geometry: GeoJsonGeometry | null;
   properties?: Record<string, unknown> | null;
+}
+
+/**
+ * SRID a feature should be projected with: a manual CRS override applies to
+ * every feature; otherwise each feature uses its own per-cell SRID, falling
+ * back to the detected/selected one when unknown.
+ */
+function featureSrid(feature: PreviewFeature): number {
+  const manualSrid = selectedSrid.value !== (detectedSrid.value ?? null) ? selectedSrid.value : null;
+  return manualSrid ?? (typeof feature.properties?._srid === "number" ? feature.properties._srid : effectiveSrid.value);
 }
 
 async function loadLeaflet(): Promise<typeof L> {
@@ -210,7 +220,7 @@ function updateLabels() {
   for (const f of features) {
     const value = f.properties?.[prop];
     if (value == null) continue;
-    const coords = getLabelCoords(f.geometry);
+    const coords = getLabelCoords(f.geometry, featureSrid(f));
     if (!coords) continue;
     const icon = L.divIcon({
       className: "layer-preview-label",
@@ -252,9 +262,9 @@ function geometryCoordinatesAreValid(geometry: any, srid: number, converter: (co
   });
 }
 
-function getLabelCoords(geom: any): [number, number] | null {
-  const converter = coordinateConverter;
-  if (!geom || !converter || !geometryCoordinatesAreValid(geom, effectiveSrid.value, converter)) return null;
+function getLabelCoords(geom: any, srid: number): [number, number] | null {
+  const converter = coordinateConverters.get(srid) ?? null;
+  if (!geom || !converter || !geometryCoordinatesAreValid(geom, srid, converter)) return null;
   const pts = collectCoordinatePairs(geom);
   if (pts.length === 0) return null;
   const projected = pts.map((coord) => converter(coord));
@@ -378,21 +388,32 @@ async function renderLayer(generation: number) {
   const data = _geojsonData;
 
   try {
-    const converter = await prepareCoordsToLatLng(effectiveSrid.value, leaflet);
+    const features = (data.features ?? []) as PreviewFeature[];
+    const sridsNeeded = new Set<number>();
+    for (const feature of features) {
+      const srid = featureSrid(feature);
+      if (Number.isInteger(srid) && srid > 0) sridsNeeded.add(srid);
+    }
+    const converters = new globalThis.Map<number, CoordinateToLatLng>();
+    for (const srid of sridsNeeded) {
+      const converter = await prepareCoordsToLatLng(srid, leaflet);
+      if (converter) converters.set(srid, converter);
+    }
     if (generation !== mapGeneration || !map) return;
-    if (!converter) {
+    if (converters.size === 0) {
       mapError.value = t("grid.layerPreviewUnsupportedCrs", { srid: effectiveSrid.value });
       return;
     }
-    coordinateConverter = converter;
+    coordinateConverters = converters;
 
     geoLayer = leaflet.featureGroup().addTo(map);
-    const features = (data.features ?? []) as PreviewFeature[];
     const summary = renderGeometryFeaturesIndependently(
       features,
       (feature) => {
         const geometry = feature.geometry;
-        if (!geometry || !geometryCoordinatesAreValid(geometry, effectiveSrid.value, converter)) {
+        const srid = featureSrid(feature);
+        const converter = converters.get(srid) ?? null;
+        if (!geometry || !converter || !geometryCoordinatesAreValid(geometry, srid, converter)) {
           return null;
         }
         const layer = leaflet.geoJSON(feature as unknown as Parameters<(typeof L)["geoJSON"]>[0], {
@@ -407,7 +428,7 @@ async function renderLayer(generation: number) {
           pointToLayer: pointToCircleFeature,
           onEachFeature: (sourceFeature, layer) => layer.bindPopup(popupContent(sourceFeature)),
         });
-        return { layer, srid: effectiveSrid.value };
+        return { layer, srid };
       },
       (layer) => layer.addTo(geoLayer!),
       (error) => console.warn("[LayerPreview] skipped invalid feature", error),
@@ -494,7 +515,7 @@ function cleanupMap() {
     map = null;
   }
   _geojsonData = null;
-  coordinateConverter = null;
+  coordinateConverters = new globalThis.Map();
   detectedSrid.value = null;
   selectedSrid.value = 4326;
   showCustomSrid.value = false;

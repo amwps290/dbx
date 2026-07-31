@@ -49,6 +49,7 @@ export function buildGeometryMapFeatureCollection(ctx: PreviewActionContext): Ge
   const features: GeometryMapFeature[] = [];
   const seen = new Set<string>();
   const sridByColumn = new Map<number, number | null>((ctx.result.spatial_columns ?? []).map((entry) => [entry.column_index, entry.srid]));
+  const spatialValues = ctx.result.spatial_values ?? [];
   let detectedSrid: number | null = null;
 
   for (const ref of ctx.displayRowRefs) {
@@ -64,12 +65,17 @@ export function buildGeometryMapFeatureCollection(ctx: PreviewActionContext): Ge
       seen.add(wkt);
       const geometry = wktToGeoJson(wkt);
       if (!geometry) continue;
-      const columnSrid = sridByColumn.get(colIdx) ?? null;
-      if (detectedSrid == null && columnSrid != null) detectedSrid = columnSrid;
+      // Prefer the per-cell SRID carried with this feature; fall back to the
+      // column-level default hint so older results without spatial_values still
+      // render with a detected CRS.
+      const cellSrid = spatialValues[ref.sourceIndex]?.[colIdx] ?? null;
+      const srid = cellSrid ?? sridByColumn.get(colIdx) ?? null;
+      if (detectedSrid == null && srid != null) detectedSrid = srid;
 
       const properties: Record<string, unknown> = {
         _column: ctx.result.columns[colIdx],
         _row: ref.sourceIndex,
+        _srid: srid,
       };
       for (let c = 0; c < ctx.result.columns.length; c++) {
         if (geomIndices.includes(c)) continue;
