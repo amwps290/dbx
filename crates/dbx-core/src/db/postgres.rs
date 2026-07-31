@@ -990,11 +990,12 @@ async fn execute_select_prepared(
         truncated
     );
 
+    let (spatial_columns, spatial_values) = spatial_columns.finish_with_values(spatial_values);
     Ok(PreparedSelectOutcome::Complete(QueryResult {
         columns,
         column_types,
         column_sortables: Vec::new(),
-        spatial_columns: spatial_columns.finish(),
+        spatial_columns,
         spatial_values,
         rows: result_rows,
         affected_rows: 0,
@@ -1076,11 +1077,12 @@ async fn execute_select_text(
         }
     }
 
+    let (spatial_columns, spatial_values) = spatial_columns.finish_with_values(spatial_values);
     Ok(QueryResult {
         column_types: matching_pg_text_column_types(&columns, prepared_column_types),
         columns,
         column_sortables: Vec::new(),
-        spatial_columns: spatial_columns.finish(),
+        spatial_columns,
         spatial_values,
         rows: result_rows,
         affected_rows: 0,

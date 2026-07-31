@@ -264,6 +264,15 @@ impl SpatialColumnBuilder {
     pub(crate) fn finish(self) -> Vec<SpatialColumn> {
         self.columns.into_iter().map(|(column_index, srid)| SpatialColumn { column_index, srid }).collect()
     }
+
+    pub(crate) fn finish_with_values(
+        self,
+        spatial_values: Vec<Vec<Option<u32>>>,
+    ) -> (Vec<SpatialColumn>, Vec<Vec<Option<u32>>>) {
+        let spatial_columns = self.finish();
+        let spatial_values = if spatial_columns.is_empty() { Vec::new() } else { spatial_values };
+        (spatial_columns, spatial_values)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +479,19 @@ mod tests {
         builder.observe(0, Some(0)); // SRID 0 -> unknown
         assert_eq!(builder.finish(), vec![SpatialColumn { column_index: 0, srid: None }]);
         assert!(SpatialColumnBuilder::default().finish().is_empty());
+    }
+
+    #[test]
+    fn spatial_builder_omits_values_without_spatial_columns() {
+        let values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::default().finish_with_values(values);
+        assert!(columns.is_empty());
+        assert!(values.is_empty());
+
+        let expected_values = vec![vec![None, None]];
+        let (columns, values) = SpatialColumnBuilder::new([0]).finish_with_values(expected_values.clone());
+        assert_eq!(columns, vec![SpatialColumn { column_index: 0, srid: None }]);
+        assert_eq!(values, expected_values);
     }
 
     #[test]

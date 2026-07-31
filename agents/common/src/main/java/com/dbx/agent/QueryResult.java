@@ -164,7 +164,11 @@ public final class QueryResult {
         for (Integer columnIndex : spatialColumnIndexes) {
             spatialColumns.add(new SpatialColumn(columnIndex, sridByColumn.get(columnIndex)));
         }
-        return new NormalizedRows(normalized, spatialColumns, spatialValues);
+        return new NormalizedRows(
+            normalized,
+            spatialColumns,
+            spatialColumns.isEmpty() ? Collections.emptyList() : spatialValues
+        );
     }
 
     static final class NormalizedRows {

@@ -215,6 +215,25 @@ class PostgresLikeAgentTest {
             result.getSpatial_values());
     }
 
+    @Test
+    void normalizeOmitsSpatialValuesForNonSpatialRows() {
+        List<List<Object>> rows = java.util.Collections.singletonList(java.util.Arrays.asList(1, "plain text"));
+
+        QueryResult result = new QueryResult(
+            java.util.Arrays.asList("id", "note"),
+            java.util.Arrays.asList("int4", "text"),
+            rows, 0L, 0L, false);
+        QueryPageResult page = new QueryPageResult(
+            java.util.Arrays.asList("id", "note"),
+            java.util.Arrays.asList("int4", "text"),
+            rows, 0L, 0L, false, "session", false);
+
+        assertTrue(result.getSpatial_columns().isEmpty());
+        assertTrue(result.getSpatial_values().isEmpty());
+        assertTrue(page.getSpatial_columns().isEmpty());
+        assertTrue(page.getSpatial_values().isEmpty());
+    }
+
     private static final class TestPostgresLikeAgent extends PostgresLikeAgent {
         private final Connection connection;
 

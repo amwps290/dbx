@@ -55,9 +55,7 @@ describe("buildGeometryMapFeatureCollection", () => {
     ];
 
     const collection = buildGeometryMapFeatureCollection(ctx);
-    // displayRowRefs order is [mercator, wgs84, unknown]; the unknown cell falls
-    // back to the column-level default 4326.
-    expect(collection?.features.map((feature) => feature.properties._srid)).toEqual([3857, 4326, 4326]);
+    expect(collection?.features.map((feature) => feature.properties._srid)).toEqual([3857, 4326, null]);
   });
 
   it("prefers per-cell SRIDs over column-level hints", () => {
@@ -72,5 +70,32 @@ describe("buildGeometryMapFeatureCollection", () => {
     const collection = buildGeometryMapFeatureCollection(ctx);
     // wgs84 row carries its own 4326 even though the column hint says 3857.
     expect(collection?.features.find((f) => f.properties.name === "wgs84")?.properties._srid).toBe(4326);
+  });
+
+  it("uses the column-level hint only for legacy results without per-cell metadata", () => {
+    const ctx = context();
+    ctx.result.spatial_columns = [{ column_index: 0, srid: 3857 }];
+    ctx.result.spatial_values = undefined;
+
+    const collection = buildGeometryMapFeatureCollection(ctx);
+    expect(collection?.features.map((feature) => feature.properties._srid)).toEqual([3857, 3857, 3857]);
+  });
+
+  it("deduplicates geometry by SRID and WKT", () => {
+    const ctx = context();
+    ctx.result.rows = [
+      ["POINT(1 2)", "wgs84"],
+      ["POINT(1 2)", "mercator"],
+      ["POINT(1 2)", "duplicate wgs84"],
+    ];
+    ctx.result.spatial_values = [
+      [4326, null],
+      [3857, null],
+      [4326, null],
+    ];
+
+    const collection = buildGeometryMapFeatureCollection(ctx);
+    expect(collection?.features.map((feature) => feature.properties._srid)).toEqual([3857, 4326]);
+    expect(collection?.features.map((feature) => feature.properties.name)).toEqual(["mercator", "wgs84"]);
   });
 });
