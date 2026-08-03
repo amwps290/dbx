@@ -397,6 +397,22 @@ func TestHandshakeAdvertisesMultiSession(t *testing.T) {
 	}
 }
 
+// dsnContainsParam reports whether dsn contains key= as a real parameter pair
+// (not as a substring of another parameter name such as fallback_application_name).
+func dsnContainsParam(dsn, key string) bool {
+	lowerDSN := strings.ToLower(dsn)
+	needle := strings.ToLower(strings.TrimSpace(key)) + "="
+	if strings.HasPrefix(lowerDSN, needle) {
+		return true
+	}
+	for _, boundary := range []string{" ", "?", "&"} {
+		if strings.Contains(lowerDSN, boundary+needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestBuildDSNQuotesCredentialsAndFiltersKeys(t *testing.T) {
 	dsn := buildDSN(connectParams{
 		Host:      "db host",
@@ -404,17 +420,83 @@ func TestBuildDSNQuotesCredentialsAndFiltersKeys(t *testing.T) {
 		Database:  "test'db",
 		Username:  "system",
 		Password:  `p'ass\\word`,
-		URLParams: "application_name=dbx&bad-key=ignored",
+		URLParams: "application_name=ignored&fallback_application_name=dbx&bad-key=ignored",
 	})
 	for _, expected := range []string{
-		`host='db host'`, `dbname='test\'db'`, `password='p\'ass\\\\word'`, `application_name='dbx'`,
+		`host='db host'`, `dbname='test\'db'`, `password='p\'ass\\\\word'`, `fallback_application_name='dbx'`,
 	} {
 		if !strings.Contains(dsn, expected) {
 			t.Fatalf("DSN missing %q: %s", expected, dsn)
 		}
 	}
-	if strings.Contains(dsn, "bad-key") {
-		t.Fatalf("unsafe parameter key was accepted: %s", dsn)
+	for _, skipped := range []string{"application_name", "bad-key"} {
+		if dsnContainsParam(dsn, skipped) {
+			t.Fatalf("unsupported parameter %q was not skipped: %s", skipped, dsn)
+		}
+	}
+}
+
+func TestBuildDSNKeepsOnlySupportedDriverParameters(t *testing.T) {
+	cp := connectParams{
+		Host:      "127.0.0.1",
+		Port:      54321,
+		Database:  "test",
+		Username:  "system",
+		Password:  "secret",
+		URLParams: "fallback_application_name=dbx&connect_timeout=30&sslcert=cert.pem&sslkey=key.pem&sslrootcert=root.pem" +
+			"&application_name=ignored&options=-csearch_path&search_path=public&statement_timeout=1000&target_session_attrs=read-write",
+	}
+	dsn := buildDSN(cp)
+	for _, expected := range []string{
+		`fallback_application_name='dbx'`, `connect_timeout='30'`, `sslcert='cert.pem'`, `sslkey='key.pem'`, `sslrootcert='root.pem'`,
+	} {
+		if !strings.Contains(dsn, expected) {
+			t.Fatalf("DSN missing supported parameter %q: %s", expected, dsn)
+		}
+	}
+	for _, skipped := range []string{"application_name", "options", "search_path", "statement_timeout", "target_session_attrs"} {
+		if dsnContainsParam(dsn, skipped) {
+			t.Fatalf("unsupported parameter %q was not skipped: %s", skipped, dsn)
+		}
+	}
+}
+
+func TestBuildDSNKeepsOnlySupportedParametersInNativeConnectionStrings(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		connectionString   string
+		preservedFragments []string
+	}{
+		{
+			name:             "keyword DSN",
+			connectionString: "host=db.example.com port=54321 connect_timeout=30 fallback_application_name='dbx' application_name=ignored options='-c search_path=public' statement_timeout=1000",
+			preservedFragments: []string{
+				"connect_timeout=30",
+				"fallback_application_name='dbx'",
+			},
+		},
+		{
+			name:             "Kingbase URL",
+			connectionString: "kingbase://system:secret@db.example.com:54321/test?connect_timeout=30&fallback_application_name=dbx&application_name=ignored&options=-c%20search_path%3Dpublic&statement_timeout=1000",
+			preservedFragments: []string{
+				"connect_timeout=30",
+				"fallback_application_name=dbx",
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dsn := buildDSN(connectParams{ConnectionString: test.connectionString})
+			for _, expected := range test.preservedFragments {
+				if !strings.Contains(dsn, expected) {
+					t.Fatalf("native DSN missing supported parameter %q: %s", expected, dsn)
+				}
+			}
+			for _, skipped := range []string{"application_name", "options", "search_path", "statement_timeout"} {
+				if dsnContainsParam(dsn, skipped) {
+					t.Fatalf("native DSN kept unsupported parameter %q: %s", skipped, dsn)
+				}
+			}
+		})
 	}
 }
 
@@ -440,7 +522,7 @@ func TestBuildDSNNormalizesPreferWithoutPassingLiteralMode(t *testing.T) {
 		Database:  "test",
 		Username:  "system",
 		Password:  "secret",
-		URLParams: "SSLMODE=disable&sslmode=prefer&application_name=dbx",
+		URLParams: "SSLMODE=disable&sslmode=prefer&fallback_application_name=dbx",
 	}
 	if mode := effectiveSSLMode(cp); mode != "prefer" {
 		t.Fatalf("unexpected effective SSL mode: %q", mode)
@@ -452,7 +534,7 @@ func TestBuildDSNNormalizesPreferWithoutPassingLiteralMode(t *testing.T) {
 	if !strings.Contains(dsn, "sslmode=require") || strings.Contains(strings.ToLower(dsn), "sslmode=prefer") {
 		t.Fatalf("prefer must be converted to the first require attempt: %s", dsn)
 	}
-	if !strings.Contains(dsn, "application_name='dbx'") {
+	if !strings.Contains(dsn, "fallback_application_name='dbx'") {
 		t.Fatalf("unrelated URL parameters must be preserved: %s", dsn)
 	}
 }
@@ -462,23 +544,31 @@ func TestBuildDSNOverridesPreferInNativeConnectionStrings(t *testing.T) {
 		name               string
 		connectionString   string
 		preservedFragments []string
+		droppedFragments   []string
 	}{
 		{
 			name:             "keyword DSN",
-			connectionString: "host=db.example.com application_name='dbx app' sslmode = 'prefer' options='-c search_path=public tenant'",
+			connectionString: "host=db.example.com fallback_application_name='dbx app' sslmode = 'prefer' options='-c search_path=public tenant'",
 			preservedFragments: []string{
 				"host=db.example.com",
-				"application_name='dbx app'",
-				"options='-c search_path=public tenant'",
+				"fallback_application_name='dbx app'",
+			},
+			droppedFragments: []string{
+				"application_name",
+				"options",
+				"search_path",
 			},
 		},
 		{
 			name:             "Kingbase URL",
-			connectionString: "kingbase://system:secret@db.example.com/test?application_name=dbx&SSLMODE=prefer#section",
+			connectionString: "kingbase://system:secret@db.example.com/test?application_name=dbx&fallback_application_name=dbx&SSLMODE=prefer#section",
 			preservedFragments: []string{
 				"kingbase://system:secret@db.example.com/test?",
-				"application_name=dbx",
+				"fallback_application_name=dbx",
 				"#section",
+			},
+			droppedFragments: []string{
+				"application_name",
 			},
 		},
 	} {
@@ -499,6 +589,11 @@ func TestBuildDSNOverridesPreferInNativeConnectionStrings(t *testing.T) {
 					t.Fatalf("native DSN lost %q: %s", fragment, dsn)
 				}
 			}
+			for _, fragment := range test.droppedFragments {
+				if dsnContainsParam(dsn, fragment) {
+					t.Fatalf("native DSN kept unsupported %q: %s", fragment, dsn)
+				}
+			}
 		})
 	}
 }
@@ -511,18 +606,18 @@ func TestOpenAndPingDBNativeConnectionStringsWithoutSSLModeUsePreferFallback(t *
 	}{
 		{
 			name:             "keyword DSN",
-			connectionString: "host=db.example.com application_name=dbx",
+			connectionString: "host=db.example.com fallback_application_name=dbx application_name=ignored",
 			preservedFragments: []string{
 				"host=db.example.com",
-				"application_name=dbx",
+				"fallback_application_name=dbx",
 			},
 		},
 		{
 			name:             "Kingbase URL",
-			connectionString: "kingbase://system:secret@db.example.com/test?application_name=dbx",
+			connectionString: "kingbase://system:secret@db.example.com/test?application_name=ignored&fallback_application_name=dbx",
 			preservedFragments: []string{
 				"kingbase://system:secret@db.example.com/test?",
-				"application_name=dbx",
+				"fallback_application_name=dbx",
 			},
 		},
 	} {

@@ -917,7 +917,7 @@ func buildDSNWithSSLMode(cp connectParams, sslMode string) string {
 	}
 	for _, pair := range strings.FieldsFunc(cp.URLParams, func(r rune) bool { return r == '&' || r == ';' }) {
 		key, value, ok := strings.Cut(pair, "=")
-		if ok && isSafeParamKey(key) && !strings.EqualFold(strings.TrimSpace(key), "sslmode") {
+		if ok && isSafeParamKey(key) && isSupportedDSNParam(key) && !strings.EqualFold(strings.TrimSpace(key), "sslmode") {
 			parts = append(parts, strings.TrimSpace(key)+"="+quoteDSNValue(strings.TrimSpace(value)))
 		}
 	}
@@ -999,7 +999,7 @@ func rewriteNativeConnectionStringSSLMode(value, sslMode string) string {
 			for _, pair := range strings.Split(query, "&") {
 				key, _, _ := strings.Cut(pair, "=")
 				decodedKey, err := url.QueryUnescape(key)
-				if err == nil && strings.EqualFold(decodedKey, "sslmode") {
+				if err == nil && (strings.EqualFold(decodedKey, "sslmode") || !isSupportedDSNParam(decodedKey)) {
 					continue
 				}
 				if pair != "" {
@@ -1019,7 +1019,7 @@ func rewriteNativeConnectionStringSSLMode(value, sslMode string) string {
 	result := make([]string, 0, len(fields)+1)
 	for _, field := range fields {
 		key, _, ok := strings.Cut(field, "=")
-		if ok && strings.EqualFold(strings.TrimSpace(key), "sslmode") {
+		if ok && (strings.EqualFold(strings.TrimSpace(key), "sslmode") || !isSupportedDSNParam(key)) {
 			continue
 		}
 		result = append(result, field)
@@ -1094,6 +1094,28 @@ func isKingbaseJDBCURL(value string) bool {
 
 func quoteDSNValue(value string) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), "'", `\'`) + "'"
+}
+
+// supportedDSNParams lists the connection parameters the underlying gokb
+// driver understands (its libpq compatibility surface). Any other keyword is
+// ignored when building a DSN because the driver rejects unknown parameters.
+var supportedDSNParams = map[string]struct{}{
+	"dbname":                    {},
+	"user":                      {},
+	"password":                  {},
+	"host":                      {},
+	"port":                      {},
+	"sslmode":                   {},
+	"fallback_application_name": {},
+	"connect_timeout":           {},
+	"sslcert":                   {},
+	"sslkey":                    {},
+	"sslrootcert":               {},
+}
+
+func isSupportedDSNParam(key string) bool {
+	_, ok := supportedDSNParams[strings.ToLower(strings.TrimSpace(key))]
+	return ok
 }
 
 func isSafeParamKey(value string) bool {
