@@ -514,6 +514,109 @@ func TestBuildDSNKeepsOnlySupportedNativeConnectionStringParameters(t *testing.T
 	}
 }
 
+// kingbaseParamSurfaces expands a &-separated parameter list into the three
+// connection-input surfaces the driver must treat consistently: app-supplied
+// url_params, a native keyword DSN, and a kingbase:// URL. Values must not
+// contain spaces so they survive the keyword-DSN join.
+func kingbaseParamSurfaces(params string) map[string]connectParams {
+	pairs := strings.Split(params, "&")
+	keyword := "host=db.example.com user=system password=secret dbname=test " + strings.Join(pairs, " ")
+	kurl := "kingbase://system:secret@db.example.com:54321/test?" + params
+	return map[string]connectParams{
+		"url_params":   {Host: "db.example.com", Port: 54321, Database: "test", Username: "system", Password: "secret", URLParams: params},
+		"keyword_dsn":  {ConnectionString: keyword},
+		"kingbase_url": {ConnectionString: kurl},
+	}
+}
+
+// TestBuildDSNForwardsUnknownServerParameters locks in the review's central
+// requirement: gokb forwards every non-driver-setting to the server startup
+// packet (conn.go startup()), so user/session GUCs that are not in the curated
+// native list must still be passed through rather than silently dropped.
+func TestBuildDSNForwardsUnknownServerParameters(t *testing.T) {
+	for surface, cp := range kingbaseParamSurfaces("plan_cache_mode=force_generic_plan&row_security=off&bytea_output=hex") {
+		t.Run(surface, func(t *testing.T) {
+			dsn := buildDSN(cp)
+			for _, key := range []string{"plan_cache_mode", "row_security", "bytea_output"} {
+				if !dsnContainsParam(dsn, key) {
+					t.Fatalf("expected server GUC %q to be forwarded: %s", key, dsn)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDSNNormalizesJDBCAliases verifies JDBC properties with a direct native
+// equivalent are rewritten to the gokb/server name instead of being discarded.
+func TestBuildDSNNormalizesJDBCAliases(t *testing.T) {
+	for surface, cp := range kingbaseParamSurfaces("connectTimeout=20&currentSchema=public&ApplicationName=dbx&clientEncoding=UTF-8") {
+		t.Run(surface, func(t *testing.T) {
+			dsn := buildDSN(cp)
+			for _, native := range []string{"connect_timeout", "search_path", "application_name", "client_encoding"} {
+				if !dsnContainsParam(dsn, native) {
+					t.Fatalf("expected JDBC alias to normalize to %q: %s", native, dsn)
+				}
+			}
+			for _, jdbc := range []string{"connectTimeout", "currentSchema", "ApplicationName", "clientEncoding"} {
+				if dsnContainsParam(dsn, jdbc) {
+					t.Fatalf("JDBC alias %q must not be forwarded verbatim: %s", jdbc, dsn)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDSNDropsNonUTF8ClientEncoding checks that a non-UTF-8 clientEncoding
+// is dropped: gokb rejects any client_encoding other than UTF-8, so forwarding
+// or renaming a GBK value would fail the whole connection.
+func TestBuildDSNDropsNonUTF8ClientEncoding(t *testing.T) {
+	for surface, cp := range kingbaseParamSurfaces("clientEncoding=GBK") {
+		t.Run(surface, func(t *testing.T) {
+			dsn := buildDSN(cp)
+			if dsnContainsParam(dsn, "client_encoding") || strings.Contains(strings.ToLower(dsn), "gbk") {
+				t.Fatalf("non-UTF8 clientEncoding must be dropped: %s", dsn)
+			}
+		})
+	}
+}
+
+// TestBuildDSNDropsUnknownCamelCaseJDBCProperties guards the heuristic: unknown
+// camelCase names are treated as client-side JDBC properties and dropped, since
+// forwarding them would make the server reject the startup packet.
+func TestBuildDSNDropsUnknownCamelCaseJDBCProperties(t *testing.T) {
+	for surface, cp := range kingbaseParamSurfaces("tinyInt1isBit=true&someFutureJdbcFlag=1") {
+		t.Run(surface, func(t *testing.T) {
+			dsn := buildDSN(cp)
+			for _, jdbc := range []string{"tinyInt1isBit", "someFutureJdbcFlag"} {
+				if dsnContainsParam(dsn, jdbc) {
+					t.Fatalf("unknown camelCase JDBC property %q must be dropped: %s", jdbc, dsn)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildDSNParameterPrecedenceNativeBeatsAlias verifies duplicate-parameter
+// precedence: an explicit native parameter wins over its JDBC alias and the
+// parameter is emitted exactly once (no duplicate for gokb to resolve).
+func TestBuildDSNParameterPrecedenceNativeBeatsAlias(t *testing.T) {
+	for surface, cp := range kingbaseParamSurfaces("connect_timeout=30&connectTimeout=10") {
+		t.Run(surface, func(t *testing.T) {
+			dsn := buildDSN(cp)
+			if got := strings.Count(strings.ToLower(dsn), "connect_timeout="); got != 1 {
+				t.Fatalf("connect_timeout must appear exactly once, saw %d: %s", got, dsn)
+			}
+			unquoted := strings.ReplaceAll(dsn, "'", "")
+			if !strings.Contains(unquoted, "connect_timeout=30") {
+				t.Fatalf("native connect_timeout=30 must win over alias: %s", dsn)
+			}
+			if strings.Contains(unquoted, "connect_timeout=10") {
+				t.Fatalf("alias connectTimeout=10 must not win: %s", dsn)
+			}
+		})
+	}
+}
+
 func TestBuildDSNConvertsDBXJDBCURL(t *testing.T) {
 	dsn := buildDSN(connectParams{
 		Host:             "127.0.0.1",
