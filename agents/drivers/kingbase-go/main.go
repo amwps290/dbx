@@ -1096,21 +1096,78 @@ func quoteDSNValue(value string) string {
 	return "'" + strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), "'", `\'`) + "'"
 }
 
-// supportedDSNParams lists the connection parameters the underlying gokb
-// driver understands (its libpq compatibility surface). Any other keyword is
-// ignored when building a DSN because the driver rejects unknown parameters.
+// supportedDSNParams is the allow-list of connection parameters that are
+// understood by the gokb driver or by the Kingbase server itself. Anything
+// else (typically client-side JDBC settings such as useSSL, serverTimezone or
+// rewriteBatchedStatements) would be forwarded to the server in the startup
+// packet and rejected with "unrecognized configuration parameter", so it is
+// filtered out.
+//
+// The list mirrors the driver's own surface:
+//   - gokb conn.go isDriverSetting(): host, port, password, sslmode, sslcert,
+//     sslkey, sslrootcert, fallback_application_name, connect_timeout,
+//     disable_prepared_binary_result, binary_parameters, krbsrvname, krbspn;
+//   - the standard startup keywords user and dbname;
+//   - connector.go special handling: client_encoding (must be UTF8),
+//     datestyle, extra_float_digits;
+//   - common Kingbase/PostgreSQL run-time parameters that can be set in the
+//     startup packet: application_name, options, search_path,
+//     statement_timeout, work_mem, timezone and friends.
 var supportedDSNParams = map[string]struct{}{
-	"dbname":                    {},
-	"user":                      {},
-	"password":                  {},
-	"host":                      {},
-	"port":                      {},
-	"sslmode":                   {},
-	"fallback_application_name": {},
-	"connect_timeout":           {},
-	"sslcert":                   {},
-	"sslkey":                    {},
-	"sslrootcert":               {},
+	// gokb driver settings (conn.go isDriverSetting) and startup keywords
+	"host":                           {},
+	"port":                           {},
+	"user":                           {},
+	"password":                       {},
+	"dbname":                         {},
+	"sslmode":                        {},
+	"sslcert":                        {},
+	"sslkey":                         {},
+	"sslrootcert":                    {},
+	"fallback_application_name":      {},
+	"connect_timeout":                {},
+	"disable_prepared_binary_result": {},
+	"binary_parameters":              {},
+	"krbsrvname":                     {},
+	"krbspn":                         {},
+
+	// connector.go special handling
+	"client_encoding":    {},
+	"datestyle":          {},
+	"extra_float_digits": {},
+
+	// Common run-time parameters the Kingbase server accepts in the startup
+	// packet (PostgreSQL-compatible GUCs).
+	"application_name":                    {},
+	"options":                             {},
+	"search_path":                         {},
+	"statement_timeout":                   {},
+	"lock_timeout":                        {},
+	"idle_in_transaction_session_timeout": {},
+	"idle_session_timeout":                {},
+	"work_mem":                            {},
+	"maintenance_work_mem":                {},
+	"temp_buffers":                        {},
+	"effective_cache_size":                {},
+	"timezone":                            {},
+	"intervalstyle":                       {},
+	"lc_messages":                         {},
+	"lc_monetary":                         {},
+	"lc_numeric":                          {},
+	"lc_time":                             {},
+	"default_transaction_isolation":       {},
+	"default_transaction_read_only":       {},
+	"default_transaction_deferrable":      {},
+	"synchronous_commit":                  {},
+	"client_min_messages":                 {},
+	"standard_conforming_strings":         {},
+	"xmloption":                           {},
+	"role":                                {},
+	"session_replication_role":            {},
+	"default_tablespace":                  {},
+	"temp_tablespaces":                    {},
+	"default_table_access_method":         {},
+	"max_parallel_workers_per_gather":     {},
 }
 
 func isSupportedDSNParam(key string) bool {
