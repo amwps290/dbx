@@ -600,20 +600,38 @@ func TestBuildDSNDropsUnknownCamelCaseJDBCProperties(t *testing.T) {
 // precedence: an explicit native parameter wins over its JDBC alias and the
 // parameter is emitted exactly once (no duplicate for gokb to resolve).
 func TestBuildDSNParameterPrecedenceNativeBeatsAlias(t *testing.T) {
-	for surface, cp := range kingbaseParamSurfaces("connect_timeout=30&connectTimeout=10") {
-		t.Run(surface, func(t *testing.T) {
-			dsn := buildDSN(cp)
-			if got := strings.Count(strings.ToLower(dsn), "connect_timeout="); got != 1 {
-				t.Fatalf("connect_timeout must appear exactly once, saw %d: %s", got, dsn)
-			}
-			unquoted := strings.ReplaceAll(dsn, "'", "")
-			if !strings.Contains(unquoted, "connect_timeout=30") {
-				t.Fatalf("native connect_timeout=30 must win over alias: %s", dsn)
-			}
-			if strings.Contains(unquoted, "connect_timeout=10") {
-				t.Fatalf("alias connectTimeout=10 must not win: %s", dsn)
-			}
-		})
+	for _, params := range []string{"connect_timeout=30&connectTimeout=10", "connectTimeout=10&connect_timeout=30"} {
+		for surface, cp := range kingbaseParamSurfaces(params) {
+			t.Run(surface+"/"+params, func(t *testing.T) {
+				dsn := buildDSN(cp)
+				if got := strings.Count(strings.ToLower(dsn), "connect_timeout="); got != 1 {
+					t.Fatalf("connect_timeout must appear exactly once, saw %d: %s", got, dsn)
+				}
+				unquoted := strings.ReplaceAll(dsn, "'", "")
+				if !strings.Contains(unquoted, "connect_timeout=30") {
+					t.Fatalf("native connect_timeout=30 must win over alias: %s", dsn)
+				}
+				if strings.Contains(unquoted, "connect_timeout=10") {
+					t.Fatalf("alias connectTimeout=10 must not win: %s", dsn)
+				}
+			})
+		}
+	}
+}
+
+func TestBuildDSNPreservesFirstDuplicateWithinSameParameterClass(t *testing.T) {
+	for _, params := range []string{"application_name=first&application_name=second", "ApplicationName=first&applicationName=second"} {
+		for surface, cp := range kingbaseParamSurfaces(params) {
+			t.Run(surface+"/"+params, func(t *testing.T) {
+				dsn := strings.ReplaceAll(buildDSN(cp), "'", "")
+				if !strings.Contains(dsn, "application_name=first") {
+					t.Fatalf("first duplicate value must be preserved: %s", dsn)
+				}
+				if strings.Contains(dsn, "application_name=second") {
+					t.Fatalf("later duplicate value must not replace the first: %s", dsn)
+				}
+			})
+		}
 	}
 }
 

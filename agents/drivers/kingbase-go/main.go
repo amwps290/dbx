@@ -1333,15 +1333,16 @@ func classifyDSNParam(key, decodedValue string) (nativeKey string, keep bool) {
 
 // mergeDSNParams applies duplicate-parameter precedence: an explicit native
 // parameter beats a JDBC alias for the same key, and within the same class the
-// last occurrence wins. Output order follows each key's first appearance.
+// first occurrence wins to preserve gokb's existing DSN behavior. Output order
+// follows each key's first appearance.
 func mergeDSNParams(params []dsnParam) []dsnParam {
 	result := make([]dsnParam, 0, len(params))
 	pos := make(map[string]int, len(params))
 	for _, p := range params {
 		if i, ok := pos[p.key]; ok {
-			// Overwrite unless the existing entry is an explicit native parameter
-			// and the new one is only an alias.
-			if result[i].fromAlias || !p.fromAlias {
+			// A later explicit native parameter may replace an earlier alias, but
+			// same-class duplicates keep the first value just as gokb does.
+			if result[i].fromAlias && !p.fromAlias {
 				result[i] = p
 			}
 			continue
