@@ -2345,6 +2345,8 @@ async fn external_driver_presto_like_objects(
             schema: Some(schema.to_string()),
             valid: None,
             signature: None,
+            custom_type_kind: None,
+            has_members: None,
             comment: table.comment,
             created_at: None,
             updated_at: None,
@@ -2562,7 +2564,7 @@ mod tests {
     use super::{list_databases_core, list_tables_core};
     use super::{
         object_types_include_custom_types, object_types_include_relations, object_types_include_routines,
-        object_types_only_custom_types, supports_pg_custom_type_objects,
+        object_types_only_custom_types, supports_custom_type_details, supports_pg_custom_type_objects,
     };
     use crate::connection::{AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseType};
@@ -2748,6 +2750,29 @@ mod tests {
             DatabaseType::Redshift,
         ] {
             assert!(!supports_pg_custom_type_objects(&test_connection_config(db_type)), "{db_type:?}");
+        }
+    }
+
+    #[test]
+    fn supports_custom_type_details_covers_five_verified_families() {
+        for db_type in [
+            DatabaseType::Postgres,
+            DatabaseType::OpenGauss,
+            DatabaseType::Gaussdb,
+            DatabaseType::Kingbase,
+            DatabaseType::Vastbase,
+        ] {
+            assert!(supports_custom_type_details(&test_connection_config(db_type)), "{db_type:?}");
+        }
+        for db_type in [
+            DatabaseType::Highgo,
+            DatabaseType::Uxdb,
+            DatabaseType::Kwdb,
+            DatabaseType::Redshift,
+            DatabaseType::Mysql,
+            DatabaseType::Xugu,
+        ] {
+            assert!(!supports_custom_type_details(&test_connection_config(db_type)), "{db_type:?}");
         }
     }
 
@@ -3245,6 +3270,8 @@ for line in sys.stdin:
             schema: Some("app".to_string()),
             valid: None,
             signature: None,
+            custom_type_kind: None,
+            has_members: None,
             comment: None,
             created_at: None,
             updated_at: None,
@@ -4136,6 +4163,8 @@ for line in sys.stdin:
                 schema: Some("DBX_TEST".to_string()),
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -4148,6 +4177,8 @@ for line in sys.stdin:
                 schema: Some("DBX_TEST".to_string()),
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -4160,6 +4191,8 @@ for line in sys.stdin:
                 schema: Some("DBX_TEST".to_string()),
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
@@ -4865,6 +4898,8 @@ async fn list_objects_once(
                         schema: if schema.is_empty() { None } else { Some(schema.to_string()) },
                         valid: None,
                         signature: None,
+                        custom_type_kind: None,
+                        has_members: None,
                         comment: table.comment,
                         created_at: None,
                         updated_at: None,
@@ -6944,6 +6979,67 @@ async fn read_mysql_object_source_row(
         .ok_or_else(|| "Failed to read object source".to_string())
 }
 
+/// Whether a connection may serve custom type details (phase 2). Kept
+/// separate from listing support so a future per-kind DDL capability can be
+/// toggled independently.
+fn supports_custom_type_details(config: &ConnectionConfig) -> bool {
+    matches!(
+        config.db_type,
+        DatabaseType::Postgres
+            | DatabaseType::OpenGauss
+            | DatabaseType::Gaussdb
+            | DatabaseType::Kingbase
+            | DatabaseType::Vastbase
+    )
+}
+
+pub async fn get_custom_type_details_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    name: &str,
+) -> Result<db::CustomTypeDetails, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || {
+        get_custom_type_details_once(state, connection_id, database, schema, name)
+    })
+    .await
+}
+
+async fn get_custom_type_details_once(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    name: &str,
+) -> Result<db::CustomTypeDetails, String> {
+    let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+    let db_config = connection_config(state, connection_id).await;
+    let Some(config) = db_config.as_ref() else {
+        return Err("connection not found".to_string());
+    };
+    if !supports_custom_type_details(config) {
+        return Err(format!("custom type details are not supported for {:?} connections", config.db_type));
+    }
+    {
+        let connections = state.connections.read().await;
+        if let Some(client) = extract_pool!(&connections, &pool_key, Agent) {
+            let timeout_duration = agent_metadata_timeout(db_config.as_ref());
+            drop(connections);
+            let mut client = client.lock().await;
+            return client
+                .get_custom_type_details::<db::CustomTypeDetails>(database, schema, name, timeout_duration)
+                .await;
+        }
+    }
+    let connections = state.connections.read().await;
+    let pool = connections.get(&pool_key).ok_or("Pool not found")?;
+    match pool {
+        PoolKind::Postgres(p) => db::postgres::get_custom_type_details(p, schema, name).await,
+        _ => Err("custom type details are not supported for this connection type".to_string()),
+    }
+}
+
 pub async fn get_object_source_core(
     state: &AppState,
     connection_id: &str,
@@ -7173,6 +7269,8 @@ async fn oracle_agent_list_objects(
                 schema,
                 valid: None,
                 signature: None,
+                custom_type_kind: None,
+                has_members: None,
                 comment: None,
                 created_at: None,
                 updated_at: None,
