@@ -2181,13 +2181,21 @@ mod tests {
         request.selected_tables = Some(vec![SqlFileTable { database: None, name: "a".to_string() }]);
         assert!(validate_table_restore_target(
             &request,
-            Some(&SqlFileImportTarget { db_type: DatabaseType::Postgres, driver_profile: None, compatibility_mode: SqlCompatibilityMode::NotApplicable }),
+            Some(&SqlFileImportTarget {
+                db_type: DatabaseType::Postgres,
+                driver_profile: None,
+                compatibility_mode: SqlCompatibilityMode::NotApplicable
+            }),
             1
         )
         .is_err());
         assert!(validate_table_restore_target(
             &request,
-            Some(&SqlFileImportTarget { db_type: DatabaseType::Mysql, driver_profile: None, compatibility_mode: SqlCompatibilityMode::NotApplicable }),
+            Some(&SqlFileImportTarget {
+                db_type: DatabaseType::Mysql,
+                driver_profile: None,
+                compatibility_mode: SqlCompatibilityMode::NotApplicable
+            }),
             2
         )
         .is_err());
