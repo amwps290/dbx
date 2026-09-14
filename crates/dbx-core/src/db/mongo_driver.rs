@@ -2504,11 +2504,137 @@ fn json_update_to_modifications(value: &serde_json::Value) -> Result<UpdateModif
     }
 }
 
-fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
+pub fn json_object_to_document_extended_json(value: &serde_json::Value) -> Result<Document, String> {
     match Bson::try_from(value.clone()).map_err(|e| e.to_string())? {
         Bson::Document(doc) => Ok(doc),
         other => Err(format!("Expected a JSON object, got {other:?}")),
     }
+}
+
+pub fn document_to_canonical_extended_json(document: &Document) -> serde_json::Value {
+    Bson::Document(document.clone()).into_canonical_extjson()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MongoBulkWriteError {
+    pub message: String,
+    pub index: Option<usize>,
+    pub code: Option<i32>,
+    pub retryable: bool,
+}
+
+/// What actually happened to a submitted batch. A batch can partly succeed, so the count of
+/// inserted documents and the per-document rejections are reported together.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MongoInsertOutcome {
+    pub inserted: u64,
+    /// One entry per document the server rejected, `index` pointing into the submitted batch.
+    pub errors: Vec<MongoBulkWriteError>,
+}
+
+pub async fn insert_bson_documents(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    documents: Vec<Document>,
+) -> Result<MongoInsertOutcome, MongoBulkWriteError> {
+    if documents.is_empty() {
+        return Ok(MongoInsertOutcome::default());
+    }
+    let total = documents.len() as u64;
+    let col = client.database(database).collection::<Document>(collection);
+    // Unordered: one rejected document must not abandon the rest of the batch, and the server
+    // then reports every rejection instead of stopping at the first.
+    match col.insert_many(documents).ordered(false).await {
+        Ok(result) => Ok(MongoInsertOutcome { inserted: result.inserted_ids.len() as u64, errors: Vec::new() }),
+        Err(error) => {
+            let errors = insert_write_errors(&error);
+            if errors.is_empty() {
+                // No per-document detail means the whole batch failed (network, auth, …).
+                return Err(map_insert_many_error(error));
+            }
+            Ok(MongoInsertOutcome { inserted: total.saturating_sub(errors.len() as u64), errors })
+        }
+    }
+}
+
+/// Per-document rejections, sorted by batch index. Empty when the failure was not per-document.
+fn insert_write_errors(error: &mongodb::error::Error) -> Vec<MongoBulkWriteError> {
+    use mongodb::error::{ErrorKind, WriteFailure};
+    let mut errors = match error.kind.as_ref() {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            vec![write_error_entry(None, write_error.code, &write_error.message)]
+        }
+        ErrorKind::InsertMany(failure) => failure
+            .write_errors
+            .iter()
+            .flatten()
+            .map(|error| write_error_entry(Some(error.index), error.code, &error.message))
+            .collect(),
+        ErrorKind::BulkWrite(failure) => failure
+            .write_errors
+            .iter()
+            .map(|(index, error)| write_error_entry(Some(*index), error.code, &error.message))
+            .collect(),
+        _ => Vec::new(),
+    };
+    errors.sort_by_key(|error| error.index.unwrap_or(0));
+    errors
+}
+
+fn write_error_entry(index: Option<usize>, code: i32, message: &str) -> MongoBulkWriteError {
+    MongoBulkWriteError {
+        message: message.to_string(),
+        index,
+        code: Some(code),
+        retryable: is_retryable_mongo_write_code(code),
+    }
+}
+
+fn map_insert_many_error(error: mongodb::error::Error) -> MongoBulkWriteError {
+    use mongodb::error::ErrorKind;
+    match error.kind.as_ref() {
+        ErrorKind::Io(_) | ErrorKind::ConnectionPoolCleared { .. } | ErrorKind::ServerSelection { .. } => {
+            MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: true }
+        }
+        _ => MongoBulkWriteError { message: error.to_string(), index: None, code: None, retryable: false },
+    }
+}
+
+fn is_retryable_mongo_write_code(code: i32) -> bool {
+    !matches!(code, 11000 | 11001 | 12582)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn for_each_find_document(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    filter: Option<&str>,
+    projection: Option<&str>,
+    sort: Option<&str>,
+    collation: Option<&str>,
+    batch_size: u32,
+    mut on_document: impl FnMut(Document) -> Result<(), String>,
+) -> Result<(), String> {
+    let col = client.database(database).collection::<Document>(collection);
+    let filter_doc = parse_optional_filter_document(filter)?.unwrap_or_default();
+    let mut find = col.find(filter_doc).batch_size(batch_size);
+    if let Some(projection) = parse_optional_json_document(projection, "projection")? {
+        find = find.projection(projection);
+    }
+    if let Some(sort) = parse_optional_json_document(sort, "sort")? {
+        find = find.sort(sort);
+    }
+    if let Some(collation) = parse_find_collation(collation)? {
+        find = find.collation(collation);
+    }
+    let mut cursor = find.await.map_err(|error| error.to_string())?;
+    while cursor.advance().await.map_err(|error| error.to_string())? {
+        let document = cursor.deserialize_current().map_err(|error| error.to_string())?;
+        on_document(document)?;
+    }
+    Ok(())
 }
 
 fn json_object_to_document_preserving_existing(
@@ -2695,13 +2821,22 @@ fn json_filter_value_to_bson(value: &serde_json::Value, field_name: Option<&str>
         }
         serde_json::Value::Object(obj) => {
             if obj.len() == 1 {
-                // Shell constructor wrappers (UUID/BinData/Timestamp/MinKey/MaxKey)
-                // and $regularExpression decode through the shared extended JSON
-                // parser, following the same precedent as $date below.
+                // Shell constructor wrappers (UUID/BinData/Timestamp/MinKey/MaxKey),
+                // $regularExpression, and the numeric type wrappers decode through
+                // the shared extended JSON parser, following the same precedent as
+                // $date below, so typed number literals compare correctly in filters.
                 if obj.keys().next().is_some_and(|key| {
                     matches!(
                         key.as_str(),
-                        "$regularExpression" | "$uuid" | "$binary" | "$timestamp" | "$minKey" | "$maxKey"
+                        "$regularExpression"
+                            | "$uuid"
+                            | "$binary"
+                            | "$timestamp"
+                            | "$minKey"
+                            | "$maxKey"
+                            | "$numberInt"
+                            | "$numberDouble"
+                            | "$numberDecimal"
                     )
                 }) {
                     if let Ok(Some(value)) = parse_extended_json_value(obj) {
@@ -3419,6 +3554,51 @@ mod tests {
             blob.get("$eq"),
             Some(Bson::Binary(binary)) if binary.subtype == mongodb::bson::spec::BinarySubtype::Generic && binary.bytes == [1, 2, 3]
         ));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_extended_json_number_wrappers() {
+        // Typed number literals must compare against the typed BSON value, not a
+        // raw { "$numberInt": ... } document the server rejects with
+        // "unknown operator" (or that silently matches nothing).
+        let filter = serde_json::json!({
+            "score": { "$numberInt": "5" },
+            "ratio": { "$numberDouble": "1.5" },
+            "price": { "$numberDecimal": "3.14" },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        assert_eq!(doc.get("score"), Some(&Bson::Int32(5)));
+        assert_eq!(doc.get("ratio"), Some(&Bson::Double(1.5)));
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(doc.get("price"), Some(&Bson::Decimal128(expected_decimal)));
+    }
+
+    #[test]
+    fn json_filter_to_document_decodes_number_wrappers_inside_operators() {
+        // Range and $in operands must decode too, exactly like extended JSON
+        // dates: { score: { $gte: {"$numberInt": "5"} } } would otherwise
+        // compare against a sub-document and silently match nothing.
+        let filter = serde_json::json!({
+            "score": { "$gte": { "$numberInt": "5" } },
+            "tags": { "$in": [{ "$numberDecimal": "3.14" }, { "$numberDouble": "1.5" }] },
+        });
+        let doc = json_filter_to_document(&filter).unwrap();
+
+        let Some(Bson::Document(score)) = doc.get("score") else {
+            panic!("expected score operator document");
+        };
+        assert_eq!(score.get("$gte"), Some(&Bson::Int32(5)));
+
+        let Some(Bson::Document(tags)) = doc.get("tags") else {
+            panic!("expected tags operator document");
+        };
+        let Some(Bson::Array(values)) = tags.get("$in") else {
+            panic!("expected tags $in array");
+        };
+        let expected_decimal: mongodb::bson::Decimal128 = "3.14".parse().unwrap();
+        assert_eq!(values.first(), Some(&Bson::Decimal128(expected_decimal)));
+        assert_eq!(values.get(1), Some(&Bson::Double(1.5)));
     }
 
     #[test]
