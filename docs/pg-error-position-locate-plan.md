@@ -581,3 +581,16 @@ pnpm typecheck
 ## 9. 一句话总结
 
 PG 的出错行列一直存在于 `DbError::position()`，只是被 `pg_error_to_string` 丢弃；本方案在驱动层提取 cursorpos，用轻量 marker 穿过既有 `String` 错误 ABI，在 `query.rs` 还原为类型化的 `BackendError.errorPosition`，前端借助已有的 `resultSourceRange` 把「语句内行列」换算成编辑器 offset，并在错误横幅/执行摘要上提供一键定位。整体对现有架构侵入小、对非 PG 驱动零影响。
+
+## 10. 实现补充：下发语句漂移的处理（已落地）
+
+「位置相对实际下发语句」在本方案实现后暴露出一个高频问题：DBX 常在下发前改写语句（追加 `LIMIT/OFFSET`、用 `SELECT * FROM (…)` 包裹分页、为可编辑查询注入隐藏主键列），导致后端位置与用户原文对不上，定位会失败或偏移。已在前端增加一层投影，无需改动后端协议：
+
+1. `annotateQueryResultSources` 额外接收本次实际下发的 SQL（`sqlToExecute`），当某个 result 的语句文本与 `sourceStatement` 不同时，把实际下发的语句文本记录到 `QueryResult.executedStatement`（仅在前端内部使用）。
+2. `sqlErrorEditorOffset` 先把后端 `line/column` 解析到 `executedStatement`（位置本就相对它），再用 `mapExecutedOffsetToSource` 投影回 `sourceStatement`：
+   - 直接子串匹配 → 精确处理「追加子句」与「子查询包裹」；
+   - 前缀对齐 + 剩余文本重定位 → 处理「在投影中注入隐藏列」；
+   - 最后退回「首个/末个差异之间的单一变更区间」对齐。
+3. 行/列越界时钳制而非报「不可用」，因此只要还存在该语句的源码范围，点击定位总能落到句式内的合理位置；只有编辑器内容与结果语句确实不一致（stale）时才提示无法定位。
+
+新增单测覆盖：追加 `LIMIT`、分页包裹、注入隐藏列、多行语句、软字符（emoji）列宽换算与越界钳制。

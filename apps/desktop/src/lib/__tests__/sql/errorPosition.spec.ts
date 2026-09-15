@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { BackendError, SqlErrorPosition } from "@/lib/backend/errorUtils";
-import { sqlErrorEditorOffset } from "@/lib/sql/errorPosition";
+import { mapExecutedOffsetToSource, scalarPositionToUtf16Offset, sqlErrorEditorOffset } from "@/lib/sql/errorPosition";
 import type { QueryResult } from "@/types/database";
 
 function backendError(position?: SqlErrorPosition): BackendError {
@@ -17,7 +17,7 @@ function backendError(position?: SqlErrorPosition): BackendError {
   };
 }
 
-function errorResult(options: { editorStatement?: string; sourceFrom?: number; sourceTo?: number; position?: SqlErrorPosition }): QueryResult {
+function errorResult(options: { editorStatement?: string; sourceFrom?: number; sourceTo?: number; executedStatement?: string; position?: SqlErrorPosition }): QueryResult {
   const statement = options.editorStatement ?? "";
   return {
     columns: ["Error"],
@@ -29,6 +29,7 @@ function errorResult(options: { editorStatement?: string; sourceFrom?: number; s
     sourceStatement: statement,
     sourceFrom: options.sourceFrom ?? 0,
     sourceTo: options.sourceTo ?? statement.length,
+    ...(options.executedStatement ? { executedStatement: options.executedStatement } : {}),
   };
 }
 
@@ -95,13 +96,93 @@ describe("sqlErrorEditorOffset", () => {
     expect(sqlErrorEditorOffset({ editorSql: "SELECT 1", result })).toBeUndefined();
   });
 
-  it("returns undefined for a line beyond the statement", () => {
+  it("clamps instead of failing when the position line is beyond the statement", () => {
     const sql = "SELECT 1";
     const result = errorResult({
       editorStatement: sql,
       position: { line: 5, column: 1, offset: 4 },
     });
 
-    expect(sqlErrorEditorOffset({ editorSql: sql, result })).toBeUndefined();
+    // The position is relative to the statement, so a bad line clamps to its end.
+    expect(sqlErrorEditorOffset({ editorSql: sql, result })?.offset).toBe(sql.length);
+  });
+
+  describe("when the executed statement differs from the source", () => {
+    it("projects an appended LIMIT/OFFSET position back onto the source", () => {
+      const source = "SELECT * FROM t";
+      const executed = "SELECT * FROM t LIMIT 100 OFFSET 0;";
+      const tableOffset = executed.indexOf("FROM t") + "FROM ".length;
+      const result = errorResult({
+        editorStatement: source,
+        executedStatement: executed,
+        position: { line: 1, column: tableOffset + 1, offset: tableOffset },
+      });
+
+      expect(sqlErrorEditorOffset({ editorSql: source, result })?.offset).toBe(source.indexOf("FROM t") + "FROM ".length);
+    });
+
+    it("projects a pagination wrapper position back onto the inner statement", () => {
+      const source = "SELECT * FROM t";
+      const executed = "SELECT * FROM (SELECT * FROM t) AS dbx_page LIMIT 100 OFFSET 0;";
+      const tableOffset = executed.indexOf("FROM t") + "FROM ".length;
+      const result = errorResult({
+        editorStatement: source,
+        executedStatement: executed,
+        position: { line: 1, column: tableOffset + 1, offset: tableOffset },
+      });
+
+      expect(sqlErrorEditorOffset({ editorSql: source, result })?.offset).toBe(source.indexOf("FROM t") + "FROM ".length);
+    });
+
+    it("projects an injected hidden-key column position back onto the source", () => {
+      const source = "SELECT * FROM users";
+      const executed = 'SELECT *, "id" AS "__dbx_hidden_pk" FROM users LIMIT 100 OFFSET 0;';
+      const tableOffset = executed.indexOf("FROM users") + "FROM ".length;
+      const result = errorResult({
+        editorStatement: source,
+        executedStatement: executed,
+        position: { line: 1, column: tableOffset + 1, offset: tableOffset },
+      });
+
+      expect(sqlErrorEditorOffset({ editorSql: source, result })?.offset).toBe(source.indexOf("users"));
+    });
+
+    it("keeps a multi-line position aligned when the wrapper is on the first line only", () => {
+      const source = "SELECT *\nFROM users\nWHERE id = 1";
+      const executed = `SELECT * FROM (${source}) AS dbx_page LIMIT 100 OFFSET 0;`;
+      const executedMissing = executed.indexOf("users");
+      const result = errorResult({
+        editorStatement: source,
+        executedStatement: executed,
+        // `users` is on line 2 of both texts.
+        position: { line: 2, column: 6, offset: executedMissing + 5 },
+      });
+
+      expect(sqlErrorEditorOffset({ editorSql: source, result })?.offset).toBe(source.indexOf("users"));
+    });
+  });
+});
+
+describe("scalarPositionToUtf16Offset", () => {
+  it("converts scalar line/column to a UTF-16 offset", () => {
+    expect(scalarPositionToUtf16Offset("SELECT '😀' FROM t", 1, 12)).toBe(12);
+  });
+
+  it("clamps a column past the end of its line", () => {
+    expect(scalarPositionToUtf16Offset("SELECT 1\nFROM t", 1, 999)).toBe("SELECT 1".length);
+  });
+});
+
+describe("mapExecutedOffsetToSource", () => {
+  it("returns the offset unchanged when both texts are identical", () => {
+    expect(mapExecutedOffsetToSource("SELECT 1", "SELECT 1", 4)).toBe(4);
+  });
+
+  it("maps an append-only rewrite through the shared prefix", () => {
+    expect(mapExecutedOffsetToSource("SELECT 1 LIMIT 10", "SELECT 1", 4)).toBe(4);
+  });
+
+  it("clamps offsets in the appended region to the source end", () => {
+    expect(mapExecutedOffsetToSource("SELECT 1 LIMIT 10", "SELECT 1", 15)).toBe("SELECT 1".length);
   });
 });
