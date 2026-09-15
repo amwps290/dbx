@@ -1480,7 +1480,17 @@ fn escape_tsvector_lexeme(value: &str) -> String {
 }
 
 fn pg_error_to_string(err: tokio_postgres::Error) -> String {
-    err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
+    let Some(db_error) = err.as_db_error() else {
+        return err.to_string();
+    };
+    let mut message = db_error.to_string();
+    // Carry the server-reported cursor position across the `db` layer's
+    // `Result<_, String>` boundary; `query.rs` resolves it against the executed
+    // statement and strips the suffix before the message reaches any client.
+    if let Some(tokio_postgres::error::ErrorPosition::Original(cursor)) = db_error.position() {
+        message.push_str(&crate::sql_error_position::encode_marker(*cursor));
+    }
+    message
 }
 
 /// Tries each SQL tier in `tiers` in order (most-capable first), via `run`,
