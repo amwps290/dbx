@@ -388,6 +388,22 @@ function annotateQueryResultSources(results: QueryResult[], sql: string, databas
   return { results, sqlServerUseDatabase };
 }
 
+/**
+ * Annotate the synthesized error result of a thrown single-statement execution
+ * so the row/column locate flow can map the backend position back to the editor.
+ *
+ * The core returns per-statement error results for batches, but a
+ * single-statement failure aborts the whole execute-multi command, leaving the
+ * frontend to synthesize the error result here. Only annotated when the error
+ * actually carries a position and the submission is a single statement (a
+ * multi-statement thrown error's position cannot be attributed to one statement).
+ */
+function annotateSingleStatementErrorResult(errorResult: QueryResult, sourceSql: string, databaseType: DatabaseType | undefined, sourceOffset: number | undefined, parameterOptions: SqlParameterOptions | undefined, executedSql: string | undefined): void {
+  if (!errorResult.error?.errorPosition) return;
+  if (splitSqlStatementRanges(sourceSql, databaseType, parameterOptions).length !== 1) return;
+  annotateQueryResultSources([errorResult], sourceSql, undefined, databaseType, sourceOffset, parameterOptions, executedSql);
+}
+
 const NON_STREAMING_BATCH_DATABASE_TYPES = new Set<DatabaseType>(["sqlserver", "turso", "cloudflare-d1"]);
 const liveBatchSqlExecutions = new WeakMap<QueryTab, BatchSqlExecution>();
 
@@ -6195,6 +6211,11 @@ export const useQueryStore = defineStore("query", () => {
     let producedResult = false;
     const resumedExecutionTarget = batchResume?.batch.executionTarget;
     const executionConnectionId = resumedExecutionTarget?.connectionId ?? options?.executionTarget?.connectionId ?? tab.connectionId;
+    // Captured for the catch below: a single-statement failure aborts the whole
+    // execute-multi command (the core only returns per-statement error results
+    // for batches), so the synthesized error result must be annotated here for
+    // the row/column locate flow. These locals live inside the try block.
+    let errorLocateContext: { databaseType: DatabaseType | undefined; parameterOptions: SqlParameterOptions | undefined; sourceOffset: number | undefined; executedSql: string | undefined } | undefined;
     try {
       await waitForTabSessionReset(id);
       const connStore = useConnectionStore();
@@ -6900,6 +6921,13 @@ export const useQueryStore = defineStore("query", () => {
         useAgentResultSession = conn?.db_type === "sqlserver" && conn?.driver_profile?.trim().toLowerCase() === "sqlserver-legacy";
       }
 
+      errorLocateContext = {
+        databaseType: effectiveDbType,
+        parameterOptions: sqlStatementParameterOptions,
+        sourceOffset: options?.sourceOffset,
+        executedSql: sqlToExecute,
+      };
+
       const executionSchema = connectionQueryExecutionSchema(conn, targetDatabase, targetSchema, tab.mode === "data");
       // Jumping to a non-zero offset without a live cursor session: the plan
       // could not rewrite the SQL for these engines, so a plain execution
@@ -7340,6 +7368,7 @@ export const useQueryStore = defineStore("query", () => {
           return false;
         }
         const errorResult = toErrorResult(e);
+        annotateSingleStatementErrorResult(errorResult, queryBaseSql, errorLocateContext?.databaseType, errorLocateContext?.sourceOffset, errorLocateContext?.parameterOptions, errorLocateContext?.executedSql);
         const activeGroupIndex = current.activeResultIndex;
         const activeGroupResults = current.results;
         const shouldReplaceActiveResultInGroup = options?.replaceActiveResultInGroup === true && Array.isArray(activeGroupResults) && typeof activeGroupIndex === "number" && activeGroupIndex >= 0 && activeGroupIndex < activeGroupResults.length;
