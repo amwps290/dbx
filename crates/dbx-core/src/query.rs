@@ -92,7 +92,7 @@ pub enum QueryExecutionError {
 
 impl QueryExecutionError {
     pub fn into_legacy_string(self) -> String {
-        match self {
+        let mut message = match self {
             Self::Agent(error) => error.into_legacy_string(),
             Self::DuckDb { message, .. } => message,
             Self::Canceled { .. } => canceled_error(),
@@ -100,7 +100,11 @@ impl QueryExecutionError {
             Self::Sql(error) => error,
             Self::SqlWithPosition { message, .. } => message,
             Self::Legacy(error) => error,
-        }
+        };
+        // Defensive: any remaining transport marker (e.g. from a driver error
+        // that never passed through the resolve step) must not reach clients.
+        let _ = crate::sql_error_position::take_marker(&mut message);
+        message
     }
 
     pub fn into_backend_error(self) -> crate::backend_error::BackendError {
@@ -2386,14 +2390,18 @@ async fn do_execute_typed(
             if let Some(agent_error) = typed_agent_error {
                 return QueryExecutionError::Agent(agent_error);
             }
-            // PostgreSQL reports a cursor position as a suffix on the driver
-            // message. Resolve it here, while the executed statement text is
-            // still available, into a typed field so it can ride the public
-            // error envelope instead of being re-parsed later.
-            if pool_db_type == Some(DatabaseType::Postgres) {
-                if let Some((message, position)) = crate::sql_error_position::resolve_message(&error, sql) {
-                    return QueryExecutionError::SqlWithPosition { message, position };
-                }
+            // PostgreSQL reports a cursor position as a marker suffix on the
+            // driver message. Resolve it here, while the executed statement text
+            // is still available, into a typed field. The marker is stripped even
+            // when it cannot be resolved, so it can never reach a user-facing
+            // message. The PostgreSQL driver also backs Redshift/GaussDB/Kwdb/
+            // QuestDB/openGauss, so this is not gated on `DatabaseType::Postgres`.
+            if error.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER) {
+                let (message, position) = crate::sql_error_position::take_message_position(&error, sql);
+                return match position {
+                    Some(position) => QueryExecutionError::SqlWithPosition { message, position },
+                    None => QueryExecutionError::Legacy(message),
+                };
             }
             QueryExecutionError::Legacy(error)
         })
@@ -8806,8 +8814,8 @@ for line in sys.stdin:
             "ERROR: relation \"no_such_table\" does not exist{}",
             crate::sql_error_position::encode_marker(cursor)
         );
-        let (message, position) = crate::sql_error_position::resolve_message(&raw, sql).unwrap();
-        let error = QueryExecutionError::SqlWithPosition { message, position };
+        let (message, position) = crate::sql_error_position::take_message_position(&raw, sql);
+        let error = QueryExecutionError::SqlWithPosition { message, position: position.unwrap() };
 
         // The transport marker must never reach the user-facing message.
         let legacy = error.clone().into_legacy_string();
@@ -8822,6 +8830,16 @@ for line in sys.stdin:
         assert_eq!(backend_error.code(), "DBX-JDBC-4001");
         let position = backend_error.error_position().expect("position must survive into the envelope");
         assert_eq!((position.line, position.column), (2, 6));
+    }
+
+    #[test]
+    fn legacy_rendering_strips_a_leftover_transport_marker() {
+        // Guards the driver-error path that never went through the resolve step
+        // (e.g. a PostgreSQL-family driver error shown as a legacy string).
+        let error = QueryExecutionError::Legacy(format!("ERROR: boom{}", crate::sql_error_position::encode_marker(9)));
+        let rendered = error.into_legacy_string();
+        assert_eq!(rendered, "ERROR: boom");
+        assert!(!rendered.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER));
     }
 
     #[test]

@@ -92,13 +92,19 @@ pub fn strip_marker(message: &str) -> String {
     owned
 }
 
-/// Resolve an error `message` (possibly carrying a cursor marker) against the
-/// executed statement text into a cleaned message plus a typed position.
-pub fn resolve_message(message: &str, statement_sql: &str) -> Option<(String, SqlErrorPosition)> {
+/// Strip a transport suffix (if any) from `message` and, when possible, resolve
+/// the carried cursor against the executed statement text into a typed position.
+///
+/// The returned message is always marker-free, even when the position cannot be
+/// resolved (malformed cursor, empty statement), so a marker can never reach a
+/// user-facing message through a partial error path.
+pub fn take_message_position(message: &str, statement_sql: &str) -> (String, Option<SqlErrorPosition>) {
     let mut cleaned = message.to_string();
-    let cursor = take_marker(&mut cleaned)?;
-    let position = SqlErrorPosition::from_pg_cursor(statement_sql, cursor)?;
-    Some((cleaned, position))
+    let Some(cursor) = take_marker(&mut cleaned) else {
+        return (cleaned, None);
+    };
+    let position = SqlErrorPosition::from_pg_cursor(statement_sql, cursor);
+    (cleaned, position)
 }
 
 #[cfg(test)]
@@ -184,14 +190,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_message_strips_marker_and_resolves_position() {
+    fn take_message_position_strips_marker_and_resolves_position() {
         let sql = "SELECT 1\nFROM missing";
         let cursor = sql.find("missing").unwrap() as u32 + 1;
         let raw = format!("ERROR: relation \"missing\" does not exist{}", encode_marker(cursor));
-        let (message, position) = resolve_message(&raw, sql).unwrap();
+        let (message, position) = take_message_position(&raw, sql);
         assert_eq!(message, "ERROR: relation \"missing\" does not exist");
+        let position = position.unwrap();
         assert_eq!(position.line, 2);
         assert_eq!(position.column, 6);
+    }
+
+    #[test]
+    fn take_message_position_still_strips_when_the_cursor_is_unusable() {
+        // cursor 0 cannot be resolved, but the marker must not leak.
+        let raw = format!("ERROR: boom{}", encode_marker(0));
+        let (message, position) = take_message_position(&raw, "SELECT 1");
+        assert_eq!(message, "ERROR: boom");
+        assert!(position.is_none());
+
+        // Empty statement: nothing to map onto.
+        let raw = format!("ERROR: boom{}", encode_marker(5));
+        let (message, position) = take_message_position(&raw, "");
+        assert_eq!(message, "ERROR: boom");
+        assert!(position.is_none());
+    }
+
+    #[test]
+    fn take_message_position_without_marker_is_identity() {
+        let (message, position) = take_message_position("ERROR: x", "SELECT 1");
+        assert_eq!(message, "ERROR: x");
+        assert!(position.is_none());
     }
 
     #[test]
