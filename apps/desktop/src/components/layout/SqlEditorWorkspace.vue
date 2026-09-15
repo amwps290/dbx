@@ -254,6 +254,14 @@ function handleFocusStatement(tabId: string, range: StatementRange | null): bool
   }
   return false;
 }
+function handleFocusErrorOffset(tabId: string, offset: number): boolean {
+  for (const group of groupRefs.values()) {
+    if (group.focusErrorPosition(tabId, offset)) {
+      return true;
+    }
+  }
+  return false;
+}
 </script>
 
 <template>
@@ -347,6 +355,11 @@ function handleFocusStatement(tabId: string, range: StatementRange | null): bool
               @focus-statement="
                 (tabId: string, range: { from: number; to: number } | null) => {
                   handleFocusStatement(tabId, range);
+                }
+              "
+              @focus-error-offset="
+                (tabId: string, offset: number) => {
+                  handleFocusErrorOffset(tabId, offset);
                 }
               "
             />

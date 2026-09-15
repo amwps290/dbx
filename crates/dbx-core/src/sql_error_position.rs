@@ -68,13 +68,20 @@ pub fn encode_marker(cursor: u32) -> String {
     format!("{SQL_ERROR_POSITION_MARKER}{cursor}")
 }
 
-/// Remove a trailing marker from `message` and return the raw cursor it carried.
+/// Remove a marker from `message` and return the raw cursor it carried.
 ///
-/// A malformed or absent suffix leaves `message` untouched and returns `None`.
+/// The marker segment is removed even when followed by more text (the read-only
+/// transaction path can append a cleanup error after it, e.g.
+/// `...<marker>15; rollback failed`), so the trailing text is preserved. A
+/// malformed or absent suffix leaves `message` untouched and returns `None`.
 pub fn take_marker(message: &mut String) -> Option<u32> {
     let index = message.rfind(SQL_ERROR_POSITION_MARKER)?;
-    let cursor = message[index + SQL_ERROR_POSITION_MARKER.len()..].trim().parse::<u32>().ok()?;
-    message.truncate(index);
+    let digits_start = index + SQL_ERROR_POSITION_MARKER.len();
+    let digits_end = message[digits_start..]
+        .find(|ch: char| !ch.is_ascii_digit())
+        .map_or(message.len(), |offset| digits_start + offset);
+    let cursor = message[digits_start..digits_end].parse::<u32>().ok()?;
+    message.replace_range(index..digits_end, "");
     Some(cursor)
 }
 
@@ -167,6 +174,13 @@ mod tests {
         let mut message = text.clone();
         assert_eq!(take_marker(&mut message), None);
         assert_eq!(message, text);
+    }
+
+    #[test]
+    fn marker_followed_by_text_is_stripped_and_preserves_the_tail() {
+        let mut message = format!("ERROR: boom{}; rollback failed", encode_marker(7));
+        assert_eq!(take_marker(&mut message), Some(7));
+        assert_eq!(message, "ERROR: boom; rollback failed");
     }
 
     #[test]
