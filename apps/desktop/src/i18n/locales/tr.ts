@@ -1658,6 +1658,7 @@ export default withEnglishFallback({
     returnedTable: "{count} sütunlu bir sonuç tablosu döndürdü",
     noTable: "Sonuç tablosu döndürülmedi",
     noSql: "SQL kullanılamıyor",
+    lineColumn: "{line}. satır, {column}. sütun",
     navigationHint: "SQL'ini önizlemek için bir satıra tıklayın; düzenleyicide odaklamak için çift tıklayın.",
     recoveryPrompt: "#{statement} numaralı ifade başarısız oldu; {count} ifade çalıştırılmadı.",
     stop: "Durdur",

@@ -1708,6 +1708,7 @@ export default withEnglishFallback({
     returnedTable: "Restituita una tabella con {count} colonne",
     noTable: "Nessuna tabella restituita",
     noSql: "SQL non disponibile",
+    lineColumn: "riga {line}, colonna {column}",
     navigationHint: "Fai clic per visualizzare l'SQL; fai doppio clic per selezionarlo nell'editor.",
     recoveryPrompt: "L'istruzione #{statement} non è riuscita; {count} istruzioni non sono state eseguite.",
     stop: "Interrompi",

@@ -1659,6 +1659,7 @@ export default withEnglishFallback({
     returnedTable: "{count}열 결과 테이블을 반환했습니다",
     noTable: "반환된 결과 테이블이 없습니다",
     noSql: "SQL을 가져올 수 없습니다",
+    lineColumn: "{line}행 {column}열",
     navigationHint: "행을 클릭하여 SQL을 미리 보고 두 번 클릭하여 편집기에서 선택하세요.",
     recoveryPrompt: "구문 #{statement} 실행에 실패하여 나머지 {count}개 구문이 실행되지 않았습니다.",
     stop: "중지",

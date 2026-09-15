@@ -1709,6 +1709,7 @@ export default withEnglishFallback({
     returnedTable: "回傳 {count} 欄的結果表",
     noTable: "未回傳結果表",
     noSql: "無法取得 SQL",
+    lineColumn: "第 {line} 行，第 {column} 列",
     navigationHint: "按一下預覽 SQL，按兩下在編輯器中聚焦並選取。",
     recoveryPrompt: "語句 #{statement} 執行失敗，剩餘 {count} 條未執行。",
     stop: "停止",

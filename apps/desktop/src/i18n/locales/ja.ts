@@ -1730,6 +1730,7 @@ export default withEnglishFallback({
     returnedTable: "{count}列の結果テーブルを返しました",
     noTable: "結果テーブルは返されませんでした",
     noSql: "SQLを取得できません",
+    lineColumn: "{line} 行目 {column} 桁目",
     navigationHint: "クリックでSQLをプレビューし、ダブルクリックでエディター内を選択します。",
     recoveryPrompt: "ステートメント #{statement} が失敗し、残り {count} 件は未実行です。",
     stop: "停止",

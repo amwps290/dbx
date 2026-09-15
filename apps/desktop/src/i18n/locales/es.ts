@@ -1710,6 +1710,7 @@ export default withEnglishFallback({
     returnedTable: "Devolvió una tabla de resultados de {count} columnas",
     noTable: "No se devolvió ninguna tabla de resultados",
     noSql: "SQL no disponible",
+    lineColumn: "línea {line}, columna {column}",
     navigationHint: "Haz clic para previsualizar el SQL; haz doble clic para enfocarlo en el editor.",
     recoveryPrompt: "Falló la sentencia #{statement}; no se ejecutaron {count} sentencias.",
     stop: "Detener",

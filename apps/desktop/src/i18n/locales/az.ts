@@ -1657,6 +1657,7 @@ export default withEnglishFallback({
     returnedTable: "{count} sütunlu nəticə cədvəli qaytarıldı",
     noTable: "Nəticə cədvəli qaytarılmadı",
     noSql: "SQL mövcud deyil",
+    lineColumn: "{line}. sətir, {column}. sütun",
     navigationHint: "SQL-ə önbaxış üçün sətrə klikləyin; redaktorda ona keçmək üçün iki dəfə klikləyin.",
     recoveryPrompt: "#{statement} əmri uğursuz oldu; {count} əmr işlədilmədi.",
     stop: "Dayandır",
