@@ -103,7 +103,7 @@ impl QueryExecutionError {
         };
         // Defensive: any remaining transport marker (e.g. from a driver error
         // that never passed through the resolve step) must not reach clients.
-        let _ = crate::sql_error_position::take_marker(&mut message);
+        while crate::sql_error_position::take_marker(&mut message).is_some() {}
         message
     }
 
@@ -8836,7 +8836,11 @@ for line in sys.stdin:
     fn legacy_rendering_strips_a_leftover_transport_marker() {
         // Guards the driver-error path that never went through the resolve step
         // (e.g. a PostgreSQL-family driver error shown as a legacy string).
-        let error = QueryExecutionError::Legacy(format!("ERROR: boom{}", crate::sql_error_position::encode_marker(9)));
+        let error = QueryExecutionError::Legacy(format!(
+            "ERROR: boom{}{}",
+            crate::sql_error_position::encode_marker(9),
+            crate::sql_error_position::encode_marker(2)
+        ));
         let rendered = error.into_legacy_string();
         assert_eq!(rendered, "ERROR: boom");
         assert!(!rendered.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER));

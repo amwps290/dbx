@@ -68,12 +68,23 @@ pub fn encode_marker(cursor: u32) -> String {
     format!("{SQL_ERROR_POSITION_MARKER}{cursor}")
 }
 
+/// Remove every marker from `message` and return the cursors they carried.
+///
+/// Markers are removed even when followed by more text (the read-only
+/// transaction path can append a cleanup error after one, e.g.
+/// `...<marker>15; rollback failed`), so the trailing text is preserved. A
+/// malformed or absent suffix leaves `message` untouched and is not collected.
+fn take_all_markers(message: &mut String) -> Vec<u32> {
+    let mut cursors = Vec::new();
+    while let Some(cursor) = take_marker(message) {
+        cursors.push(cursor);
+    }
+    cursors
+}
+
 /// Remove a marker from `message` and return the raw cursor it carried.
 ///
-/// The marker segment is removed even when followed by more text (the read-only
-/// transaction path can append a cleanup error after it, e.g.
-/// `...<marker>15; rollback failed`), so the trailing text is preserved. A
-/// malformed or absent suffix leaves `message` untouched and returns `None`.
+/// See [`take_all_markers`] for the multi-marker behaviour.
 pub fn take_marker(message: &mut String) -> Option<u32> {
     let index = message.rfind(SQL_ERROR_POSITION_MARKER)?;
     let digits_start = index + SQL_ERROR_POSITION_MARKER.len();
@@ -85,25 +96,27 @@ pub fn take_marker(message: &mut String) -> Option<u32> {
     Some(cursor)
 }
 
-/// Return `message` with any transport suffix stripped.
+/// Return `message` with every transport suffix stripped.
 pub fn strip_marker(message: &str) -> String {
     let mut owned = message.to_string();
-    let _ = take_marker(&mut owned);
+    let _ = take_all_markers(&mut owned);
     owned
 }
 
-/// Strip a transport suffix (if any) from `message` and, when possible, resolve
-/// the carried cursor against the executed statement text into a typed position.
+/// Strip all transport suffixes from `message` and, when possible, resolve the
+/// carried cursor against the executed statement text into a typed position.
 ///
-/// The returned message is always marker-free, even when the position cannot be
-/// resolved (malformed cursor, empty statement), so a marker can never reach a
-/// user-facing message through a partial error path.
+/// The returned message is always marker-free. The position is only resolved
+/// when exactly one marker was present: a message carrying several markers (e.g.
+/// a user-statement error merged with an infrastructure error) cannot be
+/// attributed to a single statement, and guessing would point at the wrong spot.
 pub fn take_message_position(message: &str, statement_sql: &str) -> (String, Option<SqlErrorPosition>) {
     let mut cleaned = message.to_string();
-    let Some(cursor) = take_marker(&mut cleaned) else {
+    let cursors = take_all_markers(&mut cleaned);
+    if cursors.len() != 1 {
         return (cleaned, None);
-    };
-    let position = SqlErrorPosition::from_pg_cursor(statement_sql, cursor);
+    }
+    let position = SqlErrorPosition::from_pg_cursor(statement_sql, cursors[0]);
     (cleaned, position)
 }
 
@@ -221,6 +234,18 @@ mod tests {
         let (message, position) = take_message_position("ERROR: x", "SELECT 1");
         assert_eq!(message, "ERROR: x");
         assert!(position.is_none());
+    }
+
+    #[test]
+    fn multiple_markers_are_all_stripped_and_never_resolved() {
+        // A user-statement error merged with an infrastructure error carries two
+        // cursors; the position cannot be attributed to a single statement.
+        let raw =
+            format!("ERROR: relation missing does not exist{}; cleanup failed{}", encode_marker(15), encode_marker(3));
+        let (message, position) = take_message_position(&raw, "SELECT * FROM missing");
+        assert_eq!(message, "ERROR: relation missing does not exist; cleanup failed");
+        assert!(position.is_none());
+        assert_eq!(strip_marker(&raw), "ERROR: relation missing does not exist; cleanup failed");
     }
 
     #[test]

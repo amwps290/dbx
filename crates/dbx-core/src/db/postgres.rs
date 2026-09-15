@@ -1493,6 +1493,15 @@ fn pg_error_to_string(err: tokio_postgres::Error) -> String {
     message
 }
 
+/// Same as [`pg_error_to_string`] but never carries a cursor position.
+///
+/// Used for infrastructure/setup statements (search_path, BEGIN/ROLLBACK, …)
+/// whose SQL is not the statement the user is editing: a marker from those would
+/// be resolved against the user's SQL and point at the wrong place.
+fn pg_error_to_string_plain(err: tokio_postgres::Error) -> String {
+    err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
+}
+
 /// Tries each SQL tier in `tiers` in order (most-capable first), via `run`,
 /// returning the first tier that succeeds. Every driver-compat query in this
 /// module (a "does this server have the newer catalog column" primary/compat
@@ -2832,7 +2841,10 @@ async fn set_automatic_postgres_timezone(client: &deadpool_postgres::Client, tim
                 }
             }
             Err(error) => {
-                return Err(format!("PostgreSQL SET timezone failed after connecting: {}", pg_error_to_string(error)));
+                return Err(format!(
+                    "PostgreSQL SET timezone failed after connecting: {}",
+                    pg_error_to_string_plain(error)
+                ));
             }
         }
     }
@@ -8018,7 +8030,7 @@ pub(crate) async fn execute_postgres_infra_statement(
     tokio::time::timeout(timeout_duration, client.execute_typed(sql, &[]))
         .await
         .map_err(|_| format!("PostgreSQL {stage} timed out after {} seconds", timeout_duration.as_secs()))?
-        .map_err(pg_error_to_string)
+        .map_err(pg_error_to_string_plain)
 }
 
 pub(crate) async fn wait_postgres_operation<T, F>(
