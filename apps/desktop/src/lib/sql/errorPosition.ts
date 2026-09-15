@@ -1,5 +1,6 @@
 import type { DatabaseType, QueryResult } from "@/types/database";
 import type { SqlParameterOptions } from "@/lib/sql/sqlParameters";
+import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { resultSourceRange } from "@/lib/tabs/tabPresentation";
 
 export interface EditorErrorPosition {
@@ -9,6 +10,80 @@ export interface EditorErrorPosition {
   line: number;
   /** 1-based column within the statement, for display. */
   column: number;
+}
+
+export interface SqlErrorOffsetOptions {
+  editorSql: string;
+  result: QueryResult | undefined | null;
+  resultIndex?: number;
+  databaseType?: DatabaseType;
+  parameterOptions?: SqlParameterOptions;
+}
+
+/**
+ * Diagnostics for the "locate SQL error" flow.
+ *
+ * Failures are always logged (they explain the "position unavailable" toast).
+ * Successful resolutions are verbose-only: run
+ * `localStorage.setItem("dbx:debug:sql-error-position", "1")` once (then reload)
+ * to also inspect the drift/offset details.
+ */
+const LOG_TAG = "[DBX][sql-error-position]";
+const DEBUG_FLAG_KEY = "dbx:debug:sql-error-position";
+
+export function isSqlErrorPositionDebugEnabled(): boolean {
+  try {
+    return globalThis.localStorage?.getItem(DEBUG_FLAG_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Emit a diagnostics record. Failures are always logged; success details are verbose-only. */
+export function logSqlErrorPosition(stage: string, payload: Record<string, unknown>): void {
+  console.info(`${LOG_TAG} ${stage}`, payload);
+}
+
+function previewText(value: string | undefined | null, max = 2000): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  return value.length > max ? `${value.slice(0, max)}…(len=${value.length})` : value;
+}
+
+function logDiagnostics(stage: string, options: SqlErrorOffsetOptions, extra: Record<string, unknown>): void {
+  const result = options.result ?? undefined;
+  const details: Record<string, unknown> = {
+    stage,
+    resultIndex: options.resultIndex,
+    editorLength: options.editorSql.length,
+    result: result
+      ? {
+          statementIndex: result.statement_index,
+          executionError: result.execution_error,
+          hasError: Boolean(result.error),
+          errorPosition: result.error?.errorPosition ?? null,
+          sourceStatement: previewText(result.sourceStatement),
+          executedStatement: previewText(result.executedStatement),
+          sourceFrom: result.sourceFrom,
+          sourceTo: result.sourceTo,
+        }
+      : null,
+    editorSliceAtSourceRange: typeof result?.sourceFrom === "number" && typeof result?.sourceTo === "number" ? previewText(options.editorSql.slice(result.sourceFrom, result.sourceTo)) : undefined,
+    editorContainsSourceStatement: result?.sourceStatement ? options.editorSql.includes(result.sourceStatement) : undefined,
+    ...extra,
+  };
+  if (options.editorSql.trim()) {
+    try {
+      details.editorStatements = splitSqlStatementRanges(options.editorSql, options.databaseType, options.parameterOptions).map((statement, index) => ({
+        index,
+        from: statement.from,
+        to: statement.to,
+        sql: previewText(statement.sql, 200),
+      }));
+    } catch (error) {
+      details.editorStatementSplitError = String(error);
+    }
+  }
+  logSqlErrorPosition(stage, details);
 }
 
 /**
@@ -26,12 +101,20 @@ export interface EditorErrorPosition {
  * statement text in the editor (stale editor / different statement) — jumping
  * anywhere in that case would be wrong.
  */
-export function sqlErrorEditorOffset(options: { editorSql: string; result: QueryResult | undefined | null; resultIndex?: number; databaseType?: DatabaseType; parameterOptions?: SqlParameterOptions }): EditorErrorPosition | undefined {
+export function sqlErrorEditorOffset(options: SqlErrorOffsetOptions): EditorErrorPosition | undefined {
   const position = options.result?.error?.errorPosition;
-  if (!position) return undefined;
+  if (!position) {
+    if (isSqlErrorPositionDebugEnabled()) logDiagnostics("skip:no-error-position", options, {});
+    return undefined;
+  }
 
   const range = resultSourceRange(options.editorSql, options.result ?? undefined, options.resultIndex, options.databaseType, options.parameterOptions);
-  if (!range) return undefined;
+  if (!range) {
+    logDiagnostics("unresolved:result-source-range", options, {
+      reason: "resultSourceRange returned undefined: the result's statement text is not found (or no longer unique) in the editor",
+    });
+    return undefined;
+  }
 
   // The position is relative to the executed statement when we recorded one;
   // older/other results only have the source statement to fall back on.
@@ -41,11 +124,25 @@ export function sqlErrorEditorOffset(options: { editorSql: string; result: Query
   // Walk the line/column in the text the position is relative to (scalar values,
   // matching PostgreSQL's character-based cursor), then convert to UTF-16.
   const basisOffset = scalarPositionToUtf16Offset(positionBasis, position.line, position.column);
-  const sourceOffset = executedStatement && executedStatement !== range.sql ? mapExecutedOffsetToSource(executedStatement, range.sql, basisOffset) : basisOffset;
+  const drifted = Boolean(executedStatement && executedStatement !== range.sql);
+  const sourceOffset = drifted ? mapExecutedOffsetToSource(executedStatement!, range.sql, basisOffset) : basisOffset;
 
   // Clamp inside the resolved statement range so a residual mismatch can never
   // place the caret outside the statement it belongs to.
   const editorOffset = Math.max(range.from, Math.min(range.from + sourceOffset, range.to));
+  if (isSqlErrorPositionDebugEnabled()) {
+    logDiagnostics("resolved", options, {
+      position,
+      rangeFrom: range.from,
+      rangeTo: range.to,
+      rangeSql: previewText(range.sql),
+      drifted,
+      positionBasis: previewText(positionBasis),
+      basisOffset,
+      sourceOffset,
+      editorOffset,
+    });
+  }
   return { offset: editorOffset, line: position.line, column: position.column };
 }
 

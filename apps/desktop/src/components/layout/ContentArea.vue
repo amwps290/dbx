@@ -135,7 +135,7 @@ import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGr
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
-import { sqlErrorEditorOffset } from "@/lib/sql/errorPosition";
+import { sqlErrorEditorOffset, logSqlErrorPosition } from "@/lib/sql/errorPosition";
 import {
   databaseDisplayNameForTab,
   executionSummaryItems,
@@ -1302,6 +1302,17 @@ function focusErrorPosition(offset: number): boolean {
  */
 function locateActiveResultError() {
   const result = props.activeTab.result;
+  logSqlErrorPosition("locate:invoke", {
+    tabId: props.activeTab.id,
+    mode: props.activeTab.mode,
+    hasEditorRef: Boolean(queryEditorRef.value),
+    activeResultIndex: props.activeTab.activeResultIndex,
+    statementIndex: result?.statement_index,
+    hasBackendError: Boolean(result?.error),
+    errorPosition: result?.error?.errorPosition ?? null,
+    editorLength: props.activeTab.sql.length,
+    resultIsError: Boolean(result && isQueryExecutionErrorResult(result)),
+  });
   const mapped = sqlErrorEditorOffset({
     editorSql: props.activeTab.sql,
     result,
@@ -1310,9 +1321,14 @@ function locateActiveResultError() {
     parameterOptions: activeSqlStatementParameterOptions.value,
   });
   if (!mapped) {
+    logSqlErrorPosition("locate:unavailable", {
+      tabId: props.activeTab.id,
+      reason: "sqlErrorEditorOffset returned undefined (see the preceding 'unresolved:result-source-range' log)",
+    });
     toast(t("editor.errorPositionUnavailable"), 3000);
     return;
   }
+  logSqlErrorPosition("locate:focus", { tabId: props.activeTab.id, offset: mapped.offset, line: mapped.line, column: mapped.column });
   if (queryEditorRef.value) {
     queryEditorRef.value.focusErrorPosition(mapped.offset);
   } else {
