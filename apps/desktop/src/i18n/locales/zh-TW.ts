@@ -1409,6 +1409,8 @@ export default withEnglishFallback({
     queryTimeoutError: "查詢逾時 ({seconds}s)，請檢查資料庫連線是否正常",
     changeConnectionTimeout: "修改連線逾時時間",
     changeQueryTimeout: "修改查詢逾時時間",
+    locateError: "定位錯誤（第 {line} 行，第 {column} 列）",
+    errorPositionUnavailable: "錯誤位置與目前編輯器內容不一致，無法定位。",
     connectionMayBeLost: "連線可能已斷開，請重新整理資料重試",
     showResultsPane: "顯示結果",
     hideResultsPane: "收起結果",

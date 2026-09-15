@@ -1411,6 +1411,8 @@ export default withEnglishFallback({
     queryTimeoutError: "La consulta agotó el tiempo ({seconds}s). Comprueba la conexión a la base de datos.",
     changeConnectionTimeout: "Cambiar tiempo de espera de conexión",
     changeQueryTimeout: "Cambiar tiempo de espera de consulta",
+    locateError: "Localizar error (línea {line}, columna {column})",
+    errorPositionUnavailable: "La posición del error ya no coincide con el contenido del editor, por lo que no se puede localizar.",
     connectionMayBeLost: "Es posible que la conexión se haya perdido. Actualiza los datos e inténtalo de nuevo.",
     showResultsPane: "Mostrar resultados",
     hideResultsPane: "Ocultar resultados",

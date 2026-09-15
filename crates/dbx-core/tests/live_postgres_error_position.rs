@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Live PostgreSQL verification of the SQL error-position plumbing.
 //!
 //! Requires a connectable PostgreSQL-family server pointed at by

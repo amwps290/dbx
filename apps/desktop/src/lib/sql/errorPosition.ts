@@ -110,9 +110,13 @@ export function sqlErrorEditorOffset(options: SqlErrorOffsetOptions): EditorErro
 
   const range = resultSourceRange(options.editorSql, options.result ?? undefined, options.resultIndex, options.databaseType, options.parameterOptions);
   if (!range) {
-    logDiagnostics("unresolved:result-source-range", options, {
-      reason: "resultSourceRange returned undefined: the result's statement text is not found (or no longer unique) in the editor",
-    });
+    const reason = "resultSourceRange returned undefined: the result's statement text is not found (or no longer unique) in the editor";
+    if (isSqlErrorPositionDebugEnabled()) {
+      logDiagnostics("unresolved:result-source-range", options, { reason });
+    } else {
+      // Redacted failure record: SQL previews (user data) go to the debug-gated diagnostics only.
+      logSqlErrorPosition("unresolved:result-source-range", { reason, resultIndex: options.resultIndex, statementIndex: options.result?.statement_index ?? null });
+    }
     return undefined;
   }
 

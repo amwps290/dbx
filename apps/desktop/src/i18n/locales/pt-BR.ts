@@ -1410,6 +1410,8 @@ export default withEnglishFallback({
     queryTimeoutError: "A consulta expirou ({seconds}s). Verifique se a conexão com o banco de dados está saudável.",
     changeConnectionTimeout: "Alterar tempo limite da conexão",
     changeQueryTimeout: "Alterar tempo limite da consulta",
+    locateError: "Localizar erro (linha {line}, coluna {column})",
+    errorPositionUnavailable: "A posição do erro não corresponde mais ao conteúdo do editor, portanto não é possível localizá-la.",
     connectionMayBeLost: "A conexão pode ter sido perdida. Atualize os dados e tente novamente.",
     showResultsPane: "Mostrar resultados",
     hideResultsPane: "Ocultar resultados",

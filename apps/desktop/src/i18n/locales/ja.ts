@@ -1430,6 +1430,8 @@ export default withEnglishFallback({
     queryTimeoutError: "クエリがタイムアウトしました（{seconds}秒）。データベース接続が正常か確認してください。",
     changeConnectionTimeout: "接続タイムアウトを変更",
     changeQueryTimeout: "クエリタイムアウトを変更",
+    locateError: "エラー位置へ移動（{line} 行目 {column} 桁目）",
+    errorPositionUnavailable: "エラー位置が現在のエディター内容と一致しないため、位置を特定できません。",
     connectionMayBeLost: "接続が失われた可能性があります。データを更新して再試行してください。",
     showResultsPane: "結果を表示",
     hideResultsPane: "結果を非表示",

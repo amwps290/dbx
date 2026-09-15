@@ -1311,6 +1311,8 @@ export default withEnglishFallback({
     queryTimeoutError: "Sorğunun vaxt limiti bitdi ({seconds}s). Verilənlər bazası əlaqəsinin işlək olub-olmadığını yoxlayın.",
     changeConnectionTimeout: "Əlaqənin vaxt limitini dəyiş",
     changeQueryTimeout: "Sorğunun vaxt limitini dəyiş",
+    locateError: "Xətanı tap ({line}. sətir, {column}. sütun)",
+    errorPositionUnavailable: "Xəta mövqeyi redaktorun cari məzmununa uyğun gəlmir, ona görə də tapıla bilmir.",
     connectionMayBeLost: "Əlaqə kəsilmiş ola bilər. Məlumatları yeniləyin və yenidən cəhd edin.",
     showResultsPane: "Nəticələri göstər",
     hideResultsPane: "Nəticələri gizlət",

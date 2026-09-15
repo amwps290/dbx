@@ -1313,6 +1313,8 @@ export default withEnglishFallback({
     queryTimeoutError: "Sorgu zaman aşımına uğradı ({seconds} sn). Veritabanı bağlantısının sağlıklı olup olmadığını denetleyin.",
     changeConnectionTimeout: "Bağlantı zaman aşımını değiştir",
     changeQueryTimeout: "Sorgu zaman aşımını değiştir",
+    locateError: "Hatayı bul ({line}. satır, {column}. sütun)",
+    errorPositionUnavailable: "Hata konumu düzenleyicinin geçerli içeriğiyle eşleşmediği için bulunamıyor.",
     connectionMayBeLost: "Bağlantı kopmuş olabilir. Verileri yenileyip tekrar deneyin.",
     showResultsPane: "Sonuçları göster",
     hideResultsPane: "Sonuçları gizle",

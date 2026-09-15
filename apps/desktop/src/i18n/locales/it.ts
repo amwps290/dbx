@@ -1409,6 +1409,8 @@ export default withEnglishFallback({
     queryTimeoutError: "Timeout della query ({seconds}s). Verifica se la connessione al database è integra.",
     changeConnectionTimeout: "Modifica timeout connessione",
     changeQueryTimeout: "Modifica timeout query",
+    locateError: "Individua errore (riga {line}, colonna {column})",
+    errorPositionUnavailable: "La posizione dell'errore non corrisponde più al contenuto dell'editor, quindi non è possibile individuarla.",
     connectionMayBeLost: "La connessione potrebbe essere andata perduta. Aggiorna i dati e riprova.",
     showResultsPane: "Mostra risultati",
     hideResultsPane: "Nascondi risultati",
