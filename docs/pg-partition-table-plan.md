@@ -315,6 +315,9 @@ pub struct TablePartitionDraft {
 
 ## 7. 分阶段实施计划
 
+> **实施状态**：Phase 0 / 1 / 2a / 3a 已完成并通过真实库验证（PostgreSQL 14.19、KingbaseES V009R001C010）。
+> 待办：Phase 2b 子分区树编辑、Phase 3b openGauss / GaussDB / Vastbase（`pg_partition` catalog，非 PG 声明式分区模型）。
+
 ### Phase 0 — 只读展示（建议先落地，1–2 天）
 
 1. 后端：`PgTablePartitioning` 模型 + `get_table_partitioning_core` + `parse_pg_partition_bound` + 单元测试。
@@ -341,7 +344,8 @@ pub struct TablePartitionDraft {
 
 ### Phase 3 — 方言扩展（3–5 天，按需）
 
-- opengauss / kingbase / vastbase / GaussDB（A/PG 模式）/ PolarDB-PG：复用同一模型，`capabilityByType` 逐个打开，注意各自 catalog 差异（如 opengauss 9.2 不支持 `DETACH CONCURRENTLY`）。
+- **3a（已完成）**：kingbase — KingbaseES V9 与 PostgreSQL 共用 `pg_partitioned_table` / `relispartition` / `pg_get_partkeydef` catalog 与 `PARTITION OF` / `ATTACH` / `DETACH` 语法，直接复用同一模型；后端 `supports_partition_ddl` 放行 PostgreSQL + Kingbase，前端 capability 同步开启，已用真实 KingbaseES 实例跑通全部 live 用例。
+- **3b（待办）**：openGauss / GaussDB / Vastbase 使用 **openGauss 专有的 `pg_partition` catalog**（无 `relispartition`/`relpartbound`/`pg_get_partkeydef`），且分区是 Oracle 风格（`PARTITION BY RANGE (col) (PARTITION p1 VALUES LESS THAN (...))`），没有独立子表。需要单独的读取与 DDL 通道，不能复用本模型，因此暂不开启。
 - Oracle / Xugu 等已有 `list_partitions` Agent 通路，可复用新页签的只读形态，DDL 走各自方言。
 
 ---
