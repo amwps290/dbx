@@ -69,9 +69,10 @@ import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomC
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
 import CustomTypeInfoPanel from "@/components/objects/CustomTypeInfoPanel.vue";
+import TablePartitionsPanel from "@/components/structure/TablePartitionsPanel.vue";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import * as api from "@/lib/backend/api";
-import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, PgTablePartitioning, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
 import { sortTablesByFkDependency, type TableWithFk } from "@/lib/table/tableDependencySort";
 import { isSchemaAware, supportsTableVacuum, supportsTransfer } from "@/lib/database/databaseCapabilities";
 import { supportsAiAssistantContext, supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
@@ -265,6 +266,9 @@ const tableTriggersLoaded = ref(false);
 const tableConstraints = ref<ConstraintInfo[]>([]);
 const tableConstraintsLoading = ref(false);
 const tableConstraintsLoaded = ref(false);
+const tablePartitions = ref<PgTablePartitioning | null>(null);
+const tablePartitionsLoading = ref(false);
+const tablePartitionsLoaded = ref(false);
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/TableStructureEditor.
 const tableConstraintsForTab = computed(() => constraintsForConstraintsTab(tableConstraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -275,6 +279,7 @@ const activeTableInfoLoading = computed(() => {
   if (tableInfoTab.value === "columns") return tableColumnsLoading.value;
   if (tableInfoTab.value === "indexes") return tableIndexesLoading.value;
   if (tableInfoTab.value === "foreignKeys") return tableForeignKeysLoading.value;
+  if (tableInfoTab.value === "partitions") return tablePartitionsLoading.value;
   return tableInfoTab.value === "triggers" && tableTriggersLoading.value;
 });
 const SIDE_PANEL_MIN_WIDTH = 280;
@@ -1082,6 +1087,9 @@ const tableInfoTabs = computed<TableInfoTabItem[]>(() => {
   if (tableMetadataCapabilities.value.triggers) {
     tabs.push({ id: "triggers", label: t("grid.tableInfoTriggers"), icon: RotateCcw, count: tableTriggers.value.length });
   }
+  if (tableMetadataCapabilities.value.partitions) {
+    tabs.push({ id: "partitions", label: t("structureEditor.partitions"), icon: Network, count: tablePartitions.value?.partitions.length });
+  }
   return tabs;
 });
 
@@ -1143,6 +1151,9 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tableForeignKeys.value = [];
   tableTriggers.value = [];
   tableConstraints.value = [];
+  tablePartitions.value = null;
+  tablePartitionsLoaded.value = false;
+  tablePartitionsLoading.value = false;
   tableColumnsLoaded.value = false;
   tableDdlLoaded.value = false;
   tableIndexesLoaded.value = false;
@@ -1166,6 +1177,7 @@ async function selectTableInfoTab(tab: TableInfoTab) {
   else if (nextTab === "foreignKeys") await fetchTableForeignKeys();
   else if (nextTab === "constraints") await fetchTableConstraints();
   else if (nextTab === "triggers") await fetchTableTriggers();
+  else if (nextTab === "partitions") await fetchTablePartitions();
 }
 
 function tableMetadataRequest(row: ObjectBrowserRow): ObjectDdlRequest {
@@ -1298,6 +1310,31 @@ async function fetchTableTriggers(force = false) {
   }
 }
 
+async function fetchTablePartitions(force = false) {
+  const row = sidePanelRow.value;
+  if (!row || (tablePartitionsLoaded.value && !force)) return;
+  const epoch = sidePanelGuard.capture();
+  tablePartitionsLoading.value = true;
+  let loadedSuccessfully = false;
+  try {
+    const request = tableMetadataRequest(row);
+    // Live catalog read: partition metadata has no persisted cache facet.
+    const value = await api.getTablePartitioning(request.connectionId, request.database, request.schema || request.database, request.tableName);
+    if (sidePanelGuard.isStale(epoch)) return;
+    tablePartitions.value = value;
+    loadedSuccessfully = true;
+  } catch (error) {
+    if (sidePanelGuard.isStale(epoch)) return;
+    tablePartitions.value = null;
+    toast(translateBackendError(t, error), 5000);
+  } finally {
+    if (sidePanelGuard.isFresh(epoch)) {
+      tablePartitionsLoaded.value = loadedSuccessfully;
+      tablePartitionsLoading.value = false;
+    }
+  }
+}
+
 async function fetchTableConstraints(force = false) {
   const row = sidePanelRow.value;
   if (!row || (tableConstraintsLoaded.value && !force)) return;
@@ -1350,6 +1387,10 @@ async function refreshActiveTableInfo() {
     tableTriggers.value = [];
     tableTriggersLoaded.value = false;
     await fetchTableTriggers(true);
+  } else if (tableInfoTab.value === "partitions") {
+    tablePartitions.value = null;
+    tablePartitionsLoaded.value = false;
+    await fetchTablePartitions(true);
   }
 }
 
@@ -3921,6 +3962,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               </div>
             </div>
           </div>
+          <TablePartitionsPanel v-else-if="tableInfoTab === 'partitions'" :partitioning="tablePartitions" :loading="tablePartitionsLoading" :error="''" :search-query="tableInfoSearchQuery" />
           <pre
             v-else-if="tableInfoTab === 'ddl' && !tableDdlLoading"
             ref="tableInfoDdlPreRef"

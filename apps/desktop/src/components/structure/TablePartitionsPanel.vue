@@ -1,0 +1,79 @@
+<script setup lang="ts">
+import { computed } from "vue";
+import { Loader2 } from "@lucide/vue";
+import { useI18n } from "vue-i18n";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText } from "@/lib/table/pgPartitionPresentation";
+import { formatBytes } from "@/lib/database/serverMetrics";
+import type { PgPartitionKind, PgTablePartitioning } from "@/types/database";
+
+/**
+ * Read-only partition summary shared by the DataGrid / ObjectBrowser
+ * "table properties" drawers. The full structure editor keeps its own
+ * editable partitions pane.
+ */
+interface TablePartitionsPanelProps {
+  partitioning: PgTablePartitioning | null;
+  loading: boolean;
+  error: string;
+  searchQuery?: string;
+}
+
+const props = defineProps<TablePartitionsPanelProps>();
+
+const { t } = useI18n();
+
+function partitionStrategyLabel(kind?: PgPartitionKind): string {
+  const key = pgPartitionKindLabelKey(kind);
+  return key ? t(key) : "";
+}
+
+const rows = computed(() => {
+  const all = flattenPgPartitionNodes(props.partitioning?.partitions ?? []);
+  const query = props.searchQuery?.trim().toLowerCase();
+  if (!query) return all;
+  return all.filter((row) => row.node.name.toLowerCase().includes(query));
+});
+</script>
+
+<template>
+  <div class="flex-1 min-h-0 overflow-auto">
+    <div v-if="props.loading" class="h-full flex items-center justify-center">
+      <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
+    </div>
+    <div v-else-if="props.error" class="p-3 text-xs text-destructive">
+      {{ props.error }}
+    </div>
+    <div v-else-if="!props.partitioning || (!props.partitioning.isPartitioned && !props.partitioning.isPartition)" class="p-6 text-center text-xs text-muted-foreground">
+      {{ t("structureEditor.partitionsEmpty") }}
+    </div>
+    <div v-else class="divide-y">
+      <div class="p-3 text-xs">
+        <div class="flex flex-wrap items-center gap-1.5">
+          <span v-if="props.partitioning.isPartitioned" class="rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{{ partitionStrategyLabel(props.partitioning.strategy) }}</span>
+          <span v-else class="rounded border px-1.5 py-0.5 text-[10px] text-muted-foreground">{{ t("structureEditor.partitionMemberBadge") }}</span>
+          <span v-if="props.partitioning.keyDefinition" class="min-w-0 truncate font-mono text-[11px]">{{ props.partitioning.keyDefinition }}</span>
+        </div>
+        <div v-if="props.partitioning.parent" class="mt-1 truncate font-mono text-[11px] text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ props.partitioning.parent }}</div>
+        <div v-if="props.partitioning.ownBound" class="mt-1 truncate font-mono text-[11px] text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(props.partitioning.ownBound) }}</div>
+        <div v-if="props.partitioning.defaultPartition" class="mt-1 truncate font-mono text-[11px] text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ props.partitioning.defaultPartition }}</div>
+      </div>
+      <div v-if="rows.length === 0" class="p-6 text-center text-xs text-muted-foreground">
+        {{ props.searchQuery ? t("grid.tableInfoNoResults") : t("structureEditor.partitionsEmptyChildren") }}
+      </div>
+      <div v-for="row in rows" :key="row.key" class="p-3 text-xs">
+        <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 12}px` }">
+          <span class="font-medium truncate">{{ row.node.name }}</span>
+          <span v-if="row.node.strategy" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ partitionStrategyLabel(row.node.strategy) }}</span>
+          <span v-if="row.node.bound?.kind === 'default'" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</span>
+        </div>
+        <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">
+          {{ pgPartitionNodeBoundText(row.node) }}
+        </div>
+        <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
+          <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
+          <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>

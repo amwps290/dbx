@@ -44,6 +44,7 @@ import {
   RefreshCw,
   RefreshCcw,
   TableProperties,
+  Network,
   UserRound,
   Database,
   Eraser,
@@ -89,7 +90,7 @@ import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
 import DataGridReadonlyTextSelection from "@/components/grid/DataGridReadonlyTextSelection.vue";
 import GridSnapshotDialog from "@/components/grid/GridSnapshotDialog.vue";
-import type { QueryResult, ColumnInfo, ConstraintInfo, DatabaseType, ForeignKeyInfo, IndexInfo, TriggerInfo, TableInfoTab, QueryResultSourceColumnRef, QueryPageJumpProgress } from "@/types/database";
+import type { QueryResult, ColumnInfo, ConstraintInfo, DatabaseType, ForeignKeyInfo, IndexInfo, PgTablePartitioning, TriggerInfo, TableInfoTab, QueryResultSourceColumnRef, QueryPageJumpProgress } from "@/types/database";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { shouldNavigateFromTableInfoColumnClick } from "@/lib/table/tableInfoColumnNavigation";
 import { tableInfoTabForDrawerToggle } from "@/lib/table/tableInfoTabPreference";
@@ -10396,6 +10397,11 @@ const constraintsLoaded = ref(false);
 const constraintsLoading = ref(false);
 const constraintsError = ref("");
 const constraintsRequestGeneration = ref(0);
+const partitioning = ref<PgTablePartitioning | null>(null);
+const partitioningLoaded = ref(false);
+const partitioningLoading = ref(false);
+const partitioningError = ref("");
+const partitioningRequestGeneration = ref(0);
 // The Constraints tab hides foreign keys when a dedicated Foreign Keys tab is
 // also shown (each constraint appears once; FK navigation stays in that tab).
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -10406,6 +10412,7 @@ const activeTableInfoLoading = computed(() => {
   if (activeTableInfoTab.value === "indexes") return indexesLoading.value;
   if (activeTableInfoTab.value === "foreignKeys") return foreignKeysLoading.value;
   if (activeTableInfoTab.value === "constraints") return constraintsLoading.value;
+  if (activeTableInfoTab.value === "partitions") return partitioningLoading.value;
   return activeTableInfoTab.value === "triggers" && triggersLoading.value;
 });
 const cellDetailPanelLayout = computed(() => settingsStore.editorSettings.cellDetailPanelLayout);
@@ -10534,6 +10541,11 @@ const metadataLoaders = useDataGridTableMetadataLoaders({
     constraintsLoaded,
     constraintsLoading,
     constraintsError,
+    partitioning,
+    partitioningLoaded,
+    partitioningLoading,
+    partitioningError,
+    partitioningRequestGeneration,
     tableInfoColumnsRequestGeneration,
     tableOwnerRequestGeneration,
     indexesRequestGeneration,
@@ -10550,7 +10562,7 @@ const metadataLoaders = useDataGridTableMetadataLoaders({
   toastMongoIndexRefreshError: (message) => toast(t("contextMenu.mongoIndexRefreshFailed", { message }), 5000),
 });
 
-const { fetchDdl, fetchTableInfoColumns, fetchTableOwner, currentIndexTableIdentity, fetchIndexes, refreshMongoIndexMetadataAfterMutation, currentForeignKeyTableIdentity, fetchForeignKeys: fetchForeignKeysMetadata, fetchTriggers, fetchConstraints } = metadataLoaders;
+const { fetchDdl, fetchTableInfoColumns, fetchTableOwner, currentIndexTableIdentity, fetchIndexes, refreshMongoIndexMetadataAfterMutation, currentForeignKeyTableIdentity, fetchForeignKeys: fetchForeignKeysMetadata, fetchTriggers, fetchConstraints, fetchPartitions } = metadataLoaders;
 tableMetadataLoaderFetchForeignKeys = fetchForeignKeysMetadata;
 const tableInfoTabs = computed(() => {
   const tabs: TableInfoTabItem[] = [];
@@ -10597,6 +10609,14 @@ const tableInfoTabs = computed(() => {
       count: triggers.value.length,
     });
   }
+  if (tableMetadataCapabilities.value.partitions) {
+    tabs.push({
+      id: "partitions",
+      label: t("structureEditor.partitions"),
+      icon: Network,
+      count: partitioning.value?.partitions.length,
+    });
+  }
   return tabs;
 });
 const tableInfoTabListStyle = computed(() => ({
@@ -10630,6 +10650,7 @@ async function selectTableInfoTab(tab: TableInfoTab) {
   else if (nextTab === "foreignKeys") await fetchForeignKeys();
   else if (nextTab === "constraints") await fetchConstraints();
   else if (nextTab === "triggers") await fetchTriggers();
+  else if (nextTab === "partitions") await fetchPartitions();
 }
 
 watch(
@@ -10668,6 +10689,9 @@ async function refreshActiveTableInfo() {
   } else if (activeTableInfoTab.value === "triggers") {
     triggersLoaded.value = false;
     await fetchTriggers();
+  } else if (activeTableInfoTab.value === "partitions") {
+    partitioningLoaded.value = false;
+    await fetchPartitions(true);
   }
 }
 
@@ -10700,6 +10724,11 @@ watch(
     constraintsLoading.value = false;
     constraintsError.value = "";
     constraintsRequestGeneration.value += 1;
+    partitioning.value = null;
+    partitioningLoaded.value = false;
+    partitioningLoading.value = false;
+    partitioningError.value = "";
+    partitioningRequestGeneration.value += 1;
     // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
     if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
       void fetchIndexes();
@@ -13419,6 +13448,9 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               :constraints="filteredConstraints"
               :constraints-loading="constraintsLoading"
               :constraints-error="constraintsError"
+              :partitioning="partitioning"
+              :partitions-loading="partitioningLoading"
+              :partitions-error="partitioningError"
               :is-protected-mongo-index="isProtectedMongoIndex"
               :format-column-type="gaussdbMColumnType"
               @table-info-column-click="onTableInfoColumnClick"
