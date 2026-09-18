@@ -184,8 +184,8 @@ func (connection *fallbackConn) QueryContext(_ context.Context, query string, _ 
 	}
 	if strings.Contains(query, "CASE c.relkind") && strings.Contains(query, "obj_description(c.oid)") {
 		return &valueRows{
-			columns: []string{"table_name", "table_type", "table_comment"},
-			rows:    [][]driver.Value{{"orders", "BASE TABLE", "orders table"}},
+			columns: []string{"table_name", "table_type", "table_comment", "parent_schema", "parent_name"},
+			rows:    [][]driver.Value{{"orders", "BASE TABLE", "orders table", nil, nil}},
 		}, nil
 	}
 	if strings.Contains(query, "SELECT obj_description(c.oid)") {
@@ -2119,24 +2119,25 @@ func TestListTablesPreservesKingbaseObjectTypesAndComments(t *testing.T) {
 		postgresCatalog bool
 		mysqlCompat     bool
 		wantCatalog     string
+		wantInherits    string
 	}{
-		{name: "modern system catalog", wantCatalog: "sys_catalog.sys_class c"},
-		{name: "PostgreSQL catalog", postgresCatalog: true, wantCatalog: "pg_catalog.pg_class c"},
-		{name: "MySQL compatibility mode", mysqlCompat: true, wantCatalog: "sys_catalog.sys_class c"},
+		{name: "modern system catalog", wantCatalog: "sys_catalog.sys_class c", wantInherits: "sys_catalog.sys_inherits i"},
+		{name: "PostgreSQL catalog", postgresCatalog: true, wantCatalog: "pg_catalog.pg_class c", wantInherits: "pg_catalog.pg_inherits i"},
+		{name: "MySQL compatibility mode", mysqlCompat: true, wantCatalog: "sys_catalog.sys_class c", wantInherits: "sys_catalog.sys_inherits i"},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
-				if !strings.Contains(query, "FROM "+test.wantCatalog) || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") || !strings.Contains(query, "obj_description(c.oid)") {
+				if !strings.Contains(query, "FROM "+test.wantCatalog) || !strings.Contains(query, "LEFT JOIN "+test.wantInherits) || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") || !strings.Contains(query, "obj_description(c.oid)") {
 					return nil, errors.New("unexpected query: " + query)
 				}
 				return &valueRows{
-					columns: []string{"relname", "relkind", "comment"},
+					columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
 					rows: [][]driver.Value{
-						{"orders", "TABLE", "orders table"},
-						{"sales_view", "VIEW", nil},
-						{"sales_cache", "MATERIALIZED_VIEW", "cached sales"},
+						{"orders", "TABLE", "orders table", nil, nil},
+						{"sales_view", "VIEW", nil, nil, nil},
+						{"sales_cache", "MATERIALIZED_VIEW", "cached sales", nil, nil},
 					},
 				}, nil
 			}}
@@ -2162,6 +2163,48 @@ func TestListTablesPreservesKingbaseObjectTypesAndComments(t *testing.T) {
 	}
 }
 
+func TestListTablesAndObjectsPreservePartitionHierarchy(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		for _, fragment := range []string{
+			"LEFT JOIN sys_catalog.sys_inherits i ON i.inhrelid = c.oid",
+			"LEFT JOIN sys_catalog.sys_class pc ON pc.oid = i.inhparent",
+			"LEFT JOIN sys_catalog.sys_namespace pn ON pn.oid = pc.relnamespace",
+			"CASE WHEN pc.relkind = 'p' THEN pn.nspname ELSE NULL END AS parent_schema",
+			"CASE WHEN pc.relkind = 'p' THEN pc.relname ELSE NULL END AS parent_name",
+		} {
+			if !strings.Contains(query, fragment) {
+				return nil, errors.New("partition query missing " + fragment + ": " + query)
+			}
+		}
+		return &valueRows{
+			columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+			rows: [][]driver.Value{
+				{"catalog_nested", "TABLE", nil, nil, nil},
+				{"catalog_nested_2024", "TABLE", nil, "partition_demo", "catalog_nested"},
+				{"catalog_nested_2024_asia", "TABLE", nil, "partition_demo", "catalog_nested_2024"},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	tables, err := server.listTables("partition_demo", metadataListConstraints{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 3 || tables[0].ParentName != nil || tables[1].ParentSchema == nil || *tables[1].ParentSchema != "partition_demo" || tables[1].ParentName == nil || *tables[1].ParentName != "catalog_nested" || tables[2].ParentName == nil || *tables[2].ParentName != "catalog_nested_2024" {
+		t.Fatalf("unexpected partition table hierarchy: %#v", tables)
+	}
+
+	objects, err := server.listObjects("partition_demo", metadataListConstraints{ObjectTypes: []string{"TABLE"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 3 || objects[1].ParentSchema == nil || *objects[1].ParentSchema != "partition_demo" || objects[1].ParentName == nil || *objects[1].ParentName != "catalog_nested" || objects[2].ParentName == nil || *objects[2].ParentName != "catalog_nested_2024" {
+		t.Fatalf("object list lost partition hierarchy: %#v", objects)
+	}
+}
+
 func TestListTablesCachesMissingCatalogOIDCapability(t *testing.T) {
 	for _, test := range []struct {
 		name            string
@@ -2183,8 +2226,8 @@ func TestListTablesCachesMissingCatalogOIDCapability(t *testing.T) {
 					return nil, errors.New("fallback must return a NULL comment: " + query)
 				}
 				return &valueRows{
-					columns: []string{"relname", "relkind", "table_comment"},
-					rows:    [][]driver.Value{{"orders", "TABLE", nil}},
+					columns: []string{"relname", "relkind", "table_comment", "parent_schema", "parent_name"},
+					rows:    [][]driver.Value{{"orders", "TABLE", nil, nil, nil}},
 				}, nil
 			}}
 			server := newServer()
@@ -2364,8 +2407,8 @@ func TestListObjectsIncludesCustomTypesWhenUnfiltered(t *testing.T) {
 			}, nil
 		case strings.Contains(query, "sys_class c"):
 			return &valueRows{
-				columns: []string{"relname", "relkind", "comment"},
-				rows:    [][]driver.Value{{"orders", "TABLE", nil}},
+				columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+				rows:    [][]driver.Value{{"orders", "TABLE", nil, nil, nil}},
 			}, nil
 		}
 		return nil, errors.New("unexpected query: " + query)
@@ -2437,8 +2480,8 @@ func TestListObjectsFiltersSortsAndPagesMySQLCompatObjects(t *testing.T) {
 		switch {
 		case strings.Contains(query, "FROM sys_catalog.sys_class c"):
 			return &valueRows{
-				columns: []string{"relname", "relkind", "comment"},
-				rows:    [][]driver.Value{{"match_table", "TABLE", nil}},
+				columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+				rows:    [][]driver.Value{{"match_table", "TABLE", nil, nil, nil}},
 			}, nil
 		case strings.Contains(query, "FROM information_schema.routines"):
 			return &valueRows{
@@ -2518,7 +2561,7 @@ func TestListObjectsSkipsMySQLCompatRoutineQueryForNonRoutineConstraints(t *test
 					return nil, errors.New("non-routine request must not query routines: " + query)
 				}
 				if objectType == "TABLE" && strings.Contains(query, "FROM sys_catalog.sys_class c") {
-					return &valueRows{columns: []string{"relname", "relkind", "comment"}}, nil
+					return &valueRows{columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"}}, nil
 				}
 				return nil, errors.New("unexpected query: " + query)
 			}}
@@ -2663,8 +2706,8 @@ func TestListObjectsKeepsTablesWhenMySQLCompatRoutineQueryFails(t *testing.T) {
 		switch {
 		case strings.Contains(query, "FROM sys_catalog.sys_class c"):
 			return &valueRows{
-				columns: []string{"relname", "relkind", "comment"},
-				rows:    [][]driver.Value{{"orders", "TABLE", "orders table"}},
+				columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+				rows:    [][]driver.Value{{"orders", "TABLE", "orders table", nil, nil}},
 			}, nil
 		case strings.Contains(query, "FROM information_schema.routines"):
 			return nil, errors.New("routine catalog unavailable")
@@ -2740,8 +2783,8 @@ func TestListObjectsSkipsCustomTypesWhenTableRequested(t *testing.T) {
 			return nil, errors.New("unexpected query: " + query)
 		}
 		return &valueRows{
-			columns: []string{"relname", "relkind", "comment"},
-			rows:    [][]driver.Value{{"orders", "TABLE", nil}},
+			columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+			rows:    [][]driver.Value{{"orders", "TABLE", nil, nil, nil}},
 		}, nil
 	}}
 	server := newServer()
@@ -2790,8 +2833,8 @@ func TestListObjectsUnfilteredPropagatesCustomTypesError(t *testing.T) {
 			}, nil
 		case strings.Contains(query, "sys_class c"):
 			return &valueRows{
-				columns: []string{"relname", "relkind", "comment"},
-				rows:    [][]driver.Value{{"orders", "TABLE", nil}},
+				columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
+				rows:    [][]driver.Value{{"orders", "TABLE", nil, nil, nil}},
 			}, nil
 		}
 		return nil, errors.New("unexpected query: " + query)

@@ -61,9 +61,11 @@ type databaseInfo struct {
 }
 
 type tableInfo struct {
-	Name      string  `json:"name"`
-	TableType string  `json:"table_type"`
-	Comment   *string `json:"comment"`
+	Name         string  `json:"name"`
+	TableType    string  `json:"table_type"`
+	Comment      *string `json:"comment"`
+	ParentSchema *string `json:"parent_schema,omitempty"`
+	ParentName   *string `json:"parent_name,omitempty"`
 }
 
 type objectInfo struct {
@@ -321,9 +323,9 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	if s.mode.postgresCatalog {
 		catalog = "pg_catalog"
 	}
-	includeComment := !s.catalogOIDUnsupported
-	rows, err := s.queryTables(effective, catalog, includeComment)
-	if err != nil && includeComment && isUndefinedColumn(err, "c.oid") {
+	includeCatalogMetadata := !s.catalogOIDUnsupported
+	rows, err := s.queryTables(effective, catalog, includeCatalogMetadata)
+	if err != nil && includeCatalogMetadata && isUndefinedColumn(err, "c.oid") {
 		s.catalogOIDUnsupported = true
 		rows, err = s.queryTables(effective, catalog, false)
 	}
@@ -334,11 +336,14 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	result := []tableInfo{}
 	for rows.Next() {
 		var name, kind string
-		var comment sql.NullString
-		if err := rows.Scan(&name, &kind, &comment); err != nil {
+		var comment, parentSchema, parentName sql.NullString
+		if err := rows.Scan(&name, &kind, &comment, &parentSchema, &parentName); err != nil {
 			return nil, err
 		}
-		item := tableInfo{Name: name, TableType: normalizeTableType(kind), Comment: nullStringPtr(comment)}
+		item := tableInfo{
+			Name: name, TableType: normalizeTableType(kind), Comment: nullStringPtr(comment),
+			ParentSchema: nullStringPtr(parentSchema), ParentName: nullStringPtr(parentName),
+		}
 		if constraintsMatch(constraints, item.Name, item.TableType) {
 			result = append(result, item)
 		}
@@ -346,17 +351,31 @@ func (s *server) listTables(schema string, constraints metadataListConstraints) 
 	return pageTables(result, constraints), rows.Err()
 }
 
-func (s *server) queryTables(schema, catalog string, includeComment bool) (*sql.Rows, error) {
+func (s *server) queryTables(schema, catalog string, includeCatalogMetadata bool) (*sql.Rows, error) {
 	commentExpression := "NULL AS table_comment"
-	if includeComment {
+	parentSchemaExpression := "NULL AS parent_schema"
+	parentNameExpression := "NULL AS parent_name"
+	inheritanceJoins := ""
+	if includeCatalogMetadata {
 		commentExpression = "obj_description(c.oid) AS table_comment"
+		parentSchemaExpression = "CASE WHEN pc.relkind = 'p' THEN pn.nspname ELSE NULL END AS parent_schema"
+		parentNameExpression = "CASE WHEN pc.relkind = 'p' THEN pc.relname ELSE NULL END AS parent_name"
+		prefix := catalogPrefix(catalog)
+		inheritanceJoins = fmt.Sprintf(`
+LEFT JOIN %s.%s_inherits i ON i.inhrelid = c.oid
+LEFT JOIN %s.%s_class pc ON pc.oid = i.inhparent
+LEFT JOIN %s.%s_namespace pn ON pn.oid = pc.relnamespace`, catalog, prefix, catalog, prefix, catalog, prefix)
 	}
+	prefix := catalogPrefix(catalog)
 	query := fmt.Sprintf(`SELECT c.relname,
 CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN_TABLE' ELSE 'TABLE' END,
+%s,
+%s,
 %s
 FROM %s.%s_class c
-JOIN %s.%s_namespace n ON n.oid = c.relnamespace
-WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f') ORDER BY c.relname`, commentExpression, catalog, catalogPrefix(catalog), catalog, catalogPrefix(catalog), quoteLiteral(schema))
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace%s
+WHERE n.nspname = %s AND c.relkind IN ('r','p','v','m','f')
+ORDER BY c.relname`, commentExpression, parentSchemaExpression, parentNameExpression, catalog, prefix, catalog, prefix, inheritanceJoins, quoteLiteral(schema))
 	return s.metadataQuery(query)
 }
 
@@ -1107,7 +1126,10 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 			return nil, err
 		}
 		for _, table := range tables {
-			result = append(result, objectInfo{Name: table.Name, ObjectType: table.TableType, Schema: effective, Comment: table.Comment})
+			result = append(result, objectInfo{
+				Name: table.Name, ObjectType: table.TableType, Schema: effective, Comment: table.Comment,
+				ParentSchema: table.ParentSchema, ParentName: table.ParentName,
+			})
 		}
 	}
 	if constraintsAllowRoutines(constraints) {
