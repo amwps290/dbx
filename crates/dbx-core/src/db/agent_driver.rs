@@ -1216,6 +1216,8 @@ pub enum AgentMethod {
     ListConstraints,
     ListPartitions,
     ListSubpartitions,
+    GetTablePartitionStatus,
+    GetTablePartitioning,
     GetTableDdl,
     ExecuteQuery,
     ExecuteQueryPage,
@@ -1235,7 +1237,7 @@ pub enum AgentMethod {
 }
 
 impl AgentMethod {
-    pub const ALL: [Self; 39] = [
+    pub const ALL: [Self; 41] = [
         Self::Handshake,
         Self::Connect,
         Self::OpenSession,
@@ -1260,6 +1262,8 @@ impl AgentMethod {
         Self::ListConstraints,
         Self::ListPartitions,
         Self::ListSubpartitions,
+        Self::GetTablePartitionStatus,
+        Self::GetTablePartitioning,
         Self::ExecuteQuery,
         Self::ExecuteQueryPage,
         Self::FetchQueryPage,
@@ -1305,6 +1309,8 @@ impl AgentMethod {
             Self::ListConstraints => "list_constraints",
             Self::ListPartitions => "list_partitions",
             Self::ListSubpartitions => "list_subpartitions",
+            Self::GetTablePartitionStatus => "get_table_partition_status",
+            Self::GetTablePartitioning => "get_table_partitioning",
             Self::ExecuteQuery => "execute_query",
             Self::ExecuteQueryPage => "execute_query_page",
             Self::FetchQueryPage => "fetch_query_page",
@@ -2319,6 +2325,36 @@ impl AgentDriverClient {
     ) -> Result<T, String> {
         self.call_method_with_timeout(
             AgentMethod::ListSubpartitions,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn get_table_partition_status<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::GetTablePartitionStatus,
+            agent_schema_table_params(database, schema, table),
+            timeout_duration,
+        )
+        .await
+    }
+
+    pub async fn get_table_partitioning<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout(
+            AgentMethod::GetTablePartitioning,
             agent_schema_table_params(database, schema, table),
             timeout_duration,
         )
@@ -5079,6 +5115,8 @@ for line in sys.stdin:
         assert_eq!(AgentMethod::ListConstraints.as_str(), "list_constraints");
         assert_eq!(AgentMethod::ListPartitions.as_str(), "list_partitions");
         assert_eq!(AgentMethod::ListSubpartitions.as_str(), "list_subpartitions");
+        assert_eq!(AgentMethod::GetTablePartitionStatus.as_str(), "get_table_partition_status");
+        assert_eq!(AgentMethod::GetTablePartitioning.as_str(), "get_table_partitioning");
         assert_eq!(AgentMethod::GetTableDdl.as_str(), "get_table_ddl");
         assert_eq!(AgentMethod::ExecuteQuery.as_str(), "execute_query");
         assert_eq!(AgentMethod::ExecuteQueryPage.as_str(), "execute_query_page");

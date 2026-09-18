@@ -68,6 +68,54 @@ type tableInfo struct {
 	ParentName   *string `json:"parent_name,omitempty"`
 }
 
+type pgPartitionBound struct {
+	Kind      string   `json:"kind"`
+	From      []string `json:"from,omitempty"`
+	To        []string `json:"to,omitempty"`
+	Values    []string `json:"values,omitempty"`
+	Modulus   int      `json:"modulus,omitempty"`
+	Remainder int      `json:"remainder,omitempty"`
+}
+
+type pgPartitionNode struct {
+	Schema          string            `json:"schema"`
+	Name            string            `json:"name"`
+	Strategy        string            `json:"strategy,omitempty"`
+	KeyDefinition   string            `json:"keyDefinition,omitempty"`
+	Bound           *pgPartitionBound `json:"bound,omitempty"`
+	BoundDefinition string            `json:"boundDefinition,omitempty"`
+	IsLeaf          bool              `json:"isLeaf"`
+	Children        []pgPartitionNode `json:"children"`
+}
+
+type pgTablePartitioning struct {
+	IsPartitioned    bool              `json:"isPartitioned"`
+	IsPartition      bool              `json:"isPartition"`
+	Parent           string            `json:"parent,omitempty"`
+	ParentSchema     string            `json:"parentSchema,omitempty"`
+	ParentTable      string            `json:"parentTable,omitempty"`
+	OwnBound         *pgPartitionBound `json:"ownBound,omitempty"`
+	Strategy         string            `json:"strategy,omitempty"`
+	KeyDefinition    string            `json:"keyDefinition,omitempty"`
+	KeyColumns       []string          `json:"keyColumns"`
+	KeyExpression    string            `json:"keyExpression,omitempty"`
+	DefaultPartition string            `json:"defaultPartition,omitempty"`
+	Partitions       []pgPartitionNode `json:"partitions"`
+	ServerVersionNum *int              `json:"serverVersionNum,omitempty"`
+}
+
+type partitionRelation struct {
+	OID           int64
+	Schema        string
+	Name          string
+	ParentOID     sql.NullInt64
+	ParentSchema  sql.NullString
+	ParentName    sql.NullString
+	Relkind       string
+	Bound         sql.NullString
+	KeyDefinition sql.NullString
+}
+
 type objectInfo struct {
 	Name           string  `json:"name"`
 	ObjectType     string  `json:"object_type"`
@@ -1114,6 +1162,144 @@ func (s *server) buildCustomTypeDDL(schema, name string, kind customTypeKind, in
 	}
 }
 
+func (s *server) getTablePartitioning(schema, table string) (pgTablePartitioning, error) {
+	effective, err := s.effectiveSchema(schema)
+	if err != nil {
+		return pgTablePartitioning{}, err
+	}
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	prefix := catalogPrefix(catalog)
+	partKeyFunction := kingbaseCatalogFunction(catalog, "sys_get_partkeydef", "pg_get_partkeydef")
+	boundFunction := kingbaseCatalogFunction(catalog, "sys_get_expr", "pg_get_expr")
+	query := fmt.Sprintf(`WITH RECURSIVE tree AS (
+SELECT c.oid::bigint AS oid, n.nspname AS schema_name, c.relname AS table_name,
+       i.inhparent::bigint AS parent_oid, pn.nspname AS parent_schema, pc.relname AS parent_name,
+       c.relkind::text AS relkind
+FROM %s.%s_class c
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+LEFT JOIN %s.%s_inherits i ON i.inhrelid = c.oid
+LEFT JOIN %s.%s_class pc ON pc.oid = i.inhparent
+LEFT JOIN %s.%s_namespace pn ON pn.oid = pc.relnamespace
+WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','f')
+UNION ALL
+SELECT c.oid::bigint, n.nspname, c.relname, tree.oid, tree.schema_name, tree.table_name, c.relkind::text
+FROM %s.%s_inherits i
+JOIN %s.%s_class c ON c.oid = i.inhrelid
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+JOIN tree ON tree.oid = i.inhparent
+WHERE c.relkind IN ('r','p','f')
+)
+SELECT t.oid, t.schema_name, t.table_name, t.parent_oid, t.parent_schema, t.parent_name, t.relkind,
+       CASE WHEN t.relkind IN ('r','f') THEN %s(c.relpartbound, c.oid, true) ELSE NULL END AS partition_bound,
+       CASE WHEN t.relkind = 'p' THEN %s(c.oid) ELSE NULL END AS partition_key
+FROM tree t
+JOIN %s.%s_class c ON c.oid = t.oid
+ORDER BY t.oid`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLiteral(table), catalog, prefix, catalog, prefix, catalog, prefix, boundFunction, partKeyFunction, catalog, prefix)
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return pgTablePartitioning{}, err
+	}
+	defer rows.Close()
+	relations := make([]partitionRelation, 0)
+	for rows.Next() {
+		var relation partitionRelation
+		if err := rows.Scan(&relation.OID, &relation.Schema, &relation.Name, &relation.ParentOID, &relation.ParentSchema, &relation.ParentName, &relation.Relkind, &relation.Bound, &relation.KeyDefinition); err != nil {
+			return pgTablePartitioning{}, err
+		}
+		relations = append(relations, relation)
+	}
+	if err := rows.Err(); err != nil {
+		return pgTablePartitioning{}, err
+	}
+	if len(relations) == 0 {
+		return pgTablePartitioning{}, nil
+	}
+	rootIndex := -1
+	for index, relation := range relations {
+		if relation.Schema == effective && relation.Name == table {
+			rootIndex = index
+			break
+		}
+	}
+	if rootIndex < 0 {
+		return pgTablePartitioning{}, nil
+	}
+	root := relations[rootIndex]
+	result := pgTablePartitioning{KeyColumns: []string{}, Partitions: []pgPartitionNode{}}
+	result.IsPartitioned = root.Relkind == "p" && root.KeyDefinition.Valid && strings.TrimSpace(root.KeyDefinition.String) != ""
+	result.IsPartition = root.ParentOID.Valid
+	if root.ParentSchema.Valid && root.ParentName.Valid {
+		result.ParentSchema, result.ParentTable = root.ParentSchema.String, root.ParentName.String
+		result.Parent = root.ParentSchema.String + "." + root.ParentName.String
+	}
+	if root.KeyDefinition.Valid {
+		result.KeyDefinition = root.KeyDefinition.String
+		result.Strategy = partitionKindFromKeyDefinition(root.KeyDefinition.String)
+	}
+	result.OwnBound = parseKingbasePartitionBound(root.Bound)
+	children := make(map[int64][]partitionRelation)
+	for index, relation := range relations {
+		if index == rootIndex || !relation.ParentOID.Valid {
+			continue
+		}
+		children[relation.ParentOID.Int64] = append(children[relation.ParentOID.Int64], relation)
+	}
+	result.Partitions = buildKingbasePartitionNodes(root.OID, children)
+	for _, node := range result.Partitions {
+		if node.Bound != nil && node.Bound.Kind == "default" {
+			result.DefaultPartition = node.Name
+			break
+		}
+	}
+	return result, nil
+}
+
+func partitionKindFromKeyDefinition(definition string) string {
+	fields := strings.Fields(strings.TrimSpace(definition))
+	if len(fields) == 0 {
+		return ""
+	}
+	switch strings.ToLower(fields[0]) {
+	case "range", "list", "hash":
+		return strings.ToLower(fields[0])
+	default:
+		return ""
+	}
+}
+
+func buildKingbasePartitionNodes(parentOID int64, children map[int64][]partitionRelation) []pgPartitionNode {
+	relations := children[parentOID]
+	sort.SliceStable(relations, func(i, j int) bool { return relations[i].Name < relations[j].Name })
+	nodes := make([]pgPartitionNode, 0, len(relations))
+	for _, relation := range relations {
+		childNodes := buildKingbasePartitionNodes(relation.OID, children)
+		node := pgPartitionNode{Schema: relation.Schema, Name: relation.Name, IsLeaf: len(childNodes) == 0, Children: childNodes}
+		if relation.KeyDefinition.Valid {
+			node.KeyDefinition = relation.KeyDefinition.String
+			node.Strategy = partitionKindFromKeyDefinition(relation.KeyDefinition.String)
+		}
+		node.BoundDefinition = relation.Bound.String
+		node.Bound = parseKingbasePartitionBound(relation.Bound)
+		nodes = append(nodes, node)
+	}
+	return nodes
+}
+
+func parseKingbasePartitionBound(value sql.NullString) *pgPartitionBound {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil
+	}
+	definition := strings.TrimSpace(value.String)
+	if strings.EqualFold(definition, "DEFAULT") {
+		return &pgPartitionBound{Kind: "default"}
+	}
+	// Keep the raw catalog definition when a Kingbase version renders a bound
+	// shape that this lightweight parser does not recognize.
+	return nil
+}
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
 	effective, err := s.effectiveSchema(schema)
 	if err != nil {

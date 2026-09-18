@@ -14,6 +14,14 @@ describe("pgPartitionPresentation", () => {
     expect(flattenPgPartitionNodes(tree).map(({ depth, node: rowNode }) => `${depth}:${rowNode.name}`)).toEqual(["0:logs", "1:logs_2024", "2:logs_2024_us", "0:logs_default"]);
   });
 
+  it("carries the direct parent identity for nested partition operations", () => {
+    const rows = flattenPgPartitionNodes([node("logs_2024", [node("logs_2024_cn")])], { schema: "public", name: "logs" });
+
+    expect(rows.map((row) => ({ name: row.node.name, parentSchema: row.parentSchema, parentName: row.parentName }))).toEqual([
+      { name: "logs_2024", parentSchema: "public", parentName: "logs" },
+      { name: "logs_2024_cn", parentSchema: "public", parentName: "logs_2024" },
+    ]);
+  });
   it("gives every row a unique key", () => {
     const rows = flattenPgPartitionNodes([node("a"), node("b", [node("b1")])]);
     expect(new Set(rows.map((row) => row.key)).size).toBe(rows.length);

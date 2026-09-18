@@ -2205,6 +2205,41 @@ func TestListTablesAndObjectsPreservePartitionHierarchy(t *testing.T) {
 	}
 }
 
+func TestGetTablePartitioningBuildsKingbaseHierarchy(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		for _, fragment := range []string{
+			"WITH RECURSIVE tree AS",
+			"sys_catalog.sys_inherits",
+			"sys_catalog.sys_get_partkeydef",
+			"sys_catalog.sys_get_expr",
+		} {
+			if !strings.Contains(query, fragment) {
+				return nil, errors.New("partition query missing " + fragment + ": " + query)
+			}
+		}
+		return &valueRows{
+			columns: []string{"oid", "schema_name", "table_name", "parent_oid", "parent_schema", "parent_name", "relkind", "partition_bound", "partition_key"},
+			rows: [][]driver.Value{
+				{int64(2), "public", "sales_default", int64(1), "public", "sales", "r", "DEFAULT", nil},
+				{int64(1), "public", "sales", nil, nil, nil, "p", nil, "RANGE (id)"},
+				{int64(3), "public", "sales_2024", int64(1), "public", "sales", "r", "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')", nil},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	partitioning, err := server.getTablePartitioning("public", "sales")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !partitioning.IsPartitioned || partitioning.IsPartition || partitioning.Strategy != "range" || partitioning.DefaultPartition != "sales_default" {
+		t.Fatalf("unexpected parent partitioning: %#v", partitioning)
+	}
+	if len(partitioning.Partitions) != 2 || !partitioning.Partitions[0].IsLeaf || partitioning.Partitions[1].Name != "sales_default" || partitioning.Partitions[1].Bound == nil || partitioning.Partitions[1].Bound.Kind != "default" {
+		t.Fatalf("unexpected partition nodes: %#v", partitioning.Partitions)
+	}
+}
 func TestListTablesCachesMissingCatalogOIDCapability(t *testing.T) {
 	for _, test := range []struct {
 		name            string

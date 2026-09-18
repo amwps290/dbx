@@ -126,7 +126,7 @@ export interface TablePartitionOperation {
   name: string;
   /** Required for `create`/`attach`; must be absent for `detach`/`drop`. */
   bound?: TablePartitionBoundDraft;
-  /** Emit `DETACH PARTITION ... CONCURRENTLY` (PostgreSQL 12+). */
+  /** Emit `DETACH PARTITION ... CONCURRENTLY` (PostgreSQL 14+). */
   concurrently: boolean;
 }
 

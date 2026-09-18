@@ -317,7 +317,7 @@ pub struct TablePartitionOperation {
     /// Required for `create`/`attach`; must be absent for `detach`/`drop`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<TablePartitionBoundDraft>,
-    /// Emit `DETACH PARTITION ... CONCURRENTLY` (PostgreSQL 12+).
+    /// Emit `DETACH PARTITION ... CONCURRENTLY` (PostgreSQL 14+).
     #[serde(default)]
     pub concurrently: bool,
 }

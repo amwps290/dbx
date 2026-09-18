@@ -59,7 +59,7 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
+import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows, type PgPartitionTreeRow } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
@@ -480,7 +480,12 @@ const createPartitioningKind = ref<PgPartitionKind>("range");
 const createPartitioningColumns = ref<string[]>([]);
 const createPartitioningExpression = ref("");
 
-const partitionTreeRows = computed(() => flattenPgPartitionNodes(partitioning.value?.partitions ?? []));
+const partitionTreeRows = computed(() =>
+  flattenPgPartitionNodes(partitioning.value?.partitions ?? [], {
+    schema: metadataSchema.value,
+    name: props.tableName || "",
+  }),
+);
 // Folded parents, so a large partition hierarchy can be navigated by level.
 const collapsedPartitionKeys = ref<Set<string>>(new Set());
 
@@ -527,7 +532,7 @@ const canManagePartitions = computed(() => {
   if (isCreateMode.value) return createPartitioningEnabled.value;
   return !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition);
 });
-const partitionSupportsConcurrentDetach = computed(() => (partitioning.value?.serverVersionNum ?? 0) >= 120000);
+const partitionSupportsConcurrentDetach = computed(() => databaseType.value === "postgres" && (partitioning.value?.serverVersionNum ?? 0) >= 140000 && !partitioning.value?.defaultPartition);
 const partitionDialogNeedsBound = computed(() => partitionDialogMode.value === "create" || partitionDialogMode.value === "attach");
 
 function resetPartitionDialog() {
@@ -552,9 +557,12 @@ function openPartitionDialog(mode: TablePartitionOperationKind, boundKind?: PgPa
   partitionDialogOpen.value = true;
 }
 
-function openPartitionRowOperation(mode: TablePartitionOperationKind, node: PgPartitionNode) {
+function openPartitionRowOperation(mode: TablePartitionOperationKind, row: PgPartitionTreeRow) {
   openPartitionDialog(mode);
-  partitionDialogName.value = node.name;
+  partitionDialogName.value = row.node.name;
+  partitionDialogSchema.value = row.node.schema;
+  partitionDialogParentSchema.value = row.parentSchema ?? "";
+  partitionDialogParentTable.value = row.parentName ?? "";
 }
 
 /** Detaching the partition currently being edited: the parent is not the
@@ -5730,10 +5738,10 @@ watch(
                           <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
                         </div>
                         <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
-                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row)">
                             <X :class="structureIconClass" />
                           </Button>
-                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row)">
                             <Trash2 :class="structureIconClass" />
                           </Button>
                         </div>

@@ -796,7 +796,7 @@ pub struct PgTablePartitioning {
     #[serde(default)]
     pub partitions: Vec<PgPartitionNode>,
     /// Server version (`current_setting('server_version_num')`), used by the UI
-    /// to gate `DETACH PARTITION CONCURRENTLY` (PostgreSQL 12+).
+    /// to gate `DETACH PARTITION CONCURRENTLY` (PostgreSQL 14+).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_version_num: Option<i32>,
 }

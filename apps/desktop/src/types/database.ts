@@ -1521,7 +1521,7 @@ export interface PgTablePartitioning {
   keyExpression?: string;
   defaultPartition?: string;
   partitions: PgPartitionNode[];
-  /** `server_version_num`, used to gate `DETACH PARTITION CONCURRENTLY` (12+). */
+  /** `server_version_num`, used to gate `DETACH PARTITION CONCURRENTLY` (14+). */
   serverVersionNum?: number;
 }
 

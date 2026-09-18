@@ -6,8 +6,16 @@ export interface PgPartitionTreeRow {
   /** 0 for a top-level partition of the table; +1 per nesting level. */
   depth: number;
   node: PgPartitionNode;
+  /** Direct parent identity, used by detach operations on nested partitions. */
+  parentSchema?: string;
+  parentName?: string;
   /** Keys of every ancestor above this row, outermost first (for collapse). */
   ancestorKeys: string[];
+}
+
+export interface PgPartitionParentIdentity {
+  schema?: string;
+  name?: string;
 }
 
 /**
@@ -15,13 +23,17 @@ export interface PgPartitionTreeRow {
  * hierarchies without recursive components. Nesting is conveyed by indentation
  * and the fold control; no tree guide lines are drawn.
  */
-export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorKeys: string[] = []): PgPartitionTreeRow[] {
+export function flattenPgPartitionNodes(nodes: PgPartitionNode[], rootParent: PgPartitionParentIdentity = {}): PgPartitionTreeRow[] {
+  return flattenPgPartitionNodesAtDepth(nodes, rootParent, 0, "", []);
+}
+
+function flattenPgPartitionNodesAtDepth(nodes: PgPartitionNode[], parent: PgPartitionParentIdentity, depth: number, keyPrefix: string, ancestorKeys: string[]): PgPartitionTreeRow[] {
   const rows: PgPartitionTreeRow[] = [];
   for (const node of nodes) {
     const key = `${keyPrefix}${node.schema}.${node.name}`;
-    rows.push({ key, depth, node, ancestorKeys: [...ancestorKeys] });
+    rows.push({ key, depth, node, parentSchema: parent.schema, parentName: parent.name, ancestorKeys: [...ancestorKeys] });
     if (node.children.length > 0) {
-      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorKeys, key]));
+      rows.push(...flattenPgPartitionNodesAtDepth(node.children, { schema: node.schema, name: node.name }, depth + 1, `${key}/`, [...ancestorKeys, key]));
     }
   }
   return rows;

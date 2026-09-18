@@ -7849,10 +7849,24 @@ pub async fn table_partition_status_core(
         match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => {
                 let info = db::postgres::get_table_partition_info(pool, schema, table).await?;
-                Ok(TablePartitionStatus {
-                    is_partitioned_parent: info.key.is_some() && !info.is_partition,
-                    is_partition: info.is_partition,
-                })
+                Ok(TablePartitionStatus { is_partitioned_parent: info.key.is_some(), is_partition: info.is_partition })
+            }
+            Some(PoolKind::Agent(client))
+                if connection_config(state, connection_id)
+                    .await
+                    .as_ref()
+                    .is_some_and(|config| config.db_type == DatabaseType::Kingbase) =>
+            {
+                let db_config = connection_config(state, connection_id).await;
+                let mut client = client.lock().await;
+                client
+                    .get_table_partition_status::<TablePartitionStatus>(
+                        database,
+                        schema,
+                        table,
+                        agent_metadata_timeout(db_config.as_ref()),
+                    )
+                    .await
             }
             _ => Ok(TablePartitionStatus::default()),
         }
@@ -7860,9 +7874,10 @@ pub async fn table_partition_status_core(
     .await
 }
 
-/// Structured PostgreSQL partitioning view used by the table structure
-/// editor's "Partitions" tab. Non-PostgreSQL pools return the default
-/// (all-false/empty) value so the tab simply renders as unsupported.
+/// Structured declarative partitioning view used by the table structure
+/// editor. Native PostgreSQL pools and compatible agents (such as Kingbase)
+/// provide the same response shape; unsupported pools return the default
+/// all-false/empty value.
 pub async fn get_table_partitioning_core(
     state: &AppState,
     connection_id: &str,
@@ -7875,6 +7890,23 @@ pub async fn get_table_partitioning_core(
         let pool_handle = state.pool_handle(&pool_key).await;
         match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => db::postgres::get_table_partitioning(pool, schema, table).await,
+            Some(PoolKind::Agent(client))
+                if connection_config(state, connection_id)
+                    .await
+                    .as_ref()
+                    .is_some_and(|config| config.db_type == DatabaseType::Kingbase) =>
+            {
+                let db_config = connection_config(state, connection_id).await;
+                let mut client = client.lock().await;
+                client
+                    .get_table_partitioning::<db::PgTablePartitioning>(
+                        database,
+                        schema,
+                        table,
+                        agent_metadata_timeout(db_config.as_ref()),
+                    )
+                    .await
+            }
             _ => Ok(db::PgTablePartitioning::default()),
         }
     })

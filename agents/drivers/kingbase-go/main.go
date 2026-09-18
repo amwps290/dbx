@@ -423,6 +423,15 @@ func (s *server) dispatch(method string, params map[string]json.RawMessage) (any
 	case "get_type_details":
 		result, err := s.getTypeDetails(stringParam(params, "schema"), stringParam(params, "name"))
 		return result, false, err
+	case "get_table_partition_status":
+		partitioning, err := s.getTablePartitioning(stringParam(params, "schema"), stringParam(params, "table"))
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]bool{"isPartitionedParent": partitioning.IsPartitioned, "isPartition": partitioning.IsPartition}, false, nil
+	case "get_table_partitioning":
+		result, err := s.getTablePartitioning(stringParam(params, "schema"), stringParam(params, "table"))
+		return result, false, err
 	case "get_table_ddl":
 		result, err := s.getTableDDL(stringParam(params, "schema"), stringParam(params, "table"))
 		return result, false, err
