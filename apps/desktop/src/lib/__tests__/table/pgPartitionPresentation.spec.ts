@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
 import type { PgPartitionNode } from "@/types/database";
 
 function node(name: string, children: PgPartitionNode[] = []): PgPartitionNode {
@@ -17,6 +17,31 @@ describe("pgPartitionPresentation", () => {
   it("gives every row a unique key", () => {
     const rows = flattenPgPartitionNodes([node("a"), node("b", [node("b1")])]);
     expect(new Set(rows.map((row) => row.key)).size).toBe(rows.length);
+  });
+
+  it("records the guide flags a tree renderer needs", () => {
+    // Two top-level partitions, the first with two children.
+    const tree = [node("p1", [node("p1a"), node("p1b")]), node("p2")];
+    const rows = flattenPgPartitionNodes(tree);
+
+    expect(rows.map((row) => [row.node.name, row.depth, row.isLastChild, row.ancestorGuides])).toEqual([
+      ["p1", 0, false, []],
+      ["p1a", 1, false, [true]],
+      ["p1b", 1, true, [true]],
+      ["p2", 0, true, []],
+    ]);
+  });
+
+  it("draws a tree prefix with vertical guides and a branch marker", () => {
+    const rows = flattenPgPartitionNodes([node("p1", [node("p1a"), node("p1b")]), node("p2", [node("p2a")])]);
+    const prefixes = Object.fromEntries(rows.map((row) => [row.node.name, pgPartitionTreePrefix(row)]));
+
+    expect(prefixes.p1).toBe("├─ ");
+    expect(prefixes.p1a).toBe("│  ├─ ");
+    expect(prefixes.p1b).toBe("│  └─ ");
+    // p2 is the last top-level partition, so its child has a blank guide.
+    expect(prefixes.p2).toBe("└─ ");
+    expect(prefixes.p2a).toBe("   └─ ");
   });
 
   it("renders each bound kind as its SQL fragment", () => {

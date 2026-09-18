@@ -4428,6 +4428,7 @@ export default {
     partitionsDefault: "Default partition",
     partitionsRowEstimate: "Estimated rows: {count}",
     partitionsSize: "Size: {size}",
+    partitionSubPartitionBadge: "Sub-partition",
     partitionMemberBadge: "Partition",
     partitionKindRange: "Range",
     partitionKindList: "List",

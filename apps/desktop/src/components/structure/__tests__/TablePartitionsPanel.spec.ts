@@ -79,6 +79,19 @@ describe("TablePartitionsPanel", () => {
     expect(text).toContain("structureEditor.partitionsSize");
   });
 
+  it("draws the nesting with tree guides and a sub-partition badge", async () => {
+    const root = await mount({ partitioning: partitioned, loading: false, error: "" });
+    const text = root.textContent ?? "";
+
+    // sales_2024 (top, has a later sibling) then sales_nested (last).
+    expect(text).toContain("├─ ");
+    expect(text).toContain("└─ ");
+    // The nested child keeps a blank guide under the last top-level partition.
+    expect(text).toContain("   └─ ");
+    // Depth > 0 rows are labelled as sub-partitions.
+    expect(text).toContain("structureEditor.partitionSubPartitionBadge");
+  });
+
   it("filters rows by the search query", async () => {
     const root = await mount({ partitioning: partitioned, loading: false, error: "", searchQuery: "2024" });
     const text = root.textContent ?? "";

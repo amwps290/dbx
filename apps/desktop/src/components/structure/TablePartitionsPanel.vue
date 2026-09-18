@@ -2,7 +2,7 @@
 import { computed } from "vue";
 import { Loader2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import type { PgPartitionKind, PgTablePartitioning } from "@/types/database";
 
@@ -61,17 +61,23 @@ const rows = computed(() => {
         {{ props.searchQuery ? t("grid.tableInfoNoResults") : t("structureEditor.partitionsEmptyChildren") }}
       </div>
       <div v-for="row in rows" :key="row.key" class="p-3 text-xs">
-        <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 12}px` }">
-          <span class="font-medium truncate">{{ row.node.name }}</span>
-          <span v-if="row.node.strategy" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ partitionStrategyLabel(row.node.strategy) }}</span>
-          <span v-if="row.node.bound?.kind === 'default'" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</span>
-        </div>
-        <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">
-          {{ pgPartitionNodeBoundText(row.node) }}
-        </div>
-        <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
-          <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
-          <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+        <div class="flex items-start gap-1">
+          <span aria-hidden="true" class="shrink-0 select-none whitespace-pre font-mono text-[11px] leading-5 text-muted-foreground/60">{{ pgPartitionTreePrefix(row) }}</span>
+          <div class="min-w-0 flex-1">
+            <div class="flex flex-wrap items-center gap-1.5">
+              <span class="font-medium truncate">{{ row.node.name }}</span>
+              <span v-if="row.depth > 0" class="rounded border border-dashed px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</span>
+              <span v-if="row.node.strategy" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ partitionStrategyLabel(row.node.strategy) }}</span>
+              <span v-if="row.node.bound?.kind === 'default'" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</span>
+            </div>
+            <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">
+              {{ pgPartitionNodeBoundText(row.node) }}
+            </div>
+            <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
+              <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
+              <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>

@@ -59,7 +59,7 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
@@ -5678,25 +5678,31 @@ watch(
                   {{ t("structureEditor.partitionsEmptyChildren") }}
                 </div>
                 <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                  <div class="flex flex-wrap items-center justify-between gap-1.5">
-                    <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
-                      <span class="font-mono font-medium">{{ row.node.name }}</span>
-                      <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
-                      <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                  <div class="flex items-start gap-1">
+                    <span aria-hidden="true" class="shrink-0 select-none whitespace-pre font-mono leading-5 text-muted-foreground/60">{{ pgPartitionTreePrefix(row) }}</span>
+                    <div class="min-w-0 flex-1">
+                      <div class="flex flex-wrap items-center justify-between gap-1.5">
+                        <div class="flex flex-wrap items-center gap-1.5">
+                          <span class="font-mono font-medium">{{ row.node.name }}</span>
+                          <Badge v-if="row.depth > 0" variant="outline" class="border-dashed text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</Badge>
+                          <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                          <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                        </div>
+                        <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
+                            <X :class="structureIconClass" />
+                          </Button>
+                          <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
+                            <Trash2 :class="structureIconClass" />
+                          </Button>
+                        </div>
+                      </div>
+                      <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
+                      <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
+                        <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
+                        <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+                      </div>
                     </div>
-                    <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
-                      <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
-                        <X :class="structureIconClass" />
-                      </Button>
-                      <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
-                        <Trash2 :class="structureIconClass" />
-                      </Button>
-                    </div>
-                  </div>
-                  <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
-                  <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
-                    <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
-                    <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
                   </div>
                 </div>
               </div>

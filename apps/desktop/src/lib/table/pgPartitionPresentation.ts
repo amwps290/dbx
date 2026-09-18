@@ -1,24 +1,46 @@
 import type { PgPartitionBound, PgPartitionKind, PgPartitionNode } from "@/types/database";
 
-/** One flattened row of a partition tree, carrying its nesting depth for indentation. */
+/** One flattened row of a partition tree, carrying what a tree renderer needs. */
 export interface PgPartitionTreeRow {
   key: string;
+  /** 0 for a top-level partition of the table; +1 per nesting level. */
   depth: number;
   node: PgPartitionNode;
+  /**
+   * One flag per ancestor level above this row: `true` means that ancestor has
+   * a later sibling, so a vertical guide line must continue through this row.
+   * Length equals `depth`.
+   */
+  ancestorGuides: boolean[];
+  /** This row is the last child of its parent (`└─` instead of `├─`). */
+  isLastChild: boolean;
 }
 
 /**
- * Depth-first flatten of a partition tree so the editor can render multi-level
- * hierarchies as an indented list without recursive components.
+ * Depth-first flatten of a partition tree so a renderer can draw multi-level
+ * hierarchies without recursive components, keeping the guide flags needed to
+ * show nesting clearly (a plain indent is too subtle for deep sub-partitions).
  */
-export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = ""): PgPartitionTreeRow[] {
+export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorGuides: boolean[] = []): PgPartitionTreeRow[] {
   const rows: PgPartitionTreeRow[] = [];
-  for (const node of nodes) {
+  nodes.forEach((node, index) => {
+    const isLastChild = index === nodes.length - 1;
     const key = `${keyPrefix}${node.schema}.${node.name}`;
-    rows.push({ key, depth, node });
-    rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`));
-  }
+    rows.push({ key, depth, node, ancestorGuides: [...ancestorGuides], isLastChild });
+    if (node.children.length > 0) {
+      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorGuides, !isLastChild]));
+    }
+  });
   return rows;
+}
+
+/**
+ * Monospace tree prefix for a flattened row, e.g. `│  ├─ ` — one 3-character
+ * cell per ancestor level plus the row's own branch marker.
+ */
+export function pgPartitionTreePrefix(row: PgPartitionTreeRow): string {
+  const guides = row.ancestorGuides.map((continues) => (continues ? "│  " : "   ")).join("");
+  return `${guides}${row.isLastChild ? "└─ " : "├─ "}`;
 }
 
 /** Renders a parsed bound as the SQL fragment PostgreSQL uses in `CREATE TABLE ... PARTITION OF`. */

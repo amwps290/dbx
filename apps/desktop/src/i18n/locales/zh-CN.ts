@@ -4404,6 +4404,7 @@ export default withEnglishFallback({
     partitionsDefault: "默认分区",
     partitionsRowEstimate: "估计行数：{count}",
     partitionsSize: "大小：{size}",
+    partitionSubPartitionBadge: "子分区",
     partitionMemberBadge: "分区",
     partitionKindRange: "范围",
     partitionKindList: "列表",
