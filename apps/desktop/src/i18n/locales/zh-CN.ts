@@ -4437,6 +4437,7 @@ export default withEnglishFallback({
     partitionRangeBoundInvalid: "RANGE 需要 FROM 与 TO 元组，且值数量相同。",
     partitionListBoundInvalid: "LIST 至少需要一个值。",
     partitionHashBoundInvalid: "HASH 需要模数 > 0，且 0 <= 余数 < 模数。",
+    partitionSqlPreview: "将执行的 SQL",
     partitionNameRequired: "请输入分区名称。",
     ddl: "DDL",
     addColumn: "新增字段",

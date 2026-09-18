@@ -20,6 +20,10 @@ test("both table-properties drawers expose a capability-gated partitions tab", (
       /tableMetadataCapabilities\.value\.partitions/,
       `${path} must gate the partitions tab on the capability`,
     );
+    // A plain table must not show the tab at all, so both drawers probe the
+    // cheap partition status and gate on the result.
+    assert.match(source, /api\.getTablePartitionStatus/, `${path} must probe the partition status`);
+    assert.match(source, /isPartitionedTable|tableIsPartitioned/, `${path} must gate on the probed status`);
     assert.match(source, /fetchPartitions|fetchTablePartitions/, `${path} must load partition metadata`);
   }
 });

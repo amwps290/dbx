@@ -407,6 +407,11 @@ const indexes = ref<EditableStructureIndex[]>([]);
  * is rejected by the server on such tables, so the option is disabled here and
  * the SQL builder refuses any concurrent request on it (fail closed). */
 const isPartitionedParent = ref(false);
+// True when the edited table is itself a member partition of another table.
+const isTablePartition = ref(false);
+// The partition-status probe has settled (success or failure), so the tab can
+// be hidden without hiding it merely because the probe is still in flight.
+const partitionStatusResolved = ref(false);
 /** Whether the last partition-status probe succeeded. When it cannot be
  * verified (probe failed), Concurrent is disabled — we must not assume a
  * non-partitioned table we could not check. */
@@ -509,14 +514,17 @@ function openDetachSelfPartitionDialog() {
   partitionDialogParentTable.value = partitioning.value?.parentTable ?? "";
 }
 
-function partitionDialogBound(): TablePartitionBoundDraft | undefined {
+/** `reportError` separates the confirm path (which surfaces validation
+ * messages) from the live SQL preview (which stays quiet while the user is
+ * still typing). */
+function partitionDialogBound(reportError: boolean): TablePartitionBoundDraft | undefined {
   const kind = partitionDialogBoundKind.value;
   if (kind === "default") return { kind: "default" };
   if (kind === "range") {
     const from = splitPgPartitionBoundValues(partitionDialogRangeFrom.value);
     const to = splitPgPartitionBoundValues(partitionDialogRangeTo.value);
     if (!from.length || from.length !== to.length) {
-      partitionDialogError.value = t("structureEditor.partitionRangeBoundInvalid");
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionRangeBoundInvalid");
       return undefined;
     }
     return { kind: "range", from, to };
@@ -524,7 +532,7 @@ function partitionDialogBound(): TablePartitionBoundDraft | undefined {
   if (kind === "list") {
     const values = splitPgPartitionBoundValues(partitionDialogListValues.value);
     if (!values.length) {
-      partitionDialogError.value = t("structureEditor.partitionListBoundInvalid");
+      if (reportError) partitionDialogError.value = t("structureEditor.partitionListBoundInvalid");
       return undefined;
     }
     return { kind: "list", values };
@@ -532,41 +540,84 @@ function partitionDialogBound(): TablePartitionBoundDraft | undefined {
   const modulus = Number.parseInt(partitionDialogModulus.value, 10);
   const remainder = Number.parseInt(partitionDialogRemainder.value, 10);
   if (!Number.isInteger(modulus) || modulus <= 0 || !Number.isInteger(remainder) || remainder < 0 || remainder >= modulus) {
-    partitionDialogError.value = t("structureEditor.partitionHashBoundInvalid");
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionHashBoundInvalid");
     return undefined;
   }
   return { kind: "hash", modulus, remainder };
 }
 
-function confirmPartitionDialog() {
-  partitionDialogError.value = "";
+function partitionDialogOperation(reportError: boolean, id: string): TablePartitionOperation | undefined {
   const mode = partitionDialogMode.value;
   const name = partitionDialogName.value.trim();
   if (!name) {
-    partitionDialogError.value = t("structureEditor.partitionNameRequired");
-    return;
+    if (reportError) partitionDialogError.value = t("structureEditor.partitionNameRequired");
+    return undefined;
   }
   let bound: TablePartitionBoundDraft | undefined;
-  if (mode === "create" || mode === "attach") {
-    bound = partitionDialogBound();
-    if (!bound) return;
+  if (partitionDialogNeedsBound.value) {
+    bound = partitionDialogBound(reportError);
+    if (!bound) return undefined;
   }
-  partitionOperations.value = [
-    ...partitionOperations.value,
-    {
-      id: `partition-op:${++partitionOperationSequence}`,
-      kind: mode,
-      parentSchema: partitionDialogParentSchema.value.trim(),
-      parentTable: partitionDialogParentTable.value.trim(),
-      schema: partitionDialogSchema.value.trim(),
-      name,
-      bound,
-      concurrently: mode === "detach" && partitionDialogConcurrently.value && partitionSupportsConcurrentDetach.value,
-    },
-  ];
+  return {
+    id,
+    kind: mode,
+    parentSchema: partitionDialogParentSchema.value.trim(),
+    parentTable: partitionDialogParentTable.value.trim(),
+    schema: partitionDialogSchema.value.trim(),
+    name,
+    bound,
+    concurrently: mode === "detach" && partitionDialogConcurrently.value && partitionSupportsConcurrentDetach.value,
+  };
+}
+
+function confirmPartitionDialog() {
+  partitionDialogError.value = "";
+  const operation = partitionDialogOperation(true, `partition-op:${++partitionOperationSequence}`);
+  if (!operation) return;
+  partitionOperations.value = [...partitionOperations.value, operation];
   partitionDialogOpen.value = false;
   scheduleSqlPreviewRefresh();
   syncDraftToParent();
+}
+
+const partitionDialogSql = ref("");
+const partitionDialogSqlWarnings = ref<string[]>([]);
+let partitionDialogSqlTimer: ReturnType<typeof setTimeout> | undefined;
+let partitionDialogSqlRequestId = 0;
+
+/** Rebuilds the statement the dialog would queue, using the same backend
+ * builder the save path uses, so the preview can never drift from execution. */
+async function refreshPartitionDialogSql() {
+  if (!partitionDialogOpen.value) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const operation = partitionDialogOperation(false, "partition-preview");
+  if (!operation) {
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [];
+    return;
+  }
+  const requestId = ++partitionDialogSqlRequestId;
+  try {
+    const result = await api.buildTablePartitionOperationSql({ ...partitionSqlOptions(), operations: [operation] });
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = result.statements.join("\n");
+    partitionDialogSqlWarnings.value = result.warnings;
+  } catch (error: any) {
+    if (requestId !== partitionDialogSqlRequestId) return;
+    partitionDialogSql.value = "";
+    partitionDialogSqlWarnings.value = [error?.message || String(error)];
+  }
+}
+
+function schedulePartitionDialogSqlRefresh() {
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
+  partitionDialogSqlTimer = setTimeout(() => {
+    partitionDialogSqlTimer = undefined;
+    void refreshPartitionDialogSql();
+  }, 150);
 }
 
 function removePartitionOperation(id: string) {
@@ -574,6 +625,26 @@ function removePartitionOperation(id: string) {
   scheduleSqlPreviewRefresh();
   syncDraftToParent();
 }
+
+watch(
+  [
+    partitionDialogOpen,
+    partitionDialogMode,
+    partitionDialogName,
+    partitionDialogSchema,
+    partitionDialogParentSchema,
+    partitionDialogParentTable,
+    partitionDialogBoundKind,
+    partitionDialogRangeFrom,
+    partitionDialogRangeTo,
+    partitionDialogListValues,
+    partitionDialogModulus,
+    partitionDialogRemainder,
+    partitionDialogConcurrently,
+  ],
+  () => schedulePartitionDialogSqlRefresh(),
+  { flush: "post" },
+);
 
 function partitionOperationLabel(kind: TablePartitionOperationKind): string {
   switch (kind) {
@@ -1313,6 +1384,9 @@ const triggerEventOptions = ["INSERT", "UPDATE", "DELETE"];
 const metadataSchema = computed(() => connectionObjectTreeQuerySchema(connection.value, props.database, props.schema));
 const refreshVersion = computed(() => (props.connectionId && props.tableName ? queryStore.tableStructureRefreshVersion(props.connectionId, props.database, props.schema, props.tableName) : 0));
 const isCreateMode = computed(() => !props.tableName);
+// Hidden for an existing table that is not partitioned: the tab could only ever
+// render an empty state. Create mode keeps it so partitioning can be declared.
+const showPartitionsTab = computed(() => tableMetadataCapabilities.value.partitions && (isCreateMode.value || isPartitionedParent.value || isTablePartition.value));
 const usesSqliteRebuildStrategy = computed(() => !isCreateMode.value && structureCapabilities.value.alterStrategy === "sqlite-rebuild");
 const hasSqliteTypeChange = computed(() => usesSqliteRebuildStrategy.value && hasExistingColumnTypeChange(columns.value));
 const canAddColumn = computed(() => canAddTableStructureColumn(databaseType.value, isCreateMode.value));
@@ -2063,6 +2137,8 @@ function resetState() {
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
   isPartitionedParent.value = false;
+  isTablePartition.value = false;
+  partitionStatusResolved.value = false;
   partitionStatusKnown.value = true;
   concurrentAvailabilityInvalidated.value = false;
   columns.value = [];
@@ -2452,6 +2528,8 @@ async function loadStructure(
     if (requestId === structureLoadRequestId) {
       partitionStatusKnown.value = partitionStatus.known;
       isPartitionedParent.value = partitionStatus.status.isPartitionedParent;
+      isTablePartition.value = partitionStatus.status.isPartition;
+      partitionStatusResolved.value = true;
       // Availability inputs changed: fail closed while the status is unknown,
       // but preserve the user's Concurrent intent so a later successful probe
       // can regenerate the same SQL. Definitive unsupported states still clear
@@ -4334,6 +4412,14 @@ watch(tableMetadataCapabilities, (capabilities) => {
   if (!localIsStructureMetadataTabSupported(activeTab.value, capabilities)) activeTab.value = localFirstStructureMetadataTab(capabilities);
 });
 
+// The Partitions tab vanishes for a non-partitioned table, so an active (or
+// navigation-requested) partitions tab must fall back once the probe settles.
+watch([activeTab, partitionStatusResolved, isPartitionedParent, isTablePartition], () => {
+  if (activeTab.value !== "partitions" || isCreateMode.value || !partitionStatusResolved.value) return;
+  if (isPartitionedParent.value || isTablePartition.value) return;
+  activeTab.value = localFirstStructureMetadataTab();
+});
+
 watch(structureCapabilities, () => {
   // Capability loss (e.g. PostgreSQL < 11 without concurrent index support)
   // invalidates any selected Concurrent flag the same way a probe failure
@@ -4604,7 +4690,7 @@ watch(
               <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.constraints" value="constraints">{{ t("structureEditor.constraints") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
-              <TabsTrigger v-if="tableMetadataCapabilities.partitions" value="partitions">{{ t("structureEditor.partitions") }}</TabsTrigger>
+              <TabsTrigger v-if="showPartitionsTab" value="partitions">{{ t("structureEditor.partitions") }}</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
               <div class="flex items-center gap-1.5">
@@ -5453,7 +5539,7 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="partitionsScrollerRef" v-if="tableMetadataCapabilities.partitions" value="partitions" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
+          <TabsContent ref="partitionsScrollerRef" v-if="showPartitionsTab" value="partitions" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
             <div v-if="isCreateMode" class="space-y-3">
               <label class="flex items-center gap-2 text-[length:var(--structure-font-size)]">
                 <input v-model="createPartitioningEnabled" type="checkbox" />
@@ -5827,6 +5913,11 @@ watch(
           </label>
           <p v-if="partitionDialogMode === 'detach'" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionDetachWarning") }}</p>
           <p v-if="partitionDialogMode === 'drop'" class="text-sm text-destructive">{{ t("structureEditor.partitionDropWarning") }}</p>
+          <div v-if="partitionDialogSql || partitionDialogSqlWarnings.length" class="space-y-1">
+            <span class="text-sm text-muted-foreground">{{ t("structureEditor.partitionSqlPreview") }}</span>
+            <pre v-if="partitionDialogSql" class="max-h-40 overflow-auto rounded-md border bg-muted/40 p-2 text-xs font-mono whitespace-pre-wrap break-all">{{ partitionDialogSql }}</pre>
+            <p v-for="warning in partitionDialogSqlWarnings" :key="warning" class="text-xs text-destructive">{{ warning }}</p>
+          </div>
           <p v-if="partitionDialogError" class="text-sm text-destructive">{{ partitionDialogError }}</p>
         </div>
         <DialogFooter>

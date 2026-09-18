@@ -239,6 +239,26 @@ vi.mock("@/components/ui/select", async () => {
   });
   return { Select: Div, SelectContent: Div, SelectItem: Div, SelectTrigger: Div, SelectValue: Div };
 });
+vi.mock("@/components/ui/dialog", async () => {
+  const { defineComponent, h } = await import("vue");
+  const Div = defineComponent({
+    inheritAttrs: false,
+    setup:
+      (_props, { attrs, slots }) =>
+      () =>
+        h("div", attrs, slots.default?.()),
+  });
+  const Dialog = defineComponent({
+    name: "MockDialog",
+    props: { open: { type: Boolean, default: false } },
+    emits: ["update:open"],
+    setup:
+      (props, { slots }) =>
+      () =>
+        props.open ? h("div", { "data-dialog": "open" }, slots.default?.()) : null,
+  });
+  return { Dialog, DialogContent: Div, DialogFooter: Div, DialogHeader: Div, DialogTitle: Div };
+});
 vi.mock("@/components/editor/EditorSearchPanel.vue", async () => {
   const { defineComponent, h } = await import("vue");
   return {
@@ -480,6 +500,38 @@ describe("TableStructureEditor partitions tab", () => {
     };
     expect(args.partitioning).toEqual({ kind: "range", columns: ["id"], expression: "" });
     expect(args.options.tableName).toBe("users");
+  });
+
+  it("hides the Partitions tab for a table that is not partitioned", async () => {
+    mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
+    const root = await mountStructureEditor();
+
+    await settle();
+    expect(root.querySelector('[data-tab-trigger="partitions"]')).toBeNull();
+    expect(mocks.getTablePartitioning).not.toHaveBeenCalled();
+  });
+
+  it("previews the SQL of the operation being edited in its dialog", async () => {
+    mocks.buildTablePartitionOperationSql.mockResolvedValue({
+      statements: ['ALTER TABLE "public"."sales" DETACH PARTITION "public"."sales_2024";'],
+      warnings: [],
+    });
+    const root = await mountStructureEditor({ initialTab: "partitions", initialTabRequestId: 1 });
+    await settle();
+
+    const detachButton = root.querySelector('button[title="structureEditor.partitionDetach"]');
+    expect(detachButton).not.toBeNull();
+    detachButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+
+    await vi.waitFor(() => expect(mocks.buildTablePartitionOperationSql).toHaveBeenCalled(), { timeout: 3000 });
+    await vi.waitFor(() => expect(root.textContent ?? "").toContain("ALTER TABLE"), { timeout: 3000 });
+    expect(root.textContent ?? "").toContain("structureEditor.partitionSqlPreview");
+
+    const options = mocks.buildTablePartitionOperationSql.mock.calls.at(-1)?.[0] as {
+      operations: { kind: string; name: string }[];
+    };
+    expect(options.operations).toHaveLength(1);
+    expect(options.operations[0]).toMatchObject({ kind: "detach", name: "sales_2024" });
   });
 
   it("surfaces a load failure instead of an empty state", async () => {

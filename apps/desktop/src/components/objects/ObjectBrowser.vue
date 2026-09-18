@@ -269,6 +269,9 @@ const tableConstraintsLoaded = ref(false);
 const tablePartitions = ref<PgTablePartitioning | null>(null);
 const tablePartitionsLoading = ref(false);
 const tablePartitionsLoaded = ref(false);
+// Only tables that actually are partitioned get the Partitions tab; the cheap
+// partition-status probe decides before the full tree is fetched.
+const tableIsPartitioned = ref(false);
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/TableStructureEditor.
 const tableConstraintsForTab = computed(() => constraintsForConstraintsTab(tableConstraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -1087,7 +1090,7 @@ const tableInfoTabs = computed<TableInfoTabItem[]>(() => {
   if (tableMetadataCapabilities.value.triggers) {
     tabs.push({ id: "triggers", label: t("grid.tableInfoTriggers"), icon: RotateCcw, count: tableTriggers.value.length });
   }
-  if (tableMetadataCapabilities.value.partitions) {
+  if (tableMetadataCapabilities.value.partitions && tableIsPartitioned.value) {
     tabs.push({ id: "partitions", label: t("structureEditor.partitions"), icon: Network, count: tablePartitions.value?.partitions.length });
   }
   return tabs;
@@ -1154,6 +1157,7 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tablePartitions.value = null;
   tablePartitionsLoaded.value = false;
   tablePartitionsLoading.value = false;
+  tableIsPartitioned.value = false;
   tableColumnsLoaded.value = false;
   tableDdlLoaded.value = false;
   tableIndexesLoaded.value = false;
@@ -1161,7 +1165,10 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tableTriggersLoaded.value = false;
   tableConstraintsLoaded.value = false;
   tableInfoSearchQuery.value = "";
-  // Determine initial tab: explicit request > previously activated
+  // Determine initial tab: explicit request > previously activated. Resolve the
+  // partition status first so a persisted `partitions` tab is not rejected (and
+  // overwritten) before the probe lands.
+  await probeTablePartitionStatus();
   const firstTab = initialTab ?? tableInfoTab.value;
   await selectTableInfoTab(firstTab);
 }
@@ -1307,6 +1314,25 @@ async function fetchTableTriggers(force = false) {
       tableTriggersLoaded.value = loadedSuccessfully;
       tableTriggersLoading.value = false;
     }
+  }
+}
+
+async function probeTablePartitionStatus() {
+  const row = sidePanelRow.value;
+  if (!row || !tableMetadataCapabilities.value.partitions) {
+    tableIsPartitioned.value = false;
+    return;
+  }
+  const epoch = sidePanelGuard.capture();
+  try {
+    const request = tableMetadataRequest(row);
+    const status = await api.getTablePartitionStatus(request.connectionId, request.database, request.schema || request.database, request.tableName);
+    if (sidePanelGuard.isStale(epoch)) return;
+    tableIsPartitioned.value = status.isPartitionedParent || status.isPartition;
+  } catch {
+    // Fail closed: hide the tab rather than offering one that cannot load.
+    if (sidePanelGuard.isStale(epoch)) return;
+    tableIsPartitioned.value = false;
   }
 }
 

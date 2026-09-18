@@ -4461,6 +4461,7 @@ export default {
     partitionRangeBoundInvalid: "RANGE needs a FROM and TO tuple with the same number of values.",
     partitionListBoundInvalid: "LIST needs at least one value.",
     partitionHashBoundInvalid: "HASH needs Modulus > 0 and 0 <= Remainder < Modulus.",
+    partitionSqlPreview: "SQL to run",
     partitionNameRequired: "Enter a partition name.",
     ddl: "DDL",
     addColumn: "Add Column",

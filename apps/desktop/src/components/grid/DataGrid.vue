@@ -10402,6 +10402,10 @@ const partitioningLoaded = ref(false);
 const partitioningLoading = ref(false);
 const partitioningError = ref("");
 const partitioningRequestGeneration = ref(0);
+// The Partitions tab is only offered for tables that actually are partitioned
+// (a partitioned parent or a member partition). Probed up front with the cheap
+// partition-status query, not the full tree.
+const isPartitionedTable = ref(false);
 // The Constraints tab hides foreign keys when a dedicated Foreign Keys tab is
 // also shown (each constraint appears once; FK navigation stays in that tab).
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -10515,6 +10519,27 @@ const mongoConnectionConfig = resolvedConnectionConfig;
 const canManageMongoIndexes = computed(() => resolvedDatabaseType.value === "mongodb" && !!props.connectionId && !!props.database && !!props.tableMeta?.tableName && supportsMongoIndexMutations(mongoConnectionConfig.value, props.tableMeta?.tableType));
 const canShowTableIndexes = computed(() => tableMetadataCapabilities.value.indexes && (resolvedDatabaseType.value !== "mongodb" || mongoCollectionSupportsIndexes(props.tableMeta?.tableType)));
 
+async function probeTablePartitionStatus() {
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const schema = props.tableMeta?.schema || props.database || "";
+  const tableName = props.tableMeta?.tableName;
+  const identity = currentIndexTableIdentity.value;
+  if (!tableMetadataCapabilities.value.partitions || !connectionId || !database || !tableName || !identity) {
+    isPartitionedTable.value = false;
+    return;
+  }
+  try {
+    const status = await api.getTablePartitionStatus(connectionId, database, schema, tableName);
+    if (identity !== currentIndexTableIdentity.value) return;
+    isPartitionedTable.value = status.isPartitionedParent || status.isPartition;
+  } catch {
+    // Fail closed: hide the tab rather than offering one that cannot load.
+    if (identity !== currentIndexTableIdentity.value) return;
+    isPartitionedTable.value = false;
+  }
+}
+
 const metadataLoaders = useDataGridTableMetadataLoaders({
   props,
   state: {
@@ -10609,7 +10634,7 @@ const tableInfoTabs = computed(() => {
       count: triggers.value.length,
     });
   }
-  if (tableMetadataCapabilities.value.partitions) {
+  if (tableMetadataCapabilities.value.partitions && isPartitionedTable.value) {
     tabs.push({
       id: "partitions",
       label: t("structureEditor.partitions"),
@@ -10697,7 +10722,7 @@ async function refreshActiveTableInfo() {
 
 watch(
   () => [props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName],
-  () => {
+  async () => {
     tableInfoColumns.value = props.tableMeta?.columns ?? [];
     tableInfoColumnsLoading.value = false;
     tableInfoColumnsRequestGeneration.value += 1;
@@ -10729,11 +10754,16 @@ watch(
     partitioningLoading.value = false;
     partitioningError.value = "";
     partitioningRequestGeneration.value += 1;
+    isPartitionedTable.value = false;
     // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
     if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
       void fetchIndexes();
     }
     if (props.autoShowTableInfo && props.tableMeta) showTableInfo.value = true;
+    // Resolve the partition status before selecting a tab so a persisted
+    // `partitions` preference is not rejected (and overwritten) just because the
+    // probe has not landed yet.
+    if (showTableInfo.value) await probeTablePartitionStatus();
     if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
     if (showTableInfo.value) void fetchTableOwner();
   },
