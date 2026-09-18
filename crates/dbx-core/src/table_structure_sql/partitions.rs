@@ -70,12 +70,9 @@ fn format_partition_clause(definition: &TablePartitionDefinition, warnings: &mut
 /// Builds the DDL for explicit partition maintenance operations
 /// (create / attach / detach / drop).
 ///
-/// These are only supported on PostgreSQL itself. PostgreSQL-family engines
-/// share `StructureDialect::Postgres` but their partition DDL has not been
-/// validated, so they are refused the same way `CREATE INDEX CONCURRENTLY` is
-/// gated to PostgreSQL proper. A refusal empties the statement list and pushes
-/// one warning; callers surface the warning and block the save, so an
-/// unsupported request never silently degrades.
+/// Gated to the engines in [`supports_partition_ddl`]; a refusal empties the
+/// statement list and pushes one warning. Callers surface the warning and block
+/// the save, so an unsupported request never silently degrades.
 pub fn build_table_partition_operation_sql(options: TablePartitionSqlOptions) -> TableStructureSqlResult {
     if options.operations.is_empty() {
         return TableStructureSqlResult { statements: Vec::new(), warnings: Vec::new() };

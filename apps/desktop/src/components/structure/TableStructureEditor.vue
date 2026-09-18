@@ -521,7 +521,6 @@ const partitionDialogModulus = ref("2");
 const partitionDialogRemainder = ref("0");
 const partitionDialogConcurrently = ref(false);
 const partitionDialogError = ref("");
-let partitionOperationSequence = 0;
 
 const canManagePartitions = computed(() => {
   if (!tableMetadataCapabilities.value.partitions) return false;
@@ -626,7 +625,7 @@ function partitionDialogOperation(reportError: boolean, id: string): TablePartit
 
 function confirmPartitionDialog() {
   partitionDialogError.value = "";
-  const operation = partitionDialogOperation(true, `partition-op:${++partitionOperationSequence}`);
+  const operation = partitionDialogOperation(true, `partition-op:${uuid()}`);
   if (!operation) return;
   partitionOperations.value = [...partitionOperations.value, operation];
   partitionDialogOpen.value = false;
@@ -2054,7 +2053,9 @@ function partitionSqlOptions(): TablePartitionSqlOptions {
   return {
     databaseType: databaseType.value,
     driverProfile: connection.value?.driver_profile,
-    schema: props.schema,
+    // `metadataSchema` normalizes the fallback (database as schema, empty → public
+    // on the backend), so DDL stays schema-qualified like every other statement.
+    schema: metadataSchema.value,
     // Create mode has no table yet: the pending partition operations target the
     // new table's name.
     tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
@@ -2268,6 +2269,9 @@ async function reloadStructureFromDatabase() {
   if (activeTab.value !== "partitions") {
     partitioning.value = null;
   }
+  // Refreshing from the database discards every other draft; pending partition
+  // operations must not survive it and still be applied on save.
+  partitionOperations.value = [];
   const refreshDdl = activeTab.value === "ddl";
   const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
   invalidateTableMetadataCache(metadataMatch);
@@ -4385,6 +4389,7 @@ onDeactivated(() => {
 });
 onBeforeUnmount(() => {
   clearCopySourceTableSearchTimer();
+  if (partitionDialogSqlTimer) clearTimeout(partitionDialogSqlTimer);
   stopColumnDragTracking();
   stopStructureHorizontalScrollbarDrag();
   structureHorizontalScrollbarObserverGeneration += 1;
