@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildTablePartitionOperationSql, getTablePartitioning } from "@/lib/backend/http";
+import { buildCreatePartitionedTableSql, buildTablePartitionOperationSql, getTablePartitioning } from "@/lib/backend/http";
 
 describe("PostgreSQL table partitioning web API", () => {
   afterEach(() => {
@@ -61,6 +61,25 @@ describe("PostgreSQL table partitioning web API", () => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ options }),
+    });
+  });
+
+  it("builds a partitioned CREATE TABLE through the query endpoint", async () => {
+    const options = { databaseType: "postgres" as const, schema: "public", tableName: "sales", columns: [] } as never;
+    const partitioning = { kind: "range" as const, columns: ["sold_on"], expression: "" };
+    const payload = { statements: ['CREATE TABLE "public"."sales" (\n  "sold_on" date\n) PARTITION BY RANGE ("sold_on");'], warnings: [] };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(payload),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildCreatePartitionedTableSql({ options, partitioning })).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/build-create-partitioned-table-sql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ options, partitioning }),
     });
   });
 });

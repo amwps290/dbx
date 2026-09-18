@@ -1,5 +1,6 @@
 use super::*;
 use crate::models::connection::DatabaseType;
+use crate::types::PgPartitionKind;
 
 fn column(name: &str) -> EditableStructureColumn {
     EditableStructureColumn {
@@ -8677,4 +8678,103 @@ fn partition_operation_quotes_identifiers() {
         result.statements,
         vec!["CREATE TABLE \"we\"\"ird\".\"part\"\"1\" PARTITION OF \"we\"\"ird\".\"sales\" DEFAULT;"]
     );
+}
+
+#[test]
+fn create_partitioned_table_appends_partition_by_clause() {
+    let column = EditableStructureColumn {
+        id: "sold_on".to_string(),
+        name: "sold_on".to_string(),
+        data_type: "date".to_string(),
+        is_nullable: false,
+        default_value: String::new(),
+        comment: String::new(),
+        is_primary_key: false,
+        extra: None,
+        original: None,
+        original_position: None,
+        marked_for_drop: false,
+        character_set: String::new(),
+        collation: String::new(),
+    };
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "sales", vec![column]);
+
+    let result = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::Range,
+            columns: vec!["sold_on".to_string()],
+            expression: String::new(),
+        },
+    );
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 1);
+    assert!(
+        result.statements[0].ends_with(") PARTITION BY RANGE (\"sold_on\");"),
+        "unexpected statement: {}",
+        result.statements[0]
+    );
+}
+
+#[test]
+fn create_partitioned_table_uses_expression_and_multi_column_keys() {
+    let options = structure_change_options(
+        DatabaseType::Postgres,
+        Some("public"),
+        "events",
+        vec![column("region"), column("occurred_at")],
+    );
+    let expression = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::Hash,
+            columns: Vec::new(),
+            expression: "abs(id)".to_string(),
+        },
+    );
+    assert!(expression.statements[0].ends_with(") PARTITION BY HASH (abs(id));"), "{}", expression.statements[0]);
+
+    let options = structure_change_options(
+        DatabaseType::Postgres,
+        Some("public"),
+        "events",
+        vec![column("region"), column("occurred_at")],
+    );
+    let multi = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::List,
+            columns: vec!["region".to_string(), "occurred_at".to_string()],
+            expression: String::new(),
+        },
+    );
+    assert!(
+        multi.statements[0].ends_with(") PARTITION BY LIST (\"region\", \"occurred_at\");"),
+        "{}",
+        multi.statements[0]
+    );
+}
+
+#[test]
+fn create_partitioned_table_requires_a_key_and_postgres() {
+    let options = structure_change_options(DatabaseType::Postgres, Some("public"), "events", vec![column("id")]);
+    let missing_key = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition { kind: PgPartitionKind::Range, columns: Vec::new(), expression: String::new() },
+    );
+    assert!(missing_key.statements.is_empty());
+    assert!(missing_key.warnings[0].contains("at least one column"));
+
+    let options = structure_change_options(DatabaseType::Mysql, Some("db"), "events", vec![column("id")]);
+    let mysql = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::Range,
+            columns: vec!["id".to_string()],
+            expression: String::new(),
+        },
+    );
+    assert!(mysql.statements.is_empty());
+    assert_eq!(mysql.warnings, vec!["Partitioning is only supported for PostgreSQL.".to_string()]);
 }

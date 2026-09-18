@@ -155,7 +155,7 @@ export function isStructureMetadataTabSupported(tab: TableInfoTab, capabilities:
     (tab === "foreignKeys" && capabilities.foreignKeys) ||
     (tab === "constraints" && capabilities.constraints) ||
     (tab === "triggers" && capabilities.triggers) ||
-    (tab === "partitions" && capabilities.partitions && !isCreateMode) ||
+    (tab === "partitions" && capabilities.partitions) ||
     (tab === "ddl" && capabilities.ddl && !isCreateMode)
   );
 }

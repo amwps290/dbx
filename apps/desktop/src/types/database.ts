@@ -1558,6 +1558,11 @@ export interface TableStructureEditorDraft {
   triggersLoaded?: boolean;
   /** Pending PostgreSQL partition operations (create/attach/detach/drop). */
   partitionOperations?: import("@/lib/table/tableStructureEditorSql").TablePartitionOperation[];
+  /** Create-mode `PARTITION BY` declaration. */
+  createPartitioningEnabled?: boolean;
+  createPartitioningKind?: import("@/types/database").PgPartitionKind;
+  createPartitioningColumns?: string[];
+  createPartitioningExpression?: string;
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   /** Request id of the structureInitialTab the editor already applied; remounts must not replay a consumed initial tab over the restored draft. */

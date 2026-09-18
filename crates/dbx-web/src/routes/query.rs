@@ -281,6 +281,13 @@ pub struct BuildTablePartitionOperationSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildCreatePartitionedTableSqlRequest {
+    pub options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+    pub partitioning: dbx_core::table_structure_sql::TablePartitionDefinition,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewSqliteTableStructureChangeRequest {
     pub connection_id: String,
     pub database: String,
@@ -1007,6 +1014,12 @@ pub async fn build_table_partition_operation_sql(
     Json(req): Json<BuildTablePartitionOperationSqlRequest>,
 ) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
     Json(dbx_core::table_structure_sql::build_table_partition_operation_sql(req.options))
+}
+
+pub async fn build_create_partitioned_table_sql(
+    Json(req): Json<BuildCreatePartitionedTableSqlRequest>,
+) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
+    Json(dbx_core::table_structure_sql::build_create_partitioned_table_sql(req.options, req.partitioning))
 }
 
 pub async fn preview_sqlite_table_structure_change(

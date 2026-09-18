@@ -295,6 +295,7 @@ export const buildViewDdlSql = forward("buildViewDdlSql");
 export const buildTableStructureChangeSql = forward("buildTableStructureChangeSql");
 export const buildTableOwnerChangeSql = forward("buildTableOwnerChangeSql");
 export const buildTablePartitionOperationSql = forward("buildTablePartitionOperationSql");
+export const buildCreatePartitionedTableSql = forward("buildCreatePartitionedTableSql");
 export const previewSqliteTableStructureChange = forward("previewSqliteTableStructureChange");
 export const applySqliteTableStructureChange = forward("applySqliteTableStructureChange");
 export const buildCreateTableSql = forward("buildCreateTableSql");

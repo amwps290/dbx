@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
   buildTablePartitionOperationSql: vi.fn(),
+  buildCreatePartitionedTableSql: vi.fn(),
   buildMysqlAutoIncrementSql: vi.fn(),
   buildTableOwnerChangeSql: vi.fn(),
   getTablePartitionStatus: vi.fn(),
@@ -289,6 +290,7 @@ vi.mock("@/lib/backend/api", () => ({
   getTablePartitionStatus: mocks.getTablePartitionStatus,
   getTablePartitioning: mocks.getTablePartitioning,
   buildTablePartitionOperationSql: mocks.buildTablePartitionOperationSql,
+  buildCreatePartitionedTableSql: mocks.buildCreatePartitionedTableSql,
   getTableOwner: mocks.getTableOwner,
 }));
 
@@ -351,6 +353,7 @@ beforeEach(() => {
   mocks.listDataTypes.mockResolvedValue([]);
   mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: true, isPartition: false });
   mocks.buildTablePartitionOperationSql.mockResolvedValue({ statements: [], warnings: [] });
+  mocks.buildCreatePartitionedTableSql.mockResolvedValue({ statements: [], warnings: [] });
   mocks.getTablePartitioning.mockResolvedValue({
     isPartitioned: true,
     isPartition: false,
@@ -440,6 +443,44 @@ describe("TableStructureEditor partitions tab", () => {
     expect(options.operations).toHaveLength(1);
     expect(root.textContent ?? "").toContain("structureEditor.partitionPendingOperations");
     expect(root.textContent ?? "").toContain('CREATE TABLE "public"."sales_2025"');
+  });
+
+  it("generates a partitioned CREATE TABLE from a create-mode draft", async () => {
+    mocks.buildCreatePartitionedTableSql.mockResolvedValue({
+      statements: ['CREATE TABLE "public"."users" (\n  "id" integer\n) PARTITION BY RANGE ("id");'],
+      warnings: [],
+    });
+
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      tableName: "",
+      initialTab: "partitions",
+      initialTabRequestId: 1,
+      draft: structureDraft({
+        activeTab: "partitions",
+        newTableName: "users",
+        columns: [{ id: "id", name: "id", dataType: "integer", isNullable: false, defaultValue: "", comment: "", isPrimaryKey: false, extra: {}, markedForDrop: false }],
+        createPartitioningEnabled: true,
+        createPartitioningKind: "range",
+        createPartitioningColumns: ["id"],
+        createPartitioningExpression: "",
+      }),
+    });
+    mountedApps.push(app);
+    app.mount(root);
+
+    await vi.waitFor(() => expect(root.querySelector('[data-tab-trigger="partitions"]')).not.toBeNull(), { timeout: 3000 });
+    await vi.waitFor(() => expect(mocks.buildCreatePartitionedTableSql).toHaveBeenCalled(), { timeout: 3000 });
+
+    const args = mocks.buildCreatePartitionedTableSql.mock.calls.at(-1)?.[0] as {
+      partitioning: { kind: string; columns: string[] };
+      options: { tableName: string };
+    };
+    expect(args.partitioning).toEqual({ kind: "range", columns: ["id"], expression: "" });
+    expect(args.options.tableName).toBe("users");
   });
 
   it("surfaces a load failure instead of an empty state", async () => {

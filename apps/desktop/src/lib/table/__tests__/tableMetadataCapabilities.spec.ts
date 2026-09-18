@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { getTableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
+import { getTableMetadataCapabilities, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 
 describe("tableMetadataCapabilities", () => {
   it("exposes only collection indexes for MongoDB table information", () => {
@@ -29,5 +29,17 @@ describe("tableMetadataCapabilities", () => {
     expect(getTableMetadataCapabilities("mysql").partitions).toBe(false);
     expect(getTableMetadataCapabilities("oracle").partitions).toBe(false);
     expect(getTableMetadataCapabilities(undefined).partitions).toBe(false);
+  });
+
+  it("shows the Partitions tab for PostgreSQL in both edit and create mode only", () => {
+    const postgres = getTableMetadataCapabilities("postgres");
+    expect(isStructureMetadataTabSupported("partitions", postgres, false)).toBe(true);
+    // Create mode declares `PARTITION BY` instead of reading the catalog.
+    expect(isStructureMetadataTabSupported("partitions", postgres, true)).toBe(true);
+
+    const mysql = getTableMetadataCapabilities("mysql");
+    expect(isStructureMetadataTabSupported("partitions", mysql, false)).toBe(false);
+    // The DDL tab has no create-mode baseline; the partitions tab does.
+    expect(isStructureMetadataTabSupported("ddl", postgres, true)).toBe(false);
   });
 });

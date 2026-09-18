@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::models::connection::DatabaseType;
+use crate::types::PgPartitionKind;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -277,6 +278,21 @@ pub struct TablePartitionSqlOptions {
     pub table_name: String,
     #[serde(default)]
     pub operations: Vec<TablePartitionOperation>,
+}
+
+/// Declarative partitioning for a table being created (`CREATE TABLE ...
+/// PARTITION BY ...`). PostgreSQL only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TablePartitionDefinition {
+    pub kind: PgPartitionKind,
+    /// Partition-key columns, used when `expression` is empty.
+    #[serde(default)]
+    pub columns: Vec<String>,
+    /// Raw partition-key expression (e.g. `date_trunc('month', ts)`), used
+    /// instead of `columns` when non-empty.
+    #[serde(default)]
+    pub expression: String,
 }
 
 /// One partition maintenance operation. The parent is the edited table unless

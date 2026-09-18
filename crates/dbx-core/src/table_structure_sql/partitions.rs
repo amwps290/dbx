@@ -1,10 +1,62 @@
+use super::create_table::build_create_table_sql_with_partition_clause;
 use super::dialect::{capabilities_for, StructureDialect};
 use super::types::{
-    TablePartitionBoundDraft, TablePartitionOperation, TablePartitionOperationKind, TablePartitionSqlOptions,
-    TableStructureSqlResult,
+    TablePartitionBoundDraft, TablePartitionDefinition, TablePartitionOperation, TablePartitionOperationKind,
+    TablePartitionSqlOptions, TableStructureSqlOptions, TableStructureSqlResult,
 };
 use super::util::quote_ident;
 use crate::models::connection::DatabaseType;
+use crate::types::PgPartitionKind;
+
+/// Builds `CREATE TABLE ... PARTITION BY ...` for a table being created.
+///
+/// Kept separate from `build_create_table_sql` so the widely-used plain builder
+/// keeps its signature; shares its implementation through
+/// `build_create_table_sql_with_partition_clause`.
+pub fn build_create_partitioned_table_sql(
+    options: TableStructureSqlOptions,
+    definition: TablePartitionDefinition,
+) -> TableStructureSqlResult {
+    let dialect = capabilities_for(options.database_type, options.driver_profile.as_deref()).dialect;
+    if dialect != StructureDialect::Postgres || options.database_type != Some(DatabaseType::Postgres) {
+        return TableStructureSqlResult {
+            statements: Vec::new(),
+            warnings: vec!["Partitioning is only supported for PostgreSQL.".to_string()],
+        };
+    }
+    let mut warnings = Vec::new();
+    let Some(clause) = format_partition_clause(&definition, &mut warnings) else {
+        return TableStructureSqlResult { statements: Vec::new(), warnings };
+    };
+    build_create_table_sql_with_partition_clause(options, Some(clause))
+}
+
+/// Renders the body of a `PARTITION BY` clause (without the leading keyword),
+/// e.g. `RANGE (region, sold_on)`.
+fn format_partition_clause(definition: &TablePartitionDefinition, warnings: &mut Vec<String>) -> Option<String> {
+    let keyword = match definition.kind {
+        PgPartitionKind::Range => "RANGE",
+        PgPartitionKind::List => "LIST",
+        PgPartitionKind::Hash => "HASH",
+    };
+    let expression = definition.expression.trim();
+    let key = if !expression.is_empty() {
+        expression.to_string()
+    } else {
+        let columns = definition
+            .columns
+            .iter()
+            .map(|column| column.trim())
+            .filter(|column| !column.is_empty())
+            .collect::<Vec<_>>();
+        if columns.is_empty() {
+            warnings.push("A partition key needs at least one column or an expression.".to_string());
+            return None;
+        }
+        columns.iter().map(|column| quote_ident(StructureDialect::Postgres, column)).collect::<Vec<_>>().join(", ")
+    };
+    Some(format!("PARTITION BY {keyword} ({key})"))
+}
 
 /// Builds the DDL for explicit partition maintenance operations
 /// (create / attach / detach / drop).

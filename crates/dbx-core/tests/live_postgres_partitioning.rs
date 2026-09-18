@@ -251,3 +251,94 @@ async fn live_postgres_partition_operations_execute() {
 
     postgres::execute_batch(&pool, &cleanup).await.expect("cleanup live partition-op schema");
 }
+
+/// Live PostgreSQL: a table created through the create-mode partitioning
+/// builder must be a real partitioned parent that accepts partitions.
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE pointing at a writable PostgreSQL database"]
+async fn live_postgres_create_partitioned_table_executes() {
+    use dbx_core::models::connection::DatabaseType;
+    use dbx_core::table_structure_sql::{
+        build_create_partitioned_table_sql, build_table_partition_operation_sql, EditableStructureColumn,
+        TablePartitionBoundDraft, TablePartitionDefinition, TablePartitionOperation, TablePartitionOperationKind,
+        TablePartitionSqlOptions, TableStructureSqlOptions,
+    };
+    use dbx_core::types::PgPartitionKind;
+
+    let pool = postgres::connect(&live_postgres_url(), Duration::from_secs(10)).await.expect("connect PostgreSQL");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("dbx_partnew_{}", &suffix[..8]);
+    let cleanup = vec![format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")];
+    let _ = postgres::execute_batch(&pool, &cleanup).await;
+    postgres::execute_batch(&pool, &[format!("CREATE SCHEMA \"{schema}\"")]).await.expect("create schema");
+
+    let column = |name: &str, data_type: &str| EditableStructureColumn {
+        id: name.to_string(),
+        name: name.to_string(),
+        data_type: data_type.to_string(),
+        is_nullable: false,
+        default_value: String::new(),
+        comment: String::new(),
+        is_primary_key: false,
+        extra: None,
+        original: None,
+        original_position: None,
+        marked_for_drop: false,
+        character_set: String::new(),
+        collation: String::new(),
+    };
+    let options = TableStructureSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        driver_profile: None,
+        schema: Some(schema.clone()),
+        table_name: "sales".to_string(),
+        columns: vec![column("sold_on", "date"), column("amount", "numeric")],
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+        triggers: Vec::new(),
+        table_comment: None,
+        original_table_comment: None,
+        mysql_engine: None,
+        partitioned: false,
+        is_gaussdb_m_mode: false,
+        table_collation: None,
+    };
+    let create = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::Range,
+            columns: vec!["sold_on".to_string()],
+            expression: String::new(),
+        },
+    );
+    assert!(create.warnings.is_empty(), "{:?}", create.warnings);
+    postgres::execute_batch(&pool, &create.statements).await.expect("execute CREATE TABLE ... PARTITION BY");
+
+    let add = build_table_partition_operation_sql(TablePartitionSqlOptions {
+        database_type: Some(DatabaseType::Postgres),
+        driver_profile: None,
+        schema: Some(schema.clone()),
+        table_name: "sales".to_string(),
+        operations: vec![TablePartitionOperation {
+            id: "op:1".to_string(),
+            kind: TablePartitionOperationKind::Create,
+            parent_schema: String::new(),
+            parent_table: String::new(),
+            schema: String::new(),
+            name: "sales_2025".to_string(),
+            bound: Some(TablePartitionBoundDraft::Range {
+                from: vec!["'2025-01-01'".to_string()],
+                to: vec!["'2026-01-01'".to_string()],
+            }),
+            concurrently: false,
+        }],
+    });
+    postgres::execute_batch(&pool, &add.statements).await.expect("execute add partition");
+
+    let partitioning = postgres::get_table_partitioning(&pool, &schema, "sales").await.expect("read partitioning");
+    assert!(partitioning.is_partitioned);
+    assert_eq!(partitioning.key_columns, vec!["sold_on".to_string()]);
+    assert!(partitioning.partitions.iter().any(|node| node.name == "sales_2025"));
+
+    postgres::execute_batch(&pool, &cleanup).await.expect("cleanup create-partitioned schema");
+}

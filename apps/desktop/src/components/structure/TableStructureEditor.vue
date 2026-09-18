@@ -433,8 +433,14 @@ const partitionsError = ref("");
 // are explicit actions on the live catalog, so they are never diffed — they
 // accumulate here until Save, then are cleared and the tree reloaded.
 const partitionOperations = ref<TablePartitionOperation[]>([]);
+// Create-mode partitioning declaration (`CREATE TABLE ... PARTITION BY ...`).
+const createPartitioningEnabled = ref(false);
+const createPartitioningKind = ref<PgPartitionKind>("range");
+const createPartitioningColumns = ref<string[]>([]);
+const createPartitioningExpression = ref("");
 
 const partitionTreeRows = computed(() => flattenPgPartitionNodes(partitioning.value?.partitions ?? []));
+const partitionCreatableColumns = computed(() => columns.value.filter((column) => !column.markedForDrop && !!column.name.trim()).map((column) => column.name.trim()));
 
 function partitionStrategyLabel(kind?: PgPartitionKind): string {
   const key = pgPartitionKindLabelKey(kind);
@@ -458,7 +464,11 @@ const partitionDialogConcurrently = ref(false);
 const partitionDialogError = ref("");
 let partitionOperationSequence = 0;
 
-const canManagePartitions = computed(() => tableMetadataCapabilities.value.partitions && !isCreateMode.value && !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition));
+const canManagePartitions = computed(() => {
+  if (!tableMetadataCapabilities.value.partitions) return false;
+  if (isCreateMode.value) return createPartitioningEnabled.value;
+  return !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition);
+});
 const partitionSupportsConcurrentDetach = computed(() => (partitioning.value?.serverVersionNum ?? 0) >= 120000);
 const partitionDialogNeedsBound = computed(() => partitionDialogMode.value === "create" || partitionDialogMode.value === "attach");
 
@@ -467,7 +477,7 @@ function resetPartitionDialog() {
   partitionDialogSchema.value = "";
   partitionDialogParentSchema.value = "";
   partitionDialogParentTable.value = "";
-  partitionDialogBoundKind.value = "range";
+  partitionDialogBoundKind.value = isCreateMode.value ? createPartitioningKind.value : "range";
   partitionDialogRangeFrom.value = "";
   partitionDialogRangeTo.value = "";
   partitionDialogListValues.value = "";
@@ -480,7 +490,7 @@ function resetPartitionDialog() {
 function openPartitionDialog(mode: TablePartitionOperationKind, boundKind?: PgPartitionKind) {
   resetPartitionDialog();
   partitionDialogMode.value = mode;
-  partitionDialogBoundKind.value = boundKind ?? partitioning.value?.strategy ?? "range";
+  partitionDialogBoundKind.value = boundKind ?? (isCreateMode.value ? createPartitioningKind.value : partitioning.value?.strategy) ?? "range";
   partitionDialogOpen.value = true;
 }
 
@@ -1598,6 +1608,10 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     triggers: cloneDraftValue(triggers.value),
     triggersLoaded: triggersLoaded.value,
     partitionOperations: cloneDraftValue(partitionOperations.value),
+    createPartitioningEnabled: createPartitioningEnabled.value,
+    createPartitioningKind: createPartitioningKind.value,
+    createPartitioningColumns: cloneDraftValue(createPartitioningColumns.value),
+    createPartitioningExpression: createPartitioningExpression.value,
     loadedMetadataFacets: [...loadedMetadataFacets],
     scrollPositions: cloneDraftValue(structureScrollPositions.value),
     appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
@@ -1653,6 +1667,10 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   // Drafts created before lazy trigger loading always contained live trigger metadata.
   triggersLoaded.value = draft.triggersLoaded ?? true;
   partitionOperations.value = cloneDraftValue(draft.partitionOperations || []);
+  createPartitioningEnabled.value = draft.createPartitioningEnabled ?? false;
+  createPartitioningKind.value = draft.createPartitioningKind ?? "range";
+  createPartitioningColumns.value = cloneDraftValue(draft.createPartitioningColumns || []);
+  createPartitioningExpression.value = draft.createPartitioningExpression ?? "";
   loadedMetadataFacets.clear();
   if (draft.loadedMetadataFacets) {
     for (const facet of draft.loadedMetadataFacets) loadedMetadataFacets.add(facet);
@@ -1719,7 +1737,17 @@ function markDraftHydratedAndSync() {
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
-    return !!newTableName.value.trim() || !!tableComment.value.trim() || mysqlTableEngine.value !== originalMysqlTableEngine.value || columns.value.length > 0 || indexes.value.length > 0 || foreignKeys.value.length > 0 || triggers.value.length > 0;
+    return (
+      !!newTableName.value.trim() ||
+      !!tableComment.value.trim() ||
+      mysqlTableEngine.value !== originalMysqlTableEngine.value ||
+      columns.value.length > 0 ||
+      indexes.value.length > 0 ||
+      foreignKeys.value.length > 0 ||
+      triggers.value.length > 0 ||
+      createPartitioningEnabled.value ||
+      partitionOperations.value.length > 0
+    );
   }
   const scope = captureStructureRefreshScope();
   return (
@@ -1894,7 +1922,9 @@ function partitionSqlOptions(): TablePartitionSqlOptions {
     databaseType: databaseType.value,
     driverProfile: connection.value?.driver_profile,
     schema: props.schema,
-    tableName: props.tableName || "",
+    // Create mode has no table yet: the pending partition operations target the
+    // new table's name.
+    tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
     operations: partitionOperations.value,
   };
 }
@@ -1949,7 +1979,13 @@ async function refreshSqlPreview() {
   const partitionResultPromise = partitionOperations.value.length > 0 ? api.buildTablePartitionOperationSql(partitionSqlOptions()) : Promise.resolve({ statements: [], warnings: [] });
   try {
     const [result, ownerResult, mysqlAutoIncrementStatement, partitionResult] = await Promise.all([
-      isCreateMode.value ? api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : api.buildTableStructureChangeSql(options),
+      isCreateMode.value
+        ? createPartitioningEnabled.value
+          ? api.buildCreatePartitionedTableSql({ options, partitioning: { kind: createPartitioningKind.value, columns: createPartitioningColumns.value, expression: createPartitioningExpression.value } })
+          : api.buildCreateTableSql(options)
+        : hasSqliteTypeChange.value
+          ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options)
+          : api.buildTableStructureChangeSql(options),
       supportsTableOwner.value
         ? api.buildTableOwnerChangeSql({
             databaseType: databaseType.value,
@@ -2041,6 +2077,10 @@ function resetState() {
   triggers.value = [];
   triggersLoaded.value = false;
   partitionOperations.value = [];
+  createPartitioningEnabled.value = false;
+  createPartitioningKind.value = "range";
+  createPartitioningColumns.value = [];
+  createPartitioningExpression.value = "";
   clearColumnSelection();
   rawDdlContent.value = "";
   ddlDraft.value = null;
@@ -2363,7 +2403,9 @@ async function loadStructure(
       : Promise.resolve(undefined);
     // Partition metadata is a live catalog read (not persisted), so it is
     // fetched directly rather than through the object metadata cache.
-    const partitioningPromise = effectiveScope.partitions ? (tableMetadataCapabilities.value.partitions ? api.getTablePartitioning(connectionId, database, schema, tableName) : Promise.resolve(undefined)) : Promise.resolve(undefined);
+    // Create mode has no catalog entry to read; the Partitions tab edits a
+    // local `PARTITION BY` declaration instead.
+    const partitioningPromise = effectiveScope.partitions && !isCreateMode.value ? (tableMetadataCapabilities.value.partitions ? api.getTablePartitioning(connectionId, database, schema, tableName) : Promise.resolve(undefined)) : Promise.resolve(undefined);
     const tableCommentLoad = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata) : undefined;
     const tableCommentPromise = tableCommentLoad
       ? tableCommentLoad.then((result) => {
@@ -4339,6 +4381,11 @@ watch(
     indexes,
     foreignKeys,
     triggers,
+    partitionOperations,
+    createPartitioningEnabled,
+    createPartitioningKind,
+    createPartitioningColumns,
+    createPartitioningExpression,
   ],
   () => {
     scheduleSqlPreviewRefresh();
@@ -5407,78 +5454,131 @@ watch(
           </TabsContent>
 
           <TabsContent ref="partitionsScrollerRef" v-if="tableMetadataCapabilities.partitions" value="partitions" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
-            <div v-if="partitionsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
-              <Loader2 class="h-4 w-4 animate-spin" />
-              {{ t("common.loading") }}
-            </div>
-            <div v-else-if="partitionsError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-              {{ partitionsError }}
-            </div>
-            <div v-else-if="!partitioning || (!partitioning.isPartitioned && !partitioning.isPartition)" class="py-10 text-center text-muted-foreground">
-              {{ t("structureEditor.partitionsEmpty") }}
-            </div>
-            <div v-else class="space-y-2">
-              <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="flex flex-wrap items-center justify-between gap-2">
-                  <div class="flex flex-wrap items-center gap-1.5">
-                    <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
-                    <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
-                    <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
-                  </div>
-                  <div v-if="canManagePartitions" class="flex shrink-0 items-center gap-1.5">
-                    <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create')">
-                      <Plus :class="[structureIconClass, 'mr-1']" />
-                      {{ t("structureEditor.partitionAdd") }}
-                    </Button>
-                    <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('attach')">
-                      <ListChevronsUpDown :class="[structureIconClass, 'mr-1']" />
-                      {{ t("structureEditor.partitionAttach") }}
-                    </Button>
-                    <Button v-if="partitioning.isPartition" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openDetachSelfPartitionDialog">
-                      <X :class="[structureIconClass, 'mr-1']" />
-                      {{ t("structureEditor.partitionDetachSelf") }}
-                    </Button>
-                  </div>
+            <div v-if="isCreateMode" class="space-y-3">
+              <label class="flex items-center gap-2 text-[length:var(--structure-font-size)]">
+                <input v-model="createPartitioningEnabled" type="checkbox" />
+                {{ t("structureEditor.partitionEnable") }}
+              </label>
+              <template v-if="createPartitioningEnabled">
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKind") }}</label>
+                  <Select v-model="createPartitioningKind">
+                    <SelectTrigger>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                      <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                      <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
-                <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
-                <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
-                <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
-              </div>
-              <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="mb-1 font-medium">{{ t("structureEditor.partitionPendingOperations") }}</div>
-                <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
-                  <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
-                  <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
-                    <Trash2 :class="structureIconClass" />
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyColumns") }}</label>
+                  <div class="flex flex-wrap gap-3">
+                    <label v-for="column in partitionCreatableColumns" :key="column" class="flex items-center gap-1 text-sm">
+                      <input v-model="createPartitioningColumns" type="checkbox" :value="column" :disabled="!!createPartitioningExpression.trim()" />
+                      <span class="font-mono">{{ column }}</span>
+                    </label>
+                  </div>
+                  <p v-if="partitionCreatableColumns.length === 0" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionKeyNoColumns") }}</p>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-sm">{{ t("structureEditor.partitionKeyExpression") }}</label>
+                  <Input v-model="createPartitioningExpression" class="font-mono" placeholder="date_trunc('month', ts)" />
+                </div>
+                <div class="flex items-center justify-between">
+                  <span class="text-[length:var(--structure-font-size)] font-medium">{{ t("structureEditor.partitionInitialPartitions") }}</span>
+                  <Button variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create', createPartitioningKind)">
+                    <Plus :class="[structureIconClass, 'mr-1']" />
+                    {{ t("structureEditor.partitionAdd") }}
                   </Button>
                 </div>
-              </div>
-              <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
-                {{ t("structureEditor.partitionsEmptyChildren") }}
-              </div>
-              <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="flex flex-wrap items-center justify-between gap-1.5">
-                  <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
-                    <span class="font-mono font-medium">{{ row.node.name }}</span>
-                    <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
-                    <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
-                  </div>
-                  <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
-                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
-                      <X :class="structureIconClass" />
-                    </Button>
-                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
                       <Trash2 :class="structureIconClass" />
                     </Button>
                   </div>
                 </div>
-                <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
-                <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
-                  <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
-                  <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+                <p v-else class="text-sm text-muted-foreground">{{ t("structureEditor.partitionInitialPartitionsEmpty") }}</p>
+              </template>
+            </div>
+            <template v-else>
+              <div v-if="partitionsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+                <Loader2 class="h-4 w-4 animate-spin" />
+                {{ t("common.loading") }}
+              </div>
+              <div v-else-if="partitionsError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {{ partitionsError }}
+              </div>
+              <div v-else-if="!partitioning || (!partitioning.isPartitioned && !partitioning.isPartition)" class="py-10 text-center text-muted-foreground">
+                {{ t("structureEditor.partitionsEmpty") }}
+              </div>
+              <div v-else class="space-y-2">
+                <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
+                      <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
+                      <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                    </div>
+                    <div v-if="canManagePartitions" class="flex shrink-0 items-center gap-1.5">
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create')">
+                        <Plus :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAdd") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('attach')">
+                        <ListChevronsUpDown :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionAttach") }}
+                      </Button>
+                      <Button v-if="partitioning.isPartition" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openDetachSelfPartitionDialog">
+                        <X :class="[structureIconClass, 'mr-1']" />
+                        {{ t("structureEditor.partitionDetachSelf") }}
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
+                  <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
+                  <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
+                </div>
+                <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="mb-1 font-medium">{{ t("structureEditor.partitionPendingOperations") }}</div>
+                  <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                    <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
+                </div>
+                <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
+                  {{ t("structureEditor.partitionsEmptyChildren") }}
+                </div>
+                <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                  <div class="flex flex-wrap items-center justify-between gap-1.5">
+                    <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
+                      <span class="font-mono font-medium">{{ row.node.name }}</span>
+                      <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                      <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                    </div>
+                    <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
+                      <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
+                        <X :class="structureIconClass" />
+                      </Button>
+                      <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
+                        <Trash2 :class="structureIconClass" />
+                      </Button>
+                    </div>
+                  </div>
+                  <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
+                  <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
+                    <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
+                    <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+                  </div>
                 </div>
               </div>
-            </div>
+            </template>
           </TabsContent>
 
           <TabsContent ref="ddlScrollerRef" v-if="tableMetadataCapabilities.ddl" value="ddl" force-mount class="relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden" @scroll.passive="onStructureContentScroll('ddl', $event)">

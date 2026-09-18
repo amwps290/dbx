@@ -138,6 +138,18 @@ export interface TablePartitionSqlOptions {
   operations: TablePartitionOperation[];
 }
 
+/** Declarative partitioning for a table being created. */
+export interface TablePartitionDefinition {
+  kind: "range" | "list" | "hash";
+  columns: string[];
+  expression: string;
+}
+
+export interface BuildCreatePartitionedTableSqlOptions {
+  options: BuildTableStructureChangeSqlOptions;
+  partitioning: TablePartitionDefinition;
+}
+
 export interface BuildTableOwnerChangeSqlOptions {
   databaseType?: DatabaseType;
   schema?: string;
