@@ -45,13 +45,17 @@ export function visiblePgPartitionRows(rows: PgPartitionTreeRow[], collapsedKeys
   return rows.filter((row) => !row.ancestorKeys.some((key) => collapsedKeys.has(key)));
 }
 
+export type PartitionTranslate = (key: string, params?: Record<string, unknown>) => string;
+
 /**
- * Monospace tree prefix for a flattened row, e.g. `│  ├─ ` — one 3-character
- * cell per ancestor level plus the row's own branch marker.
+ * Hover hint for a partition row. The estimated row count and size are kept out
+ * of the row body (they doubled every row's height) and surfaced here instead.
  */
-export function pgPartitionTreePrefix(row: PgPartitionTreeRow): string {
-  const guides = row.ancestorGuides.map((continues) => (continues ? "│  " : "   ")).join("");
-  return `${guides}${row.isLastChild ? "└─ " : "├─ "}`;
+export function pgPartitionRowHint(node: PgPartitionNode, t: PartitionTranslate, formatBytes: (value: number) => string): string | undefined {
+  const parts: string[] = [];
+  if (node.rowEstimate != null) parts.push(t("structureEditor.partitionsRowEstimate", { count: node.rowEstimate }));
+  if (node.totalBytes != null) parts.push(t("structureEditor.partitionsSize", { size: formatBytes(node.totalBytes) }));
+  return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
 /** Renders a parsed bound as the SQL fragment PostgreSQL uses in `CREATE TABLE ... PARTITION OF`. */

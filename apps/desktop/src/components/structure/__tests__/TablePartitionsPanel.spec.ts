@@ -75,19 +75,28 @@ describe("TablePartitionsPanel", () => {
     expect(text).toContain("sales_nested_cn");
     expect(text).toContain("IN ('cn')");
     expect(text).toContain("structureEditor.partitionKindList");
-    expect(text).toContain("structureEditor.partitionsRowEstimate");
-    expect(text).toContain("structureEditor.partitionsSize");
+    // The size/count estimates moved out of the row body into its hover hint.
+    expect(text).not.toContain("structureEditor.partitionsRowEstimate");
+    const hinted = Array.from(root.querySelectorAll("[title]")).find((element) => element.getAttribute("title")?.includes("structureEditor.partitionsRowEstimate"));
+    expect(hinted?.getAttribute("title")).toContain("structureEditor.partitionsSize");
   });
 
-  it("draws the nesting with tree guides and a sub-partition badge", async () => {
+  it("draws nesting with CSS guide cells and a sub-partition badge", async () => {
     const root = await mount({ partitioning: partitioned, loading: false, error: "" });
     const text = root.textContent ?? "";
 
-    // sales_2024 (top, has a later sibling) then sales_nested (last).
-    expect(text).toContain("├─ ");
-    expect(text).toContain("└─ ");
-    // The nested child keeps a blank guide under the last top-level partition.
-    expect(text).toContain("   └─ ");
+    // No character-art tree any more: guides are drawn as bordered cells.
+    expect(text).not.toContain("├─");
+    expect(text).not.toContain("└─");
+    const ancestors = root.querySelectorAll('[data-partition-guide="ancestor"]');
+    expect(ancestors).toHaveLength(1);
+    // sales_nested_cn's parent (sales_nested) is the last top-level partition, so
+    // no vertical line continues under it — a plain indent, not a stray `│`.
+    expect(ancestors[0].getAttribute("data-continues")).toBe("false");
+    const branches = root.querySelectorAll('[data-partition-guide="branch"]');
+    expect(branches).toHaveLength(3);
+    // sales_2024 and sales_nested have a later sibling; sales_nested_cn is last.
+    expect(Array.from(branches).map((cell) => cell.getAttribute("data-last"))).toEqual(["false", "true", "true"]);
     // Depth > 0 rows are labelled as sub-partitions.
     expect(text).toContain("structureEditor.partitionSubPartitionBadge");
   });

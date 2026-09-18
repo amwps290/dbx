@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import type { PgPartitionNode } from "@/types/database";
 
 function node(name: string, children: PgPartitionNode[] = []): PgPartitionNode {
@@ -50,16 +50,15 @@ describe("pgPartitionPresentation", () => {
     expect(visiblePgPartitionRows(rows, new Set(["public.p1"])).map((row) => row.node.name)).toEqual(["p1", "p2"]);
   });
 
-  it("draws a tree prefix with vertical guides and a branch marker", () => {
-    const rows = flattenPgPartitionNodes([node("p1", [node("p1a"), node("p1b")]), node("p2", [node("p2a")])]);
-    const prefixes = Object.fromEntries(rows.map((row) => [row.node.name, pgPartitionTreePrefix(row)]));
+  it("builds a row hover hint from the size and count estimates", () => {
+    const t = (key: string, params?: Record<string, unknown>) => `${key}(${JSON.stringify(params)})`;
+    const bytes = (value: number) => `${value}B`;
 
-    expect(prefixes.p1).toBe("├─ ");
-    expect(prefixes.p1a).toBe("│  ├─ ");
-    expect(prefixes.p1b).toBe("│  └─ ");
-    // p2 is the last top-level partition, so its child has a blank guide.
-    expect(prefixes.p2).toBe("└─ ");
-    expect(prefixes.p2a).toBe("   └─ ");
+    expect(pgPartitionRowHint({ ...node("p"), rowEstimate: 366, totalBytes: 1048576 }, t, bytes)).toBe('structureEditor.partitionsRowEstimate({"count":366}) · structureEditor.partitionsSize({"size":"1048576B"})');
+    expect(pgPartitionRowHint({ ...node("p"), rowEstimate: 5 }, t, bytes)).toBe('structureEditor.partitionsRowEstimate({"count":5})');
+    expect(pgPartitionRowHint({ ...node("p"), totalBytes: 10 }, t, bytes)).toBe('structureEditor.partitionsSize({"size":"10B"})');
+    // No estimates -> no tooltip at all.
+    expect(pgPartitionRowHint(node("p"), t, bytes)).toBeUndefined();
   });
 
   it("renders each bound kind as its SQL fragment", () => {

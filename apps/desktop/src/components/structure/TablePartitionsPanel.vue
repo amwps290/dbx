@@ -2,9 +2,10 @@
 import { computed, ref, watch } from "vue";
 import { ChevronDown, ChevronRight, Loader2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
+import PartitionTreeGuides from "@/components/structure/PartitionTreeGuides.vue";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
-import type { PgPartitionKind, PgTablePartitioning } from "@/types/database";
+import type { PgPartitionKind, PgPartitionNode, PgTablePartitioning } from "@/types/database";
 
 /**
  * Read-only partition summary shared by the DataGrid / ObjectBrowser
@@ -25,6 +26,11 @@ const { t } = useI18n();
 function partitionStrategyLabel(kind?: PgPartitionKind): string {
   const key = pgPartitionKindLabelKey(kind);
   return key ? t(key) : "";
+}
+
+/** Size/count estimates live in the row's hover hint so the row stays two lines. */
+function partitionRowHint(node: PgPartitionNode): string | undefined {
+  return pgPartitionRowHint(node, t, formatBytes);
 }
 
 const allRows = computed(() => flattenPgPartitionNodes(props.partitioning?.partitions ?? []));
@@ -78,36 +84,30 @@ const rows = computed(() => {
       <div v-if="rows.length === 0" class="p-6 text-center text-xs text-muted-foreground">
         {{ props.searchQuery ? t("grid.tableInfoNoResults") : t("structureEditor.partitionsEmptyChildren") }}
       </div>
-      <div v-for="row in rows" :key="row.key" class="p-3 text-xs">
-        <div class="flex items-start gap-1">
-          <span aria-hidden="true" class="shrink-0 select-none whitespace-pre font-mono text-[11px] leading-5 text-muted-foreground/60">{{ pgPartitionTreePrefix(row) }}</span>
-          <button
-            v-if="row.node.children.length"
-            type="button"
-            class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-colors hover:text-foreground"
-            :aria-label="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
-            :title="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
-            @click="togglePartitionRow(row.key)"
-          >
-            <ChevronRight v-if="collapsedPartitionKeys.has(row.key)" class="h-3.5 w-3.5" />
-            <ChevronDown v-else class="h-3.5 w-3.5" />
-          </button>
-          <span v-else class="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true"></span>
-          <div class="min-w-0 flex-1">
-            <div class="flex flex-wrap items-center gap-1.5">
-              <span class="font-medium truncate">{{ row.node.name }}</span>
-              <span v-if="row.node.children.length" class="rounded bg-muted px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionChildCount", { count: row.node.children.length }) }}</span>
-              <span v-if="row.depth > 0" class="rounded border border-dashed px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</span>
-              <span v-if="row.node.strategy" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ partitionStrategyLabel(row.node.strategy) }}</span>
-              <span v-if="row.node.bound?.kind === 'default'" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</span>
-            </div>
-            <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 font-mono text-[11px] text-muted-foreground break-all">
-              {{ pgPartitionNodeBoundText(row.node) }}
-            </div>
-            <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-[11px] text-muted-foreground">
-              <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
-              <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
-            </div>
+      <div v-for="row in rows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-stretch gap-1 px-3 py-2 text-xs">
+        <PartitionTreeGuides :row="row" />
+        <button
+          v-if="row.node.children.length"
+          type="button"
+          class="mt-0.5 h-4 w-4 shrink-0 self-start text-muted-foreground transition-colors hover:text-foreground"
+          :aria-label="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+          :title="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+          @click="togglePartitionRow(row.key)"
+        >
+          <ChevronRight v-if="collapsedPartitionKeys.has(row.key)" class="h-3.5 w-3.5" />
+          <ChevronDown v-else class="h-3.5 w-3.5" />
+        </button>
+        <span v-else class="mt-0.5 h-4 w-4 shrink-0 self-start" aria-hidden="true"></span>
+        <div class="min-w-0 flex-1">
+          <div class="flex flex-wrap items-center gap-1.5">
+            <span class="font-medium truncate">{{ row.node.name }}</span>
+            <span v-if="row.node.children.length" class="rounded bg-muted px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionChildCount", { count: row.node.children.length }) }}</span>
+            <span v-if="row.depth > 0" class="rounded border border-dashed px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</span>
+            <span v-if="row.node.strategy" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ partitionStrategyLabel(row.node.strategy) }}</span>
+            <span v-if="row.node.bound?.kind === 'default'" class="rounded border px-1 py-px text-[10px] text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</span>
+          </div>
+          <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-0.5 font-mono text-[11px] text-muted-foreground break-all">
+            {{ pgPartitionNodeBoundText(row.node) }}
           </div>
         </div>
       </div>
