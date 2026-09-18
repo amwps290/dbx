@@ -28,6 +28,22 @@ test("both table-properties drawers expose a capability-gated partitions tab", (
   }
 });
 
+test("both drawers probe the partition status on demand, not only on table change", () => {
+  // Regression: probing only in the table-change watcher meant opening the
+  // drawer for an already-selected table never resolved the status, so the
+  // Partitions tab was missing on every partitioned table.
+  const expectations: Array<[string, RegExp]> = [
+    ["apps/desktop/src/components/grid/DataGrid.vue", /if \(!partitionStatusResolved\.value\) await probeTablePartitionStatus\(\)/],
+    [
+      "apps/desktop/src/components/objects/ObjectBrowser.vue",
+      /if \(!tablePartitionStatusResolved\.value\) await probeTablePartitionStatus\(\)/,
+    ],
+  ];
+  for (const [path, pattern] of expectations) {
+    assert.match(readFileSync(path, "utf8"), pattern, `${path} must probe on demand in selectTableInfoTab`);
+  }
+});
+
 test("both drawers render the shared partitions panel", () => {
   const panels = readFileSync("apps/desktop/src/components/grid/DataGridTableInfoPanels.vue", "utf8");
   assert.match(panels, /TablePartitionsPanel/);

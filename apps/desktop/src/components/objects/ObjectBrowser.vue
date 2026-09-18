@@ -272,6 +272,7 @@ const tablePartitionsLoaded = ref(false);
 // Only tables that actually are partitioned get the Partitions tab; the cheap
 // partition-status probe decides before the full tree is fetched.
 const tableIsPartitioned = ref(false);
+const tablePartitionStatusResolved = ref(false);
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/TableStructureEditor.
 const tableConstraintsForTab = computed(() => constraintsForConstraintsTab(tableConstraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -1158,6 +1159,7 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tablePartitionsLoaded.value = false;
   tablePartitionsLoading.value = false;
   tableIsPartitioned.value = false;
+  tablePartitionStatusResolved.value = false;
   tableColumnsLoaded.value = false;
   tableDdlLoaded.value = false;
   tableIndexesLoaded.value = false;
@@ -1174,6 +1176,9 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
 }
 
 async function selectTableInfoTab(tab: TableInfoTab) {
+  // The panel can be re-selected (or restored) without `openTableInfo`, so make
+  // sure the partition status has been probed before the tab list is consulted.
+  if (!tablePartitionStatusResolved.value) await probeTablePartitionStatus();
   const nextTab = tableInfoTabs.value.some((item) => item.id === tab) ? tab : tableInfoTabs.value[0]?.id;
   if (!nextTab) return;
   tableInfoTab.value = nextTab;
@@ -1321,6 +1326,7 @@ async function probeTablePartitionStatus() {
   const row = sidePanelRow.value;
   if (!row || !tableMetadataCapabilities.value.partitions) {
     tableIsPartitioned.value = false;
+    tablePartitionStatusResolved.value = true;
     return;
   }
   const epoch = sidePanelGuard.capture();
@@ -1333,6 +1339,8 @@ async function probeTablePartitionStatus() {
     // Fail closed: hide the tab rather than offering one that cannot load.
     if (sidePanelGuard.isStale(epoch)) return;
     tableIsPartitioned.value = false;
+  } finally {
+    if (sidePanelGuard.isFresh(epoch)) tablePartitionStatusResolved.value = true;
   }
 }
 

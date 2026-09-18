@@ -502,6 +502,29 @@ describe("TableStructureEditor partitions tab", () => {
     expect(args.options.tableName).toBe("users");
   });
 
+  it("shows the Partitions tab for KingbaseES connections", async () => {
+    // Regression: the status probe used to be gated on db_type === "postgres",
+    // which hid the tab on every other PostgreSQL-family engine.
+    const previous = mocks.connection.db_type;
+    mocks.connection.db_type = "kingbase";
+    try {
+      const root = await mountStructureEditor({ initialTab: "partitions", initialTabRequestId: 1 });
+      await settle();
+      expect(root.querySelector('[data-tab-trigger="partitions"]')).not.toBeNull();
+      expect(mocks.getTablePartitioning).toHaveBeenCalled();
+    } finally {
+      mocks.connection.db_type = previous;
+    }
+  });
+
+  it("still resolves the Partitions tab when the editor opens on the DDL tab", async () => {
+    // Regression: the DDL entry point skips loadStructure, so the status probe
+    // never ran and the tab was missing on a partitioned table.
+    const root = await mountStructureEditor({ initialTab: "ddl", initialTabRequestId: 1 });
+    await settle();
+    expect(root.querySelector('[data-tab-trigger="partitions"]')).not.toBeNull();
+  });
+
   it("hides the Partitions tab for a table that is not partitioned", async () => {
     mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: false, isPartition: false });
     const root = await mountStructureEditor();

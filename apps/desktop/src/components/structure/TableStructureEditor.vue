@@ -412,6 +412,42 @@ const isTablePartition = ref(false);
 // The partition-status probe has settled (success or failure), so the tab can
 // be hidden without hiding it merely because the probe is still in flight.
 const partitionStatusResolved = ref(false);
+
+/**
+ * Standalone partition-status probe for entry points that intentionally skip
+ * `loadStructure` (opening directly on the DDL tab). It only decides whether the
+ * Partitions tab is offered; the Concurrent-index normalization still runs from
+ * `loadStructure` when an editable tab loads.
+ */
+let partitionTabProbeRequestId = 0;
+async function probePartitionsTabVisibility() {
+  if (!tableMetadataCapabilities.value.partitions || isCreateMode.value) {
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const tableName = props.tableName;
+  if (!connectionId || !database || !tableName) {
+    partitionStatusResolved.value = true;
+    return;
+  }
+  const requestId = ++partitionTabProbeRequestId;
+  try {
+    const status = await api.getTablePartitionStatus(connectionId, database, metadataSchema.value, tableName);
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = status.isPartitionedParent;
+    isTablePartition.value = status.isPartition;
+    partitionStatusResolved.value = true;
+  } catch {
+    if (requestId !== partitionTabProbeRequestId) return;
+    isPartitionedParent.value = false;
+    isTablePartition.value = false;
+    partitionStatusResolved.value = true;
+  }
+}
 /** Whether the last partition-status probe succeeded. When it cannot be
  * verified (probe failed), Concurrent is disabled — we must not assume a
  * non-partitioned table we could not check. */
@@ -2439,7 +2475,7 @@ async function loadStructure(
     const metadataRequest = ddlRequest();
     const forceMetadata = options.forceMetadata === true;
     const partitionStatusPromise =
-      databaseType.value === "postgres" && !isCreateMode.value
+      tableMetadataCapabilities.value.partitions && !isCreateMode.value
         ? api
             .getTablePartitionStatus(connectionId, database, schema, tableName)
             // No reactive mutation inside the catch: a stale request must not
@@ -4289,7 +4325,7 @@ onMounted(() => {
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
   } else if (activeTab.value === "ddl") {
-    void Promise.all([fetchDdl(), loadVisibleTableComment()]).then(markDraftHydratedAndSync);
+    void Promise.all([fetchDdl(), loadVisibleTableComment(), probePartitionsTabVisibility()]).then(markDraftHydratedAndSync);
   } else {
     void loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true }).then(() => applyInitialStructureTarget());
   }
@@ -4545,7 +4581,7 @@ watch(refreshVersion, (version, previous) => {
 async function loadActiveTableStructureMetadataIfNeeded() {
   if (!structureEditorReady || isCreateMode.value) return;
   if (activeTab.value === "ddl") {
-    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true)]);
+    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true), probePartitionsTabVisibility()]);
     return;
   }
   if (loading.value || secondaryMetadataLoading.value) return;

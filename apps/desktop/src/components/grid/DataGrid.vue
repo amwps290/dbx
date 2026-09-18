@@ -10403,9 +10403,10 @@ const partitioningLoading = ref(false);
 const partitioningError = ref("");
 const partitioningRequestGeneration = ref(0);
 // The Partitions tab is only offered for tables that actually are partitioned
-// (a partitioned parent or a member partition). Probed up front with the cheap
+// (a partitioned parent or a member partition). Probed lazily with the cheap
 // partition-status query, not the full tree.
 const isPartitionedTable = ref(false);
+const partitionStatusResolved = ref(false);
 // The Constraints tab hides foreign keys when a dedicated Foreign Keys tab is
 // also shown (each constraint appears once; FK navigation stays in that tab).
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -10527,6 +10528,7 @@ async function probeTablePartitionStatus() {
   const identity = currentIndexTableIdentity.value;
   if (!tableMetadataCapabilities.value.partitions || !connectionId || !database || !tableName || !identity) {
     isPartitionedTable.value = false;
+    partitionStatusResolved.value = true;
     return;
   }
   try {
@@ -10537,6 +10539,8 @@ async function probeTablePartitionStatus() {
     // Fail closed: hide the tab rather than offering one that cannot load.
     if (identity !== currentIndexTableIdentity.value) return;
     isPartitionedTable.value = false;
+  } finally {
+    if (identity === currentIndexTableIdentity.value) partitionStatusResolved.value = true;
   }
 }
 
@@ -10665,6 +10669,10 @@ function toggleTableInfoDrawerPinned() {
 }
 
 async function selectTableInfoTab(tab: TableInfoTab) {
+  // The drawer is often opened after the table was already selected, so the
+  // partition status may never have been probed; do it here (once) before the
+  // tab list is consulted, or the Partitions tab would be missing entirely.
+  if (!partitionStatusResolved.value) await probeTablePartitionStatus();
   const tabSupported = tableInfoTabs.value.some((item) => item.id === tab);
   const nextTab = tabSupported ? tab : tableInfoTabs.value[0]?.id;
   if (!nextTab) return;
@@ -10722,7 +10730,7 @@ async function refreshActiveTableInfo() {
 
 watch(
   () => [props.connectionId, props.database, props.tableMeta?.catalog, props.tableMeta?.schema, props.tableMeta?.tableName],
-  async () => {
+  () => {
     tableInfoColumns.value = props.tableMeta?.columns ?? [];
     tableInfoColumnsLoading.value = false;
     tableInfoColumnsRequestGeneration.value += 1;
@@ -10755,15 +10763,12 @@ watch(
     partitioningError.value = "";
     partitioningRequestGeneration.value += 1;
     isPartitionedTable.value = false;
+    partitionStatusResolved.value = false;
     // 表身份变更后，主动触发索引加载，确保索引指示器在切换表后立即可见
     if (showIndexIndicatorsInHeader.value && canShowTableIndexes.value && currentIndexTableIdentity.value) {
       void fetchIndexes();
     }
     if (props.autoShowTableInfo && props.tableMeta) showTableInfo.value = true;
-    // Resolve the partition status before selecting a tab so a persisted
-    // `partitions` preference is not rejected (and overwritten) just because the
-    // probe has not landed yet.
-    if (showTableInfo.value) await probeTablePartitionStatus();
     if (showTableInfo.value) selectTableInfoTab(activeTableInfoTab.value);
     if (showTableInfo.value) void fetchTableOwner();
   },
