@@ -8,6 +8,7 @@ mod foreign_keys;
 mod indexes;
 mod mysql_engine;
 mod owner;
+mod partitions;
 mod sqlite_rebuild;
 mod triggers;
 mod types;
@@ -20,6 +21,7 @@ mod tests;
 pub use column_alter::build_single_column_alter_sql;
 pub use create_table::build_create_table_sql;
 pub use owner::build_table_owner_change_sql;
+pub use partitions::build_table_partition_operation_sql;
 pub use sqlite_rebuild::{apply_sqlite_table_structure_change, preview_sqlite_table_structure_change};
 pub use types::*;
 

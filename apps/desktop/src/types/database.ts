@@ -1512,6 +1512,8 @@ export interface PgTablePartitioning {
   isPartitioned: boolean;
   isPartition: boolean;
   parent?: string;
+  parentSchema?: string;
+  parentTable?: string;
   ownBound?: PgPartitionBound;
   strategy?: PgPartitionKind;
   keyDefinition?: string;
@@ -1519,6 +1521,8 @@ export interface PgTablePartitioning {
   keyExpression?: string;
   defaultPartition?: string;
   partitions: PgPartitionNode[];
+  /** `server_version_num`, used to gate `DETACH PARTITION CONCURRENTLY` (12+). */
+  serverVersionNum?: number;
 }
 
 export interface TableStructureEditorTarget {
@@ -1552,6 +1556,8 @@ export interface TableStructureEditorDraft {
   constraintsLoaded?: boolean;
   triggers: import("@/lib/table/tableStructureEditorSql").EditableStructureTrigger[];
   triggersLoaded?: boolean;
+  /** Pending PostgreSQL partition operations (create/attach/detach/drop). */
+  partitionOperations?: import("@/lib/table/tableStructureEditorSql").TablePartitionOperation[];
   loadedMetadataFacets?: import("@/lib/metadata/objectMetadataCache").ObjectMetadataFacet[];
   scrollPositions?: Partial<Record<TableInfoTab, TableStructureEditorViewport>>;
   /** Request id of the structureInitialTab the editor already applied; remounts must not replay a consumed initial tab over the restored draft. */

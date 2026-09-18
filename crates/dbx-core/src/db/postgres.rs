@@ -4206,6 +4206,16 @@ pub async fn get_partition_relation_stats(
         .collect())
 }
 
+/// `current_setting('server_version_num')` as an integer (e.g. 140019 for
+/// 14.19), or `None` when the server does not report it.
+pub async fn get_server_version_num(pool: &Pool) -> Result<Option<i32>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, "SELECT current_setting('server_version_num')::int", &[])
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(rows.first().and_then(|row| row.try_get::<_, i32>(0).ok()))
+}
+
 /// Full structured partitioning view of one relation, rooted at it. Returns a
 /// default (all-false/empty) value for a plain, non-partitioned table.
 pub async fn get_table_partitioning(pool: &Pool, schema: &str, table: &str) -> Result<PgTablePartitioning, String> {
@@ -4252,6 +4262,8 @@ pub async fn get_table_partitioning(pool: &Pool, schema: &str, table: &str) -> R
     let partitions = build_partition_nodes(root.oid, &nodes_by_oid, &children_by_parent, &stats, &mut visited);
     let default_partition =
         partitions.iter().find(|node| node.bound == Some(PgPartitionBound::Default)).map(|node| node.name.clone());
+    // Best effort: a missing version just hides the CONCURRENTLY option.
+    let server_version_num = get_server_version_num(pool).await.unwrap_or(None);
 
     Ok(PgTablePartitioning {
         is_partitioned,
@@ -4260,6 +4272,8 @@ pub async fn get_table_partitioning(pool: &Pool, schema: &str, table: &str) -> R
             (Some(schema), Some(table)) => Some(format!("{schema}.{table}")),
             _ => None,
         },
+        parent_schema: root.partition_info.parent_schema.clone(),
+        parent_table: root.partition_info.parent_table.clone(),
         own_bound: root.partition_info.bound.as_deref().and_then(parse_pg_partition_bound),
         strategy: strategy.as_ref().map(|strategy| strategy.kind),
         key_definition: strategy
@@ -4270,6 +4284,7 @@ pub async fn get_table_partitioning(pool: &Pool, schema: &str, table: &str) -> R
         key_expression: strategy.and_then(|strategy| strategy.expression),
         default_partition,
         partitions,
+        server_version_num,
     })
 }
 

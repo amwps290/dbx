@@ -770,8 +770,15 @@ pub struct PgPartitionNode {
 pub struct PgTablePartitioning {
     pub is_partitioned: bool,
     pub is_partition: bool,
+    /// Display form `"schema.table"` of the owning parent, when this relation
+    /// is itself a partition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Parent parts, kept separate so a dotted identifier cannot be mis-split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_table: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_bound: Option<PgPartitionBound>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -788,6 +795,10 @@ pub struct PgTablePartitioning {
     /// Descendant partitions (the root itself is not included).
     #[serde(default)]
     pub partitions: Vec<PgPartitionNode>,
+    /// Server version (`current_setting('server_version_num')`), used by the UI
+    /// to gate `DETACH PARTITION CONCURRENTLY` (PostgreSQL 12+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_version_num: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

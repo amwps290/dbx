@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   executeBatch: vi.fn(),
   listDataTypes: vi.fn(),
   buildTableStructureChangeSql: vi.fn(),
+  buildTablePartitionOperationSql: vi.fn(),
   buildMysqlAutoIncrementSql: vi.fn(),
   buildTableOwnerChangeSql: vi.fn(),
   getTablePartitionStatus: vi.fn(),
@@ -287,12 +288,30 @@ vi.mock("@/lib/backend/api", () => ({
   buildTableOwnerChangeSql: mocks.buildTableOwnerChangeSql,
   getTablePartitionStatus: mocks.getTablePartitionStatus,
   getTablePartitioning: mocks.getTablePartitioning,
+  buildTablePartitionOperationSql: mocks.buildTablePartitionOperationSql,
   getTableOwner: mocks.getTableOwner,
 }));
 
 import TableStructureEditor from "@/components/structure/TableStructureEditor.vue";
 
 const mountedApps: App[] = [];
+
+function structureDraft(overrides: Partial<Record<string, unknown>> = {}): Record<string, unknown> {
+  return {
+    dirty: false,
+    activeTab: "partitions",
+    newTableName: "",
+    tableComment: "",
+    originalTableComment: "",
+    columns: [],
+    indexes: [],
+    foreignKeys: [],
+    constraints: [],
+    triggers: [],
+    initialized: true,
+    ...overrides,
+  };
+}
 
 async function mountStructureEditor(props: Record<string, unknown> = {}) {
   const root = document.createElement("div");
@@ -331,6 +350,7 @@ beforeEach(() => {
   mocks.executeBatch.mockResolvedValue({ rowsAffected: 0 });
   mocks.listDataTypes.mockResolvedValue([]);
   mocks.getTablePartitionStatus.mockResolvedValue({ isPartitionedParent: true, isPartition: false });
+  mocks.buildTablePartitionOperationSql.mockResolvedValue({ statements: [], warnings: [] });
   mocks.getTablePartitioning.mockResolvedValue({
     isPartitioned: true,
     isPartition: false,
@@ -387,6 +407,39 @@ describe("TableStructureEditor partitions tab", () => {
 
     await settle();
     expect(root.textContent ?? "").toContain("structureEditor.partitionsEmpty");
+  });
+
+  it("submits pending partition operations through the dedicated builder", async () => {
+    const operation = {
+      id: "op:1",
+      kind: "create",
+      parentSchema: "",
+      parentTable: "",
+      schema: "",
+      name: "sales_2025",
+      bound: { kind: "default" },
+      concurrently: false,
+    };
+    mocks.buildTablePartitionOperationSql.mockResolvedValue({
+      statements: ['CREATE TABLE "public"."sales_2025" PARTITION OF "public"."sales" DEFAULT;'],
+      warnings: [],
+    });
+
+    const root = await mountStructureEditor({
+      initialTab: "partitions",
+      initialTabRequestId: 1,
+      draft: structureDraft({ activeTab: "partitions", partitionOperations: [operation] }),
+    });
+    await settle();
+    // The SQL preview is debounced, so wait for the builder rather than assuming
+    // it ran within the microtask settle loop.
+    await vi.waitFor(() => expect(mocks.buildTablePartitionOperationSql).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    const options = mocks.buildTablePartitionOperationSql.mock.calls.at(-1)?.[0] as { operations: unknown[] };
+    expect(options.operations).toHaveLength(1);
+    expect(root.textContent ?? "").toContain("structureEditor.partitionPendingOperations");
+    expect(root.textContent ?? "").toContain('CREATE TABLE "public"."sales_2025"');
   });
 
   it("surfaces a load failure instead of an empty state", async () => {

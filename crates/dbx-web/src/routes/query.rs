@@ -275,6 +275,12 @@ pub struct BuildTableOwnerChangeSqlRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BuildTablePartitionOperationSqlRequest {
+    pub options: dbx_core::table_structure_sql::TablePartitionSqlOptions,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PreviewSqliteTableStructureChangeRequest {
     pub connection_id: String,
     pub database: String,
@@ -995,6 +1001,12 @@ pub async fn build_table_owner_change_sql(
     Json(req): Json<BuildTableOwnerChangeSqlRequest>,
 ) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
     Json(dbx_core::table_structure_sql::build_table_owner_change_sql(req.options))
+}
+
+pub async fn build_table_partition_operation_sql(
+    Json(req): Json<BuildTablePartitionOperationSqlRequest>,
+) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
+    Json(dbx_core::table_structure_sql::build_table_partition_operation_sql(req.options))
 }
 
 pub async fn preview_sqlite_table_structure_change(

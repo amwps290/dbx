@@ -781,6 +781,13 @@ pub fn build_create_table_sql(
 }
 
 #[tauri::command]
+pub fn build_table_partition_operation_sql(
+    options: dbx_core::table_structure_sql::TablePartitionSqlOptions,
+) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
+    Ok(dbx_core::table_structure_sql::build_table_partition_operation_sql(options))
+}
+
+#[tauri::command]
 pub fn build_single_column_alter_sql(
     options: dbx_core::table_structure_sql::SingleColumnAlterSqlOptions,
 ) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {

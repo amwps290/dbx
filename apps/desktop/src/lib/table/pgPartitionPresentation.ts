@@ -38,6 +38,47 @@ export function pgPartitionNodeBoundText(node: PgPartitionNode): string {
   return node.bound ? pgPartitionBoundText(node.bound) : node.boundDefinition || "";
 }
 
+/**
+ * Splits user-entered partition bound values on top-level commas only. Commas
+ * inside single quotes (with `''` escapes) or nested parentheses stay in the
+ * value, so `lower('a,b'), 2` yields two values.
+ */
+export function splitPgPartitionBoundValues(input: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let depth = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let index = 0; index < input.length; index += 1) {
+    const ch = input[index];
+    if (ch === "'" && !inDouble) {
+      if (inSingle && input[index + 1] === "'") {
+        current += "''";
+        index += 1;
+        continue;
+      }
+      inSingle = !inSingle;
+      current += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === "(") depth += 1;
+    if (!inSingle && !inDouble && ch === ")") depth -= 1;
+    if (ch === "," && !inSingle && !inDouble && depth === 0) {
+      values.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  values.push(current.trim());
+  return values.filter((value) => value.length > 0);
+}
+
 /** Translation key for a partition strategy label. */
 export function pgPartitionKindLabelKey(kind?: PgPartitionKind): string | undefined {
   if (kind === "range") return "structureEditor.partitionKindRange";

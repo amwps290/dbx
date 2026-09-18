@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getTablePartitioning } from "@/lib/backend/http";
+import { buildTablePartitionOperationSql, getTablePartitioning } from "@/lib/backend/http";
 
 describe("PostgreSQL table partitioning web API", () => {
   afterEach(() => {
@@ -25,5 +25,42 @@ describe("PostgreSQL table partitioning web API", () => {
 
     await expect(getTablePartitioning("connection 1", "sales/db", "public", "order items")).resolves.toEqual(payload);
     expect(fetchMock).toHaveBeenCalledWith("/api/schema/table-partitioning?connection_id=connection+1&database=sales%2Fdb&schema=public&table=order+items");
+  });
+
+  it("builds partition maintenance SQL through the query endpoint", async () => {
+    const options = {
+      databaseType: "postgres" as const,
+      schema: "public",
+      tableName: "sales",
+      operations: [
+        {
+          id: "op:1",
+          kind: "create" as const,
+          parentSchema: "",
+          parentTable: "",
+          schema: "",
+          name: "sales_2025",
+          bound: { kind: "default" as const },
+          concurrently: false,
+        },
+      ],
+    };
+    const payload = {
+      statements: ['CREATE TABLE "public"."sales_2025" PARTITION OF "public"."sales" DEFAULT;'],
+      warnings: [],
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: vi.fn().mockResolvedValue(payload),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(buildTablePartitionOperationSql(options)).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith("/api/query/build-table-partition-operation-sql", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ options }),
+    });
   });
 });

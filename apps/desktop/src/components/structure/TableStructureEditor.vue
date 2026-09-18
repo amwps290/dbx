@@ -39,7 +39,17 @@ import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStor
 import { invalidateObjectDdl, loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { invalidateObjectMetadataCache, loadObjectMetadataFacet, type ObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
-import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
+import {
+  type BuildTableStructureChangeSqlOptions,
+  type EditableStructureColumn,
+  type EditableStructureForeignKey,
+  type EditableStructureIndex,
+  type EditableStructureTrigger,
+  type TablePartitionBoundDraft,
+  type TablePartitionOperation,
+  type TablePartitionOperationKind,
+  type TablePartitionSqlOptions,
+} from "@/lib/table/tableStructureEditorSql";
 import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft } from "@/lib/table/mysqlAutoIncrementCounter";
 import { mysqlTableCollationSql, parseMysqlTableCollation } from "@/lib/table/mysqlTableCollation";
 import { MYSQL_STORAGE_ENGINES_SQL, mysqlTableEngineSql, mysqlTableEngineSqlOption, parseMysqlTableEngineMetadata, refreshMysqlTableEngineDraft, supportsMysqlTableEngine } from "@/lib/table/mysqlTableEngine";
@@ -49,7 +59,7 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
@@ -58,7 +68,7 @@ import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataG
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { codeMirrorSqlDialectForConnection, connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { postgresListRolesSql, usersFromPostgresRolesResult } from "@/lib/database/databaseUserAdmin";
-import type { ColumnInfo, ConstraintInfo, PgPartitionKind, PgTablePartitioning, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
+import type { ColumnInfo, ConstraintInfo, PgPartitionKind, PgPartitionNode, PgTablePartitioning, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
   applyManticoreDdlColumnExtras,
   buildStructureTargetLabel,
@@ -419,12 +429,157 @@ const constraintsLoaded = ref(false);
 const partitioning = ref<PgTablePartitioning | null>(null);
 const partitionsLoading = ref(false);
 const partitionsError = ref("");
+// Pending partition operations (not yet saved). Unlike columns/indexes these
+// are explicit actions on the live catalog, so they are never diffed — they
+// accumulate here until Save, then are cleared and the tree reloaded.
+const partitionOperations = ref<TablePartitionOperation[]>([]);
 
 const partitionTreeRows = computed(() => flattenPgPartitionNodes(partitioning.value?.partitions ?? []));
 
 function partitionStrategyLabel(kind?: PgPartitionKind): string {
   const key = pgPartitionKindLabelKey(kind);
   return key ? t(key) : "";
+}
+
+// --- Partition maintenance -------------------------------------------------
+const partitionDialogOpen = ref(false);
+const partitionDialogMode = ref<TablePartitionOperationKind>("create");
+const partitionDialogName = ref("");
+const partitionDialogSchema = ref("");
+const partitionDialogParentSchema = ref("");
+const partitionDialogParentTable = ref("");
+const partitionDialogBoundKind = ref<PgPartitionKind | "default">("range");
+const partitionDialogRangeFrom = ref("");
+const partitionDialogRangeTo = ref("");
+const partitionDialogListValues = ref("");
+const partitionDialogModulus = ref("2");
+const partitionDialogRemainder = ref("0");
+const partitionDialogConcurrently = ref(false);
+const partitionDialogError = ref("");
+let partitionOperationSequence = 0;
+
+const canManagePartitions = computed(() => tableMetadataCapabilities.value.partitions && !isCreateMode.value && !!partitioning.value && (partitioning.value.isPartitioned || partitioning.value.isPartition));
+const partitionSupportsConcurrentDetach = computed(() => (partitioning.value?.serverVersionNum ?? 0) >= 120000);
+const partitionDialogNeedsBound = computed(() => partitionDialogMode.value === "create" || partitionDialogMode.value === "attach");
+
+function resetPartitionDialog() {
+  partitionDialogName.value = "";
+  partitionDialogSchema.value = "";
+  partitionDialogParentSchema.value = "";
+  partitionDialogParentTable.value = "";
+  partitionDialogBoundKind.value = "range";
+  partitionDialogRangeFrom.value = "";
+  partitionDialogRangeTo.value = "";
+  partitionDialogListValues.value = "";
+  partitionDialogModulus.value = "2";
+  partitionDialogRemainder.value = "0";
+  partitionDialogConcurrently.value = false;
+  partitionDialogError.value = "";
+}
+
+function openPartitionDialog(mode: TablePartitionOperationKind, boundKind?: PgPartitionKind) {
+  resetPartitionDialog();
+  partitionDialogMode.value = mode;
+  partitionDialogBoundKind.value = boundKind ?? partitioning.value?.strategy ?? "range";
+  partitionDialogOpen.value = true;
+}
+
+function openPartitionRowOperation(mode: TablePartitionOperationKind, node: PgPartitionNode) {
+  openPartitionDialog(mode);
+  partitionDialogName.value = node.name;
+}
+
+/** Detaching the partition currently being edited: the parent is not the
+ * edited table, so it must be named explicitly. */
+function openDetachSelfPartitionDialog() {
+  openPartitionDialog("detach");
+  partitionDialogName.value = props.tableName || "";
+  partitionDialogSchema.value = metadataSchema.value;
+  partitionDialogParentSchema.value = partitioning.value?.parentSchema ?? "";
+  partitionDialogParentTable.value = partitioning.value?.parentTable ?? "";
+}
+
+function partitionDialogBound(): TablePartitionBoundDraft | undefined {
+  const kind = partitionDialogBoundKind.value;
+  if (kind === "default") return { kind: "default" };
+  if (kind === "range") {
+    const from = splitPgPartitionBoundValues(partitionDialogRangeFrom.value);
+    const to = splitPgPartitionBoundValues(partitionDialogRangeTo.value);
+    if (!from.length || from.length !== to.length) {
+      partitionDialogError.value = t("structureEditor.partitionRangeBoundInvalid");
+      return undefined;
+    }
+    return { kind: "range", from, to };
+  }
+  if (kind === "list") {
+    const values = splitPgPartitionBoundValues(partitionDialogListValues.value);
+    if (!values.length) {
+      partitionDialogError.value = t("structureEditor.partitionListBoundInvalid");
+      return undefined;
+    }
+    return { kind: "list", values };
+  }
+  const modulus = Number.parseInt(partitionDialogModulus.value, 10);
+  const remainder = Number.parseInt(partitionDialogRemainder.value, 10);
+  if (!Number.isInteger(modulus) || modulus <= 0 || !Number.isInteger(remainder) || remainder < 0 || remainder >= modulus) {
+    partitionDialogError.value = t("structureEditor.partitionHashBoundInvalid");
+    return undefined;
+  }
+  return { kind: "hash", modulus, remainder };
+}
+
+function confirmPartitionDialog() {
+  partitionDialogError.value = "";
+  const mode = partitionDialogMode.value;
+  const name = partitionDialogName.value.trim();
+  if (!name) {
+    partitionDialogError.value = t("structureEditor.partitionNameRequired");
+    return;
+  }
+  let bound: TablePartitionBoundDraft | undefined;
+  if (mode === "create" || mode === "attach") {
+    bound = partitionDialogBound();
+    if (!bound) return;
+  }
+  partitionOperations.value = [
+    ...partitionOperations.value,
+    {
+      id: `partition-op:${++partitionOperationSequence}`,
+      kind: mode,
+      parentSchema: partitionDialogParentSchema.value.trim(),
+      parentTable: partitionDialogParentTable.value.trim(),
+      schema: partitionDialogSchema.value.trim(),
+      name,
+      bound,
+      concurrently: mode === "detach" && partitionDialogConcurrently.value && partitionSupportsConcurrentDetach.value,
+    },
+  ];
+  partitionDialogOpen.value = false;
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+function removePartitionOperation(id: string) {
+  partitionOperations.value = partitionOperations.value.filter((operation) => operation.id !== id);
+  scheduleSqlPreviewRefresh();
+  syncDraftToParent();
+}
+
+function partitionOperationLabel(kind: TablePartitionOperationKind): string {
+  switch (kind) {
+    case "create":
+      return t("structureEditor.partitionAdd");
+    case "attach":
+      return t("structureEditor.partitionAttach");
+    case "detach":
+      return t("structureEditor.partitionDetach");
+    case "drop":
+      return t("structureEditor.partitionDrop");
+  }
+}
+
+function partitionOperationSummary(operation: TablePartitionOperation): string {
+  return `${partitionOperationLabel(operation.kind)}: ${operation.name}`;
 }
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/ObjectBrowser.
@@ -1442,6 +1597,7 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     constraintsLoaded: constraintsLoaded.value,
     triggers: cloneDraftValue(triggers.value),
     triggersLoaded: triggersLoaded.value,
+    partitionOperations: cloneDraftValue(partitionOperations.value),
     loadedMetadataFacets: [...loadedMetadataFacets],
     scrollPositions: cloneDraftValue(structureScrollPositions.value),
     appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
@@ -1496,6 +1652,7 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   triggers.value = cloneDraftValue(draft.triggers || []);
   // Drafts created before lazy trigger loading always contained live trigger metadata.
   triggersLoaded.value = draft.triggersLoaded ?? true;
+  partitionOperations.value = cloneDraftValue(draft.partitionOperations || []);
   loadedMetadataFacets.clear();
   if (draft.loadedMetadataFacets) {
     for (const facet of draft.loadedMetadataFacets) loadedMetadataFacets.add(facet);
@@ -1571,6 +1728,7 @@ function hasPendingStructureChanges(): boolean {
     scope.foreignKeys ||
     scope.triggers ||
     scope.tableComment ||
+    partitionOperations.value.length > 0 ||
     mysqlTableEngine.value.toLowerCase() !== originalMysqlTableEngine.value.toLowerCase() ||
     (canBuildMysqlAutoIncrement.value && mysqlAutoIncrementValue.value !== originalMysqlAutoIncrementValue.value) ||
     (supportsTableOwner.value && tableOwner.value.trim() !== originalTableOwner.value.trim())
@@ -1731,6 +1889,16 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
   };
 }
 
+function partitionSqlOptions(): TablePartitionSqlOptions {
+  return {
+    databaseType: databaseType.value,
+    driverProfile: connection.value?.driver_profile,
+    schema: props.schema,
+    tableName: props.tableName || "",
+    operations: partitionOperations.value,
+  };
+}
+
 async function refreshSqlPreview() {
   const requestId = ++sqlPreviewRequestId;
   if (concurrentAvailabilityInvalidated.value) {
@@ -1778,8 +1946,9 @@ async function refreshSqlPreview() {
   }
   sqlPreviewLoading.value = true;
   const options = structureChangeOptions();
+  const partitionResultPromise = partitionOperations.value.length > 0 ? api.buildTablePartitionOperationSql(partitionSqlOptions()) : Promise.resolve({ statements: [], warnings: [] });
   try {
-    const [result, ownerResult, mysqlAutoIncrementStatement] = await Promise.all([
+    const [result, ownerResult, mysqlAutoIncrementStatement, partitionResult] = await Promise.all([
       isCreateMode.value ? api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : api.buildTableStructureChangeSql(options),
       supportsTableOwner.value
         ? api.buildTableOwnerChangeSql({
@@ -1800,12 +1969,13 @@ async function refreshSqlPreview() {
         tableName: props.tableName || "",
         buildSql: api.buildMysqlAutoIncrementSql,
       }),
+      partitionResultPromise,
     ]);
     if (requestId !== sqlPreviewRequestId) return;
-    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : []), ...partitionResult.statements];
     // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
     pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers !== false || hasSqliteTypeChange.value ? statements : statements.map((statement) => formatGeneratedDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value), false));
-    warnings.value = [...result.warnings, ...ownerResult.warnings];
+    warnings.value = [...result.warnings, ...ownerResult.warnings, ...partitionResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
     if (requestId !== sqlPreviewRequestId) return;
@@ -1870,6 +2040,7 @@ function resetState() {
   partitioning.value = null;
   triggers.value = [];
   triggersLoaded.value = false;
+  partitionOperations.value = [];
   clearColumnSelection();
   rawDdlContent.value = "";
   ddlDraft.value = null;
@@ -3827,6 +3998,9 @@ async function applyChanges() {
     pendingStatements.value = [];
     warnings.value = [];
     sqliteSchemaRevision.value = undefined;
+    // Partition operations are applied in place; drop them now so the reload
+    // below reflects the new catalog state instead of replaying them.
+    partitionOperations.value = [];
     ddlFetched.value = false;
     rawDdlContent.value = "";
     ddlDraft.value = null;
@@ -5245,23 +5419,58 @@ watch(
             </div>
             <div v-else class="space-y-2">
               <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="flex flex-wrap items-center gap-1.5">
-                  <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
-                  <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
-                  <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
+                    <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
+                    <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                  </div>
+                  <div v-if="canManagePartitions" class="flex shrink-0 items-center gap-1.5">
+                    <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('create')">
+                      <Plus :class="[structureIconClass, 'mr-1']" />
+                      {{ t("structureEditor.partitionAdd") }}
+                    </Button>
+                    <Button v-if="partitioning.isPartitioned" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openPartitionDialog('attach')">
+                      <ListChevronsUpDown :class="[structureIconClass, 'mr-1']" />
+                      {{ t("structureEditor.partitionAttach") }}
+                    </Button>
+                    <Button v-if="partitioning.isPartition" variant="outline" size="sm" :class="structureToolbarButtonClass" @click="openDetachSelfPartitionDialog">
+                      <X :class="[structureIconClass, 'mr-1']" />
+                      {{ t("structureEditor.partitionDetachSelf") }}
+                    </Button>
+                  </div>
                 </div>
                 <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
                 <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
                 <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
               </div>
+              <div v-if="partitionOperations.length" class="rounded-md border border-primary/40 bg-primary/5 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                <div class="mb-1 font-medium">{{ t("structureEditor.partitionPendingOperations") }}</div>
+                <div v-for="operation in partitionOperations" :key="operation.id" class="flex items-center justify-between gap-2 py-0.5">
+                  <span class="truncate font-mono">{{ partitionOperationSummary(operation) }}</span>
+                  <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionRemoveOperation')" @click="removePartitionOperation(operation.id)">
+                    <Trash2 :class="structureIconClass" />
+                  </Button>
+                </div>
+              </div>
               <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
                 {{ t("structureEditor.partitionsEmptyChildren") }}
               </div>
               <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
-                <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
-                  <span class="font-mono font-medium">{{ row.node.name }}</span>
-                  <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
-                  <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                <div class="flex flex-wrap items-center justify-between gap-1.5">
+                  <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
+                    <span class="font-mono font-medium">{{ row.node.name }}</span>
+                    <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                    <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                  </div>
+                  <div v-if="canManagePartitions && partitioning.isPartitioned" class="flex shrink-0 items-center gap-0.5">
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDetach')" @click="openPartitionRowOperation('detach', row.node)">
+                      <X :class="structureIconClass" />
+                    </Button>
+                    <Button variant="ghost" size="sm" :class="structureIconButtonClass" :title="t('structureEditor.partitionDrop')" @click="openPartitionRowOperation('drop', row.node)">
+                      <Trash2 :class="structureIconClass" />
+                    </Button>
+                  </div>
                 </div>
                 <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
                 <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
@@ -5458,6 +5667,71 @@ watch(
           <Button :disabled="copySourceColumnsLoading || selectedCopySourceColumns.length === 0" @click="applyCopiedColumns">
             {{ t("structureEditor.copyColumnsApply", { count: selectedCopySourceColumns.length }) }}
           </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="partitionDialogOpen">
+      <DialogContent class="max-w-md">
+        <DialogHeader>
+          <DialogTitle>{{ partitionOperationLabel(partitionDialogMode) }}</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-3">
+          <div class="space-y-1">
+            <label class="text-sm">{{ t("structureEditor.partitionName") }}</label>
+            <Input v-model="partitionDialogName" class="font-mono" :disabled="partitionDialogMode === 'detach' || partitionDialogMode === 'drop'" :placeholder="t('structureEditor.partitionNamePlaceholder')" />
+          </div>
+          <template v-if="partitionDialogNeedsBound">
+            <div class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundKind") }}</label>
+              <Select v-model="partitionDialogBoundKind">
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="range">{{ t("structureEditor.partitionKindRange") }}</SelectItem>
+                  <SelectItem value="list">{{ t("structureEditor.partitionKindList") }}</SelectItem>
+                  <SelectItem value="hash">{{ t("structureEditor.partitionKindHash") }}</SelectItem>
+                  <SelectItem value="default">{{ t("structureEditor.partitionBoundDefault") }}</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <template v-if="partitionDialogBoundKind === 'range'">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundFrom") }}</label>
+                <Input v-model="partitionDialogRangeFrom" class="font-mono" placeholder="MINVALUE / '2025-01-01'" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundTo") }}</label>
+                <Input v-model="partitionDialogRangeTo" class="font-mono" placeholder="'2026-01-01' / MAXVALUE" />
+              </div>
+            </template>
+            <div v-else-if="partitionDialogBoundKind === 'list'" class="space-y-1">
+              <label class="text-sm">{{ t("structureEditor.partitionBoundValues") }}</label>
+              <Input v-model="partitionDialogListValues" class="font-mono" placeholder="1, 2, 3" />
+            </div>
+            <div v-else-if="partitionDialogBoundKind === 'hash'" class="grid grid-cols-2 gap-2">
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundModulus") }}</label>
+                <Input v-model="partitionDialogModulus" class="font-mono" inputmode="numeric" />
+              </div>
+              <div class="space-y-1">
+                <label class="text-sm">{{ t("structureEditor.partitionBoundRemainder") }}</label>
+                <Input v-model="partitionDialogRemainder" class="font-mono" inputmode="numeric" />
+              </div>
+            </div>
+          </template>
+          <label v-else-if="partitionDialogMode === 'detach' && partitionSupportsConcurrentDetach" class="flex items-center gap-2 text-sm">
+            <input v-model="partitionDialogConcurrently" type="checkbox" />
+            {{ t("structureEditor.partitionDetachConcurrently") }}
+          </label>
+          <p v-if="partitionDialogMode === 'detach'" class="text-sm text-muted-foreground">{{ t("structureEditor.partitionDetachWarning") }}</p>
+          <p v-if="partitionDialogMode === 'drop'" class="text-sm text-destructive">{{ t("structureEditor.partitionDropWarning") }}</p>
+          <p v-if="partitionDialogError" class="text-sm text-destructive">{{ partitionDialogError }}</p>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="partitionDialogOpen = false">{{ t("common.cancel") }}</Button>
+          <Button :variant="partitionDialogMode === 'drop' ? 'destructive' : 'default'" @click="confirmPartitionDialog">{{ t("common.confirm") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

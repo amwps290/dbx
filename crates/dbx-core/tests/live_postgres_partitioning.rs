@@ -173,3 +173,81 @@ async fn live_postgres_partitioning_nests_subpartitions() {
 
     postgres::execute_batch(&pool, &cleanup).await.expect("cleanup nested partition schema");
 }
+
+/// Live PostgreSQL: the generated partition maintenance DDL must actually run.
+/// Covers create (with a bound), detach, and drop end to end.
+#[tokio::test]
+#[ignore = "requires DBX_LIVE_POSTGRES_HOST/PORT/USER/PASSWORD/DATABASE pointing at a writable PostgreSQL database"]
+async fn live_postgres_partition_operations_execute() {
+    use dbx_core::table_structure_sql::{
+        build_table_partition_operation_sql, TablePartitionBoundDraft, TablePartitionOperation,
+        TablePartitionOperationKind, TablePartitionSqlOptions,
+    };
+
+    let pool = postgres::connect(&live_postgres_url(), Duration::from_secs(10)).await.expect("connect PostgreSQL");
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("dbx_partop_{}", &suffix[..8]);
+    let cleanup = vec![format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE")];
+    let _ = postgres::execute_batch(&pool, &cleanup).await;
+    postgres::execute_batch(
+        &pool,
+        &[
+            format!("CREATE SCHEMA \"{schema}\""),
+            format!("CREATE TABLE \"{schema}\".sales (id integer, sold_on date) PARTITION BY RANGE (sold_on)"),
+        ],
+    )
+    .await
+    .expect("create partitioned parent");
+
+    let operation = |kind: TablePartitionOperationKind, name: &str, bound: Option<TablePartitionBoundDraft>| {
+        TablePartitionOperation {
+            id: format!("op:{name}"),
+            kind,
+            parent_schema: String::new(),
+            parent_table: String::new(),
+            schema: String::new(),
+            name: name.to_string(),
+            bound,
+            concurrently: false,
+        }
+    };
+
+    let create = build_table_partition_operation_sql(TablePartitionSqlOptions {
+        database_type: Some(dbx_core::models::connection::DatabaseType::Postgres),
+        driver_profile: None,
+        schema: Some(schema.clone()),
+        table_name: "sales".to_string(),
+        operations: vec![operation(
+            TablePartitionOperationKind::Create,
+            "sales_2025",
+            Some(TablePartitionBoundDraft::Range {
+                from: vec!["'2025-01-01'".to_string()],
+                to: vec!["'2026-01-01'".to_string()],
+            }),
+        )],
+    });
+    assert!(create.warnings.is_empty(), "{:?}", create.warnings);
+    postgres::execute_batch(&pool, &create.statements).await.expect("execute create partition");
+
+    let partitioning = postgres::get_table_partitioning(&pool, &schema, "sales").await.expect("read partitioning");
+    assert!(partitioning.partitions.iter().any(|node| node.name == "sales_2025"));
+    assert!(partitioning.server_version_num.is_some());
+
+    // Detach + drop: the partition must disappear from the parent's tree.
+    let detach = build_table_partition_operation_sql(TablePartitionSqlOptions {
+        database_type: Some(dbx_core::models::connection::DatabaseType::Postgres),
+        driver_profile: None,
+        schema: Some(schema.clone()),
+        table_name: "sales".to_string(),
+        operations: vec![
+            operation(TablePartitionOperationKind::Detach, "sales_2025", None),
+            operation(TablePartitionOperationKind::Drop, "sales_2025", None),
+        ],
+    });
+    assert!(detach.warnings.is_empty(), "{:?}", detach.warnings);
+    postgres::execute_batch(&pool, &detach.statements).await.expect("execute detach + drop");
+    let after = postgres::get_table_partitioning(&pool, &schema, "sales").await.expect("read partitioning after drop");
+    assert!(!after.partitions.iter().any(|node| node.name == "sales_2025"));
+
+    postgres::execute_batch(&pool, &cleanup).await.expect("cleanup live partition-op schema");
+}

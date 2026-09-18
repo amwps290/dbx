@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
 import type { PgPartitionNode } from "@/types/database";
 
 function node(name: string, children: PgPartitionNode[] = []): PgPartitionNode {
@@ -32,6 +32,15 @@ describe("pgPartitionPresentation", () => {
     expect(pgPartitionNodeBoundText({ ...node("p"), boundDefinition: "FOR VALUES IN (1)" })).toBe("FOR VALUES IN (1)");
     expect(pgPartitionNodeBoundText({ ...node("p"), bound: { kind: "default" }, boundDefinition: "DEFAULT" })).toBe("DEFAULT");
     expect(pgPartitionNodeBoundText(node("p"))).toBe("");
+  });
+
+  it("splits bound values on top-level commas only", () => {
+    expect(splitPgPartitionBoundValues("1, 2, 3")).toEqual(["1", "2", "3"]);
+    expect(splitPgPartitionBoundValues("'a,b', 'c'")).toEqual(["'a,b'", "'c'"]);
+    expect(splitPgPartitionBoundValues("lower('A''B'), lower('C')")).toEqual(["lower('A''B')", "lower('C')"]);
+    expect(splitPgPartitionBoundValues("  '2024-01-01'  ")).toEqual(["'2024-01-01'"]);
+    expect(splitPgPartitionBoundValues("")).toEqual([]);
+    expect(splitPgPartitionBoundValues(" , ")).toEqual([]);
   });
 
   it("maps strategies to translation keys", () => {
