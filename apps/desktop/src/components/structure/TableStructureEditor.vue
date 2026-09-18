@@ -59,7 +59,7 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
@@ -481,6 +481,24 @@ const createPartitioningColumns = ref<string[]>([]);
 const createPartitioningExpression = ref("");
 
 const partitionTreeRows = computed(() => flattenPgPartitionNodes(partitioning.value?.partitions ?? []));
+// Folded parents, so a large partition hierarchy can be navigated by level.
+const collapsedPartitionKeys = ref<Set<string>>(new Set());
+
+function togglePartitionRow(key: string) {
+  const next = new Set(collapsedPartitionKeys.value);
+  if (next.has(key)) next.delete(key);
+  else next.add(key);
+  collapsedPartitionKeys.value = next;
+}
+
+watch(
+  () => partitioning.value,
+  () => {
+    collapsedPartitionKeys.value = new Set();
+  },
+);
+
+const partitionVisibleRows = computed(() => visiblePgPartitionRows(partitionTreeRows.value, collapsedPartitionKeys.value));
 const partitionCreatableColumns = computed(() => columns.value.filter((column) => !column.markedForDrop && !!column.name.trim()).map((column) => column.name.trim()));
 
 function partitionStrategyLabel(kind?: PgPartitionKind): string {
@@ -5677,13 +5695,26 @@ watch(
                 <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
                   {{ t("structureEditor.partitionsEmptyChildren") }}
                 </div>
-                <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                <div v-for="row in partitionVisibleRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
                   <div class="flex items-start gap-1">
                     <span aria-hidden="true" class="shrink-0 select-none whitespace-pre font-mono leading-5 text-muted-foreground/60">{{ pgPartitionTreePrefix(row) }}</span>
+                    <button
+                      v-if="row.node.children.length"
+                      type="button"
+                      class="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground transition-colors hover:text-foreground"
+                      :aria-label="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      :title="collapsedPartitionKeys.has(row.key) ? t('structureEditor.partitionExpand') : t('structureEditor.partitionCollapse')"
+                      @click="togglePartitionRow(row.key)"
+                    >
+                      <ChevronRight v-if="collapsedPartitionKeys.has(row.key)" :class="structureIconClass" />
+                      <ChevronDown v-else :class="structureIconClass" />
+                    </button>
+                    <span v-else class="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true"></span>
                     <div class="min-w-0 flex-1">
                       <div class="flex flex-wrap items-center justify-between gap-1.5">
                         <div class="flex flex-wrap items-center gap-1.5">
                           <span class="font-mono font-medium">{{ row.node.name }}</span>
+                          <Badge v-if="row.node.children.length" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionChildCount", { count: row.node.children.length }) }}</Badge>
                           <Badge v-if="row.depth > 0" variant="outline" class="border-dashed text-muted-foreground">{{ t("structureEditor.partitionSubPartitionBadge") }}</Badge>
                           <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
                           <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>

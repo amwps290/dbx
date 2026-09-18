@@ -92,6 +92,36 @@ describe("TablePartitionsPanel", () => {
     expect(text).toContain("structureEditor.partitionSubPartitionBadge");
   });
 
+  it("folds and unfolds sub-partitions from the parent toggle", async () => {
+    const root = await mount({ partitioning: partitioned, loading: false, error: "" });
+    expect(root.textContent ?? "").toContain("sales_nested_cn");
+    expect(root.textContent ?? "").toContain("structureEditor.partitionChildCount");
+
+    const collapse = root.querySelector('button[title="structureEditor.partitionCollapse"]');
+    expect(collapse).not.toBeNull();
+    collapse!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    for (let i = 0; i < 5; i += 1) await nextTick();
+
+    expect(root.textContent ?? "").not.toContain("sales_nested_cn");
+    // The parent stays visible with its fold marker flipped to expand.
+    expect(root.textContent ?? "").toContain("sales_nested");
+    expect(root.querySelector('button[title="structureEditor.partitionExpand"]')).not.toBeNull();
+  });
+
+  it("ignores the fold while searching so a matching child is never hidden", async () => {
+    const root = await mount({ partitioning: partitioned, loading: false, error: "", searchQuery: "sales" });
+    expect(root.textContent ?? "").toContain("sales_nested_cn");
+
+    const collapse = root.querySelector('button[title="structureEditor.partitionCollapse"]');
+    expect(collapse).not.toBeNull();
+    collapse!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    for (let i = 0; i < 5; i += 1) await nextTick();
+
+    // The fold is recorded, but an active search keeps every match visible.
+    expect(root.querySelector('button[title="structureEditor.partitionExpand"]')).not.toBeNull();
+    expect(root.textContent ?? "").toContain("sales_nested_cn");
+  });
+
   it("filters rows by the search query", async () => {
     const root = await mount({ partitioning: partitioned, loading: false, error: "", searchQuery: "2024" });
     const text = root.textContent ?? "";

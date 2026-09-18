@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues } from "@/lib/table/pgPartitionPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionTreePrefix, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import type { PgPartitionNode } from "@/types/database";
 
 function node(name: string, children: PgPartitionNode[] = []): PgPartitionNode {
@@ -30,6 +30,24 @@ describe("pgPartitionPresentation", () => {
       ["p1b", 1, true, [true]],
       ["p2", 0, true, []],
     ]);
+  });
+
+  it("tracks the ancestor key chain used to fold a parent", () => {
+    const rows = flattenPgPartitionNodes([node("p1", [node("p1a", [node("p1a1")])]), node("p2")]);
+
+    expect(rows.map((row) => [row.node.name, row.ancestorKeys])).toEqual([
+      ["p1", []],
+      ["p1a", ["public.p1"]],
+      ["p1a1", ["public.p1", "public.p1/public.p1a"]],
+      ["p2", []],
+    ]);
+  });
+
+  it("hides every descendant of a collapsed parent", () => {
+    const rows = flattenPgPartitionNodes([node("p1", [node("p1a"), node("p1b")]), node("p2")]);
+
+    expect(visiblePgPartitionRows(rows, new Set()).map((row) => row.node.name)).toEqual(["p1", "p1a", "p1b", "p2"]);
+    expect(visiblePgPartitionRows(rows, new Set(["public.p1"])).map((row) => row.node.name)).toEqual(["p1", "p2"]);
   });
 
   it("draws a tree prefix with vertical guides and a branch marker", () => {

@@ -534,6 +534,40 @@ describe("TableStructureEditor partitions tab", () => {
     expect(mocks.getTablePartitioning).not.toHaveBeenCalled();
   });
 
+  it("folds sub-partitions when the parent row is collapsed", async () => {
+    mocks.getTablePartitioning.mockResolvedValue({
+      isPartitioned: true,
+      isPartition: false,
+      strategy: "range",
+      keyDefinition: "RANGE (year)",
+      keyColumns: ["year"],
+      partitions: [
+        {
+          schema: "public",
+          name: "logs_2024",
+          strategy: "list",
+          isLeaf: false,
+          bound: { kind: "range", from: ["2024"], to: ["2025"] },
+          children: [{ schema: "public", name: "logs_2024_cn", isLeaf: true, bound: { kind: "list", values: ["'cn'"] }, children: [] }],
+        },
+      ],
+    });
+    const root = await mountStructureEditor({ initialTab: "partitions", initialTabRequestId: 1 });
+    await settle();
+
+    expect(root.textContent ?? "").toContain("logs_2024_cn");
+    expect(root.textContent ?? "").toContain("structureEditor.partitionChildCount");
+
+    const collapse = root.querySelector('button[title="structureEditor.partitionCollapse"]');
+    expect(collapse).not.toBeNull();
+    collapse!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    await settle();
+
+    expect(root.textContent ?? "").not.toContain("logs_2024_cn");
+    expect(root.textContent ?? "").toContain("logs_2024");
+    expect(root.querySelector('button[title="structureEditor.partitionExpand"]')).not.toBeNull();
+  });
+
   it("previews the SQL of the operation being edited in its dialog", async () => {
     mocks.buildTablePartitionOperationSql.mockResolvedValue({
       statements: ['ALTER TABLE "public"."sales" DETACH PARTITION "public"."sales_2024";'],

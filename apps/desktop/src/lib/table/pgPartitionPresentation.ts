@@ -14,6 +14,8 @@ export interface PgPartitionTreeRow {
   ancestorGuides: boolean[];
   /** This row is the last child of its parent (`└─` instead of `├─`). */
   isLastChild: boolean;
+  /** Keys of every ancestor above this row, outermost first (for collapse). */
+  ancestorKeys: string[];
 }
 
 /**
@@ -21,17 +23,26 @@ export interface PgPartitionTreeRow {
  * hierarchies without recursive components, keeping the guide flags needed to
  * show nesting clearly (a plain indent is too subtle for deep sub-partitions).
  */
-export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorGuides: boolean[] = []): PgPartitionTreeRow[] {
+export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorGuides: boolean[] = [], ancestorKeys: string[] = []): PgPartitionTreeRow[] {
   const rows: PgPartitionTreeRow[] = [];
   nodes.forEach((node, index) => {
     const isLastChild = index === nodes.length - 1;
     const key = `${keyPrefix}${node.schema}.${node.name}`;
-    rows.push({ key, depth, node, ancestorGuides: [...ancestorGuides], isLastChild });
+    rows.push({ key, depth, node, ancestorGuides: [...ancestorGuides], isLastChild, ancestorKeys: [...ancestorKeys] });
     if (node.children.length > 0) {
-      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorGuides, !isLastChild]));
+      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorGuides, !isLastChild], [...ancestorKeys, key]));
     }
   });
   return rows;
+}
+
+/**
+ * Drops rows hidden behind a collapsed ancestor, so a renderer can show a
+ * folded tree without re-walking it.
+ */
+export function visiblePgPartitionRows(rows: PgPartitionTreeRow[], collapsedKeys: ReadonlySet<string>): PgPartitionTreeRow[] {
+  if (collapsedKeys.size === 0) return rows;
+  return rows.filter((row) => !row.ancestorKeys.some((key) => collapsedKeys.has(key)));
 }
 
 /**
