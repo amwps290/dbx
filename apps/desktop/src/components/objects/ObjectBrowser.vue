@@ -80,6 +80,7 @@ import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionTableSq
 import { getTableMetadataCapabilities, type TableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
+import { PARTITION_TREE_INDENT_PX } from "@/lib/table/pgPartitionPresentation";
 import {
   buildDropObjectSql,
   buildDropTableSql,
@@ -145,6 +146,7 @@ import {
   initialObjectBrowserSortDirection,
   objectBrowserRowLegacyPinnedTreeNodeIds,
   objectBrowserRowMatchesPinnedTreeNode,
+  groupObjectBrowserRows,
   objectBrowserRowPinnedTreeNodeIdentity,
   sortObjectBrowserRows,
   summarizeObjectBrowserSearch,
@@ -628,17 +630,14 @@ const gridTemplateColumns = computed(() => {
 const objectGridMinWidth = computed(() => {
   return objectBrowserColumns.value.reduce((total, key) => total + objectColumnWidths.value[key], 0) + Math.max(0, objectBrowserColumns.value.length - 1) * 12 + 24;
 });
-const partitionRowsByParentId = computed(() => {
-  const groups = new Map<string, ObjectBrowserRow[]>();
-  for (const row of rows.value) {
-    if (!row.partitionParentId) continue;
-    const group = groups.get(row.partitionParentId) ?? [];
-    group.push(row);
-    groups.set(row.partitionParentId, group);
-  }
-  return groups;
-});
-const filteredRows = computed(() => groupedFilteredRows());
+
+const groupedRows = computed(() => groupedFilteredRows());
+const filteredRows = computed(() => groupedRows.value.rows);
+
+/** Nesting level of a partition row (0 for a top-level object). */
+function partitionRowDepth(row: ObjectBrowserRow): number {
+  return groupedRows.value.depths.get(row.id) ?? 0;
+}
 const selectableRows = computed(() => rows.value.filter((row) => row.type === "TABLE"));
 
 // ---- Grid (tile) view virtualization ----
@@ -928,32 +927,13 @@ function removePinnedObjectBrowserRows(rows: readonly ObjectBrowserRow[]) {
 }
 
 function groupedFilteredRows() {
-  const query = search.value.trim();
-  const candidateRows = rows.value.filter(rowMatchesObjectFilter);
-  const candidateIds = new Set(candidateRows.map((row) => row.id));
-  const matchingRows = objectSearchSummary.value.matchingRows.filter(rowMatchesObjectFilter);
-  const matchingIds = new Set(matchingRows.map((row) => row.id));
-  const parentIdsWithMatchingPartitions = new Set(matchingRows.flatMap((row) => (row.partitionParentId ? [row.partitionParentId] : [])));
-  const rootRows = candidateRows.filter((row) => {
-    if (row.partitionParentId) return false;
-    if (!query) return true;
-    return matchingIds.has(row.id) || parentIdsWithMatchingPartitions.has(row.id);
+  return groupObjectBrowserRows({
+    rows: rows.value.filter(rowMatchesObjectFilter),
+    matchingRows: objectSearchSummary.value.matchingRows.filter(rowMatchesObjectFilter),
+    query: search.value.trim(),
+    expandedPartitionParentIds: expandedPartitionParentIds.value,
+    sortRows: sortObjectBrowserRowsWithPins,
   });
-  const sortedRoots = sortObjectBrowserRowsWithPins(rootRows);
-  const result: ObjectBrowserRow[] = [];
-
-  for (const row of sortedRoots) {
-    result.push(row);
-    const partitions = partitionRowsByParentId.value.get(row.id)?.filter((partition) => candidateIds.has(partition.id));
-    if (!partitions?.length) continue;
-    const parentMatches = matchingIds.has(row.id);
-    const shouldShowPartitions = expandedPartitionParentIds.value.has(row.id) || !!query;
-    if (!shouldShowPartitions) continue;
-    const visiblePartitions = query && !parentMatches ? partitions.filter((partition) => matchingIds.has(partition.id)) : partitions;
-    result.push(...sortObjectBrowserRowsWithPins(visiblePartitions));
-  }
-
-  return result;
 }
 
 function iconClass(type: ObjectBrowserRow["type"]) {
@@ -3718,6 +3698,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                     <Square v-else class="h-3.5 w-3.5" />
                   </button>
                   <div class="flex min-w-0 items-center gap-2">
+                    <span v-if="partitionRowDepth(item) > 0" :data-partition-depth="partitionRowDepth(item)" :style="{ width: `${partitionRowDepth(item) * PARTITION_TREE_INDENT_PX}px` }" class="h-5 shrink-0" aria-hidden="true" />
                     <button
                       v-if="item.partitionCount"
                       type="button"
@@ -3728,7 +3709,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                       <ChevronDown v-if="isPartitionParentExpanded(item)" class="h-3.5 w-3.5" />
                       <ChevronRight v-else class="h-3.5 w-3.5" />
                     </button>
-                    <span v-else-if="item.partitionParentId" class="ml-4 h-5 w-5 shrink-0" />
+                    <span v-else-if="item.partitionParentId" class="h-5 w-5 shrink-0" />
                     <component :is="iconFor(item)" class="h-3.5 w-3.5 shrink-0" :class="iconClass(item.type)" />
                     <span class="truncate text-[13px] font-medium text-foreground" :title="item.displayName">{{ item.displayName }}</span>
                     <span v-if="item.partitionCount" class="shrink-0 rounded border bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium leading-none text-muted-foreground">
