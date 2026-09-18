@@ -8,6 +8,15 @@ use super::util::quote_ident;
 use crate::models::connection::DatabaseType;
 use crate::types::PgPartitionKind;
 
+/// Engines whose declarative-partition DDL has been verified. Only PostgreSQL
+/// and KingbaseES expose the same `pg_partitioned_table` catalog and
+/// `CREATE TABLE ... PARTITION OF` / `ATTACH` / `DETACH` syntax. openGauss-based
+/// engines (openGauss, Vastbase, GaussDB) use a different `pg_partition`
+/// catalog and are intentionally excluded until validated.
+fn supports_partition_ddl(database_type: Option<DatabaseType>) -> bool {
+    matches!(database_type, Some(DatabaseType::Postgres | DatabaseType::Kingbase))
+}
+
 /// Builds `CREATE TABLE ... PARTITION BY ...` for a table being created.
 ///
 /// Kept separate from `build_create_table_sql` so the widely-used plain builder
@@ -18,10 +27,10 @@ pub fn build_create_partitioned_table_sql(
     definition: TablePartitionDefinition,
 ) -> TableStructureSqlResult {
     let dialect = capabilities_for(options.database_type, options.driver_profile.as_deref()).dialect;
-    if dialect != StructureDialect::Postgres || options.database_type != Some(DatabaseType::Postgres) {
+    if dialect != StructureDialect::Postgres || !supports_partition_ddl(options.database_type) {
         return TableStructureSqlResult {
             statements: Vec::new(),
-            warnings: vec!["Partitioning is only supported for PostgreSQL.".to_string()],
+            warnings: vec!["Partitioning is not supported for this database engine.".to_string()],
         };
     }
     let mut warnings = Vec::new();
@@ -72,10 +81,10 @@ pub fn build_table_partition_operation_sql(options: TablePartitionSqlOptions) ->
         return TableStructureSqlResult { statements: Vec::new(), warnings: Vec::new() };
     }
     let dialect = capabilities_for(options.database_type, options.driver_profile.as_deref()).dialect;
-    if dialect != StructureDialect::Postgres || options.database_type != Some(DatabaseType::Postgres) {
+    if dialect != StructureDialect::Postgres || !supports_partition_ddl(options.database_type) {
         return TableStructureSqlResult {
             statements: Vec::new(),
-            warnings: vec!["Partition operations are only supported for PostgreSQL.".to_string()],
+            warnings: vec!["Partition operations are not supported for this database engine.".to_string()],
         };
     }
 

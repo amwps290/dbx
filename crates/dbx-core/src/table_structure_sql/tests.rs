@@ -8614,7 +8614,27 @@ fn partition_operations_are_refused_for_non_postgres() {
     ));
 
     assert!(result.statements.is_empty());
-    assert_eq!(result.warnings, vec!["Partition operations are only supported for PostgreSQL.".to_string()]);
+    assert_eq!(result.warnings, vec!["Partition operations are not supported for this database engine.".to_string()]);
+}
+
+#[test]
+fn partition_operations_are_supported_for_kingbase() {
+    let result = build_table_partition_operation_sql(partition_options(
+        DatabaseType::Kingbase,
+        Some("public"),
+        "sales",
+        vec![partition_operation(
+            TablePartitionOperationKind::Create,
+            "sales_2025",
+            Some(TablePartitionBoundDraft::Default),
+        )],
+    ));
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(
+        result.statements,
+        vec!["CREATE TABLE \"public\".\"sales_2025\" PARTITION OF \"public\".\"sales\" DEFAULT;"]
+    );
 }
 
 #[test]
@@ -8776,5 +8796,21 @@ fn create_partitioned_table_requires_a_key_and_postgres() {
         },
     );
     assert!(mysql.statements.is_empty());
-    assert_eq!(mysql.warnings, vec!["Partitioning is only supported for PostgreSQL.".to_string()]);
+    assert_eq!(mysql.warnings, vec!["Partitioning is not supported for this database engine.".to_string()]);
+}
+
+#[test]
+fn create_partitioned_table_is_supported_for_kingbase() {
+    let options = structure_change_options(DatabaseType::Kingbase, Some("public"), "events", vec![column("region")]);
+    let result = build_create_partitioned_table_sql(
+        options,
+        TablePartitionDefinition {
+            kind: PgPartitionKind::List,
+            columns: vec!["region".to_string()],
+            expression: String::new(),
+        },
+    );
+
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].ends_with(") PARTITION BY LIST (\"region\");"), "{}", result.statements[0]);
 }

@@ -30,8 +30,10 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
   oracle: {
     constraints: true,
   },
+  // KingbaseES V9 shares PostgreSQL's declarative partition catalog and DDL.
   kingbase: {
     constraints: true,
+    partitions: true,
   },
   vastbase: {
     constraints: true,

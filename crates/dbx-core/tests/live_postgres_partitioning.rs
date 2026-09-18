@@ -1,3 +1,10 @@
+//! Live declarative-partitioning tests.
+//!
+//! Point `DBX_LIVE_POSTGRES_*` at a PostgreSQL server, or at a KingbaseES
+//! server (same wire protocol and `pg_partitioned_table` catalog) — all tests
+//! pass against KingbaseES V009R001C010. openGauss-based engines use a
+//! different `pg_partition` catalog and are not covered here.
+
 use std::time::Duration;
 
 use dbx_core::db::postgres;
@@ -85,10 +92,18 @@ async fn live_postgres_partitioning_is_structured() {
     assert_eq!(sales.partitions.len(), 2);
     let sales_2024 = sales.partitions.iter().find(|node| node.name == "sales_2024").expect("sales_2024 present");
     assert!(sales_2024.is_leaf);
-    assert_eq!(
-        sales_2024.bound,
-        Some(PgPartitionBound::Range { from: vec!["'2024-01-01'".to_string()], to: vec!["'2025-01-01'".to_string()] })
-    );
+    // The literal text is whatever the server renders: PostgreSQL 14 emits
+    // `'2024-01-01'`, KingbaseES emits `'2024-01-01 00:00:00'`. Assert the shape
+    // and the date prefix instead of an exact string so both pass.
+    match sales_2024.bound.as_ref() {
+        Some(PgPartitionBound::Range { from, to }) => {
+            assert_eq!(from.len(), 1);
+            assert_eq!(to.len(), 1);
+            assert!(from[0].starts_with("'2024-01-01"), "unexpected from: {from:?}");
+            assert!(to[0].starts_with("'2025-01-01"), "unexpected to: {to:?}");
+        }
+        other => panic!("expected a range bound, got {other:?}"),
+    }
 
     // LIST.
     let events = postgres::get_table_partitioning(&pool, &schema, "events").await.expect("read events partitioning");

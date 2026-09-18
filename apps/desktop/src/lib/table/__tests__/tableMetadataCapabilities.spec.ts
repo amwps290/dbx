@@ -26,8 +26,13 @@ describe("tableMetadataCapabilities", () => {
 
   it("exposes partitions only for dialects with declarative partitioning metadata", () => {
     expect(getTableMetadataCapabilities("postgres").partitions).toBe(true);
+    expect(getTableMetadataCapabilities("kingbase").partitions).toBe(true);
     expect(getTableMetadataCapabilities("mysql").partitions).toBe(false);
     expect(getTableMetadataCapabilities("oracle").partitions).toBe(false);
+    // openGauss-based engines use a different partition catalog and stay off.
+    expect(getTableMetadataCapabilities("opengauss").partitions).toBe(false);
+    expect(getTableMetadataCapabilities("vastbase").partitions).toBe(false);
+    expect(getTableMetadataCapabilities("gaussdb").partitions).toBe(false);
     expect(getTableMetadataCapabilities(undefined).partitions).toBe(false);
   });
 
