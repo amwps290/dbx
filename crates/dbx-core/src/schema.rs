@@ -7860,6 +7860,27 @@ pub async fn table_partition_status_core(
     .await
 }
 
+/// Structured PostgreSQL partitioning view used by the table structure
+/// editor's "Partitions" tab. Non-PostgreSQL pools return the default
+/// (all-false/empty) value so the tab simply renders as unsupported.
+pub async fn get_table_partitioning_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<db::PgTablePartitioning, String> {
+    retry_metadata_connection(state, connection_id, Some(database), || async {
+        let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::Postgres(pool)) => db::postgres::get_table_partitioning(pool, schema, table).await,
+            _ => Ok(db::PgTablePartitioning::default()),
+        }
+    })
+    .await
+}
+
 /// Same-table index names whose `pg_index.indisvalid` is `false` (left behind
 /// by a cancelled `CREATE INDEX CONCURRENTLY`). Empty for non-PostgreSQL pools.
 pub async fn list_invalid_indexes_core(

@@ -2104,6 +2104,15 @@ export async function getTablePartitionStatus(connectionId: string, database: st
   });
 }
 
+export async function getTablePartitioning(connectionId: string, database: string, schema: string, table: string): Promise<import("@/types/database").PgTablePartitioning> {
+  return invoke("get_table_partitioning", {
+    connectionId,
+    database,
+    schema,
+    table,
+  });
+}
+
 export async function listInvalidIndexes(connectionId: string, database: string, schema: string, table: string): Promise<string[]> {
   return invoke("list_invalid_indexes", {
     connectionId,

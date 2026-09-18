@@ -6,6 +6,7 @@ export interface TableMetadataCapabilities {
   foreignKeys: boolean;
   constraints: boolean;
   triggers: boolean;
+  partitions: boolean;
   ddl: boolean;
 }
 
@@ -19,6 +20,9 @@ const defaultCapabilities: TableMetadataCapabilities = {
   // empty tab.
   constraints: false,
   triggers: true,
+  // Declarative partitioning metadata (pg_partitioned_table / pg_get_partkeydef)
+  // is PostgreSQL-only for now; other dialects leave the tab hidden.
+  partitions: false,
   ddl: true,
 };
 
@@ -39,6 +43,7 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
   // EXCLUDE/NOT NULL) through list_constraints.
   postgres: {
     constraints: true,
+    partitions: true,
   },
   mongodb: {
     columns: false,
@@ -150,6 +155,7 @@ export function isStructureMetadataTabSupported(tab: TableInfoTab, capabilities:
     (tab === "foreignKeys" && capabilities.foreignKeys) ||
     (tab === "constraints" && capabilities.constraints) ||
     (tab === "triggers" && capabilities.triggers) ||
+    (tab === "partitions" && capabilities.partitions && !isCreateMode) ||
     (tab === "ddl" && capabilities.ddl && !isCreateMode)
   );
 }

@@ -216,6 +216,7 @@ export const listTriggers = forward("listTriggers");
 export const listConstraints = forward("listConstraints");
 export const listPartitions = forward("listPartitions");
 export const getTablePartitionStatus = forward("getTablePartitionStatus");
+export const getTablePartitioning = forward("getTablePartitioning");
 export const listInvalidIndexes = forward("listInvalidIndexes");
 export const listSubpartitions = forward("listSubpartitions");
 export const getTableDdl = forward("getTableDdl");

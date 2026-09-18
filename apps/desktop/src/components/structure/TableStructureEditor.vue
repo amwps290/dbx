@@ -49,6 +49,8 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
+import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText } from "@/lib/table/pgPartitionPresentation";
+import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
 import { getConcurrentIndexAvailability, concurrentIndexNamesInStatements, normalizeUnsupportedConcurrentIndexes, type ConcurrentIndexAvailability } from "@/lib/table/concurrentIndexAvailability";
@@ -56,7 +58,7 @@ import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataG
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
 import { codeMirrorSqlDialectForConnection, connectionObjectTreeQuerySchema, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { postgresListRolesSql, usersFromPostgresRolesResult } from "@/lib/database/databaseUserAdmin";
-import type { ColumnInfo, ConstraintInfo, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
+import type { ColumnInfo, ConstraintInfo, PgPartitionKind, PgTablePartitioning, TableInfo, TableInfoTab, TableStructureEditorDraft, TableStructureEditorTarget, TableStructureEditorViewport } from "@/types/database";
 import {
   applyManticoreDdlColumnExtras,
   buildStructureTargetLabel,
@@ -126,6 +128,7 @@ const indexesScrollerRef = ref<StructureScrollerRef>();
 const foreignKeysScrollerRef = ref<StructureScrollerRef>();
 const constraintsScrollerRef = ref<StructureScrollerRef>();
 const triggersScrollerRef = ref<StructureScrollerRef>();
+const partitionsScrollerRef = ref<StructureScrollerRef>();
 const ddlScrollerRef = ref<StructureScrollerRef>();
 const structureHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
 const structureHorizontalScrollbarThumbRef = ref<HTMLDivElement>();
@@ -411,6 +414,18 @@ const sqliteSchemaRevision = ref<string>();
 const foreignKeys = ref<EditableStructureForeignKey[]>([]);
 const constraints = ref<ConstraintInfo[]>([]);
 const constraintsLoaded = ref(false);
+// Structured PostgreSQL partitioning view (partitioned parent, its descendant
+// partitions, or a member partition's parent/bound). Read-only for now.
+const partitioning = ref<PgTablePartitioning | null>(null);
+const partitionsLoading = ref(false);
+const partitionsError = ref("");
+
+const partitionTreeRows = computed(() => flattenPgPartitionNodes(partitioning.value?.partitions ?? []));
+
+function partitionStrategyLabel(kind?: PgPartitionKind): string {
+  const key = pgPartitionKindLabelKey(kind);
+  return key ? t(key) : "";
+}
 // The Constraints tab hides foreign keys when the dedicated Foreign Keys tab
 // is also shown, mirroring DataGrid/ObjectBrowser.
 const constraintsForTab = computed(() => constraintsForConstraintsTab(constraints.value, tableMetadataCapabilities.value.foreignKeys));
@@ -445,7 +460,7 @@ watch(
 function selectTrigger(trigger: EditableStructureTrigger) {
   selectedTriggerId.value = trigger.id;
 }
-const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value);
+const secondaryMetadataLoading = computed(() => indexesLoading.value || foreignKeysLoading.value || constraintsLoading.value || triggersLoading.value || partitionsLoading.value);
 
 function sameList(left: string[] | null | undefined, right: string[] | null | undefined): boolean {
   const a = left ?? [];
@@ -519,6 +534,9 @@ function captureStructureRefreshScope(): TableStructureRefreshScope {
     // so refresh the tab if it was ever loaded rather than leaving it stale.
     constraints: constraintsLoaded.value,
     triggers: triggers.value.some(triggerChanged),
+    // Read-only tab with no editable draft; refresh it whenever it was loaded
+    // so a save that rebuilds partitions can't leave stale rows behind.
+    partitions: loadedMetadataFacets.has("partitions"),
     tableComment: tableComment.value !== originalTableComment.value,
   };
 }
@@ -1258,6 +1276,7 @@ function structureScrollerForTab(tab: TableInfoTab): HTMLElement | undefined {
   if (tab === "foreignKeys") return structureScrollerElement(foreignKeysScrollerRef.value);
   if (tab === "constraints") return structureScrollerElement(constraintsScrollerRef.value);
   if (tab === "triggers") return structureScrollerElement(triggersScrollerRef.value);
+  if (tab === "partitions") return structureScrollerElement(partitionsScrollerRef.value);
   if (tab === "ddl") return structureScrollerElement(ddlScrollerRef.value);
   return undefined;
 }
@@ -1833,6 +1852,8 @@ function resetState() {
   foreignKeysLoading.value = false;
   constraintsLoading.value = false;
   triggersLoading.value = false;
+  partitionsLoading.value = false;
+  partitionsError.value = "";
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
   isPartitionedParent.value = false;
@@ -1846,6 +1867,7 @@ function resetState() {
   foreignKeys.value = [];
   constraints.value = [];
   constraintsLoaded.value = false;
+  partitioning.value = null;
   triggers.value = [];
   triggersLoaded.value = false;
   clearColumnSelection();
@@ -1897,6 +1919,9 @@ async function reloadStructureFromDatabase() {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+  }
   const refreshDdl = activeTab.value === "ddl";
   const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };
   invalidateTableMetadataCache(metadataMatch);
@@ -1919,6 +1944,7 @@ function setSecondaryMetadataLoading(scope: TableStructureRefreshScope, value: b
   if (scope.foreignKeys && tableMetadataCapabilities.value.foreignKeys) foreignKeysLoading.value = value;
   if (scope.constraints && tableMetadataCapabilities.value.constraints) constraintsLoading.value = value;
   if (scope.triggers && tableMetadataCapabilities.value.triggers) triggersLoading.value = value;
+  if (scope.partitions && tableMetadataCapabilities.value.partitions) partitionsLoading.value = value;
 }
 
 function withRequiredPostgresPrimaryKeyMetadata(scope: TableStructureRefreshScope): TableStructureRefreshScope {
@@ -2114,6 +2140,7 @@ async function loadStructure(
   setSecondaryMetadataLoading(effectiveScope, true);
   errorMessage.value = "";
   secondaryMetadataErrors.value = {};
+  partitionsError.value = "";
   let secondaryMetadataScheduled = false;
   let loadedSuccessfully = false;
   let columnsServedFromCache = false;
@@ -2163,6 +2190,9 @@ async function loadStructure(
         ? loadObjectMetadataFacet(metadataRequest, "triggers", () => api.listTriggers(connectionId, database, schema, tableName, catalog), { force: forceMetadata }).then((result) => result.value)
         : Promise.resolve([])
       : Promise.resolve(undefined);
+    // Partition metadata is a live catalog read (not persisted), so it is
+    // fetched directly rather than through the object metadata cache.
+    const partitioningPromise = effectiveScope.partitions ? (tableMetadataCapabilities.value.partitions ? api.getTablePartitioning(connectionId, database, schema, tableName) : Promise.resolve(undefined)) : Promise.resolve(undefined);
     const tableCommentLoad = effectiveScope.tableComment && structureCapabilities.value.comment ? loadCachedTableComment(metadataRequest, forceMetadata) : undefined;
     const tableCommentPromise = tableCommentLoad
       ? tableCommentLoad.then((result) => {
@@ -2220,7 +2250,7 @@ async function loadStructure(
       }
     }
     const applySecondaryMetadata = async () => {
-      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise]);
+      const [indexesResult, foreignKeysResult, constraintsResult, triggersResult, partitioningResult] = await Promise.allSettled([indexesPromise, foreignKeysPromise, constraintsPromise, triggersPromise, partitioningPromise]);
       if (requestId !== structureLoadRequestId) return;
 
       type SecondaryMetadataResult = { facet: ObjectMetadataFacet; result: PromiseSettledResult<unknown> };
@@ -2261,6 +2291,17 @@ async function loadStructure(
         triggers.value = createTriggerDrafts(nextTriggers);
         triggersLoaded.value = true;
         loadedMetadataFacets.add("triggers");
+      }
+      if (partitioningResult.status === "fulfilled" && partitioningResult.value !== undefined) {
+        partitioning.value = partitioningResult.value;
+        loadedMetadataFacets.add("partitions");
+      } else if (partitioningResult.status === "rejected") {
+        console.warn("[DBX][structure-editor:partitions-metadata-failed]", partitioningResult.reason);
+        if (showErrors) partitionsError.value = partitioningResult.reason?.message || String(partitioningResult.reason);
+        // Mark the facet loaded even on failure: the tab-activation watcher
+        // only refetches unloaded facets, so leaving it unloaded would retry in
+        // a loop. The toolbar Refresh clears the facet and retries explicitly.
+        loadedMetadataFacets.add("partitions");
       }
     };
 
@@ -3729,7 +3770,7 @@ async function applyChanges() {
   // A hand-written DDL script can change anything about the table, and the
   // structure draft it was applied from is clean, so the change-derived scope
   // would be empty: reload every facet instead of leaving the tabs stale.
-  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, tableComment: true } : captureStructureRefreshScope();
+  const refreshScope = ddlDirty.value ? { columns: true, indexes: true, foreignKeys: true, constraints: true, triggers: true, partitions: true, tableComment: true } : captureStructureRefreshScope();
   // Plan A guard: concurrent builds only run with a long-enough query timeout
   // (a cancelled build leaves an INVALID index behind), and are blocked
   // up-front when a same-name INVALID index already exists.
@@ -4187,6 +4228,10 @@ watch(refreshVersion, (version, previous) => {
     constraints.value = [];
     constraintsLoaded.value = false;
   }
+  if (activeTab.value !== "partitions") {
+    partitioning.value = null;
+    loadedMetadataFacets.delete("partitions");
+  }
   void loadStructure(true, visibleTableStructureRefreshScope(activeTab.value));
 });
 
@@ -4338,6 +4383,7 @@ watch(
               <TabsTrigger v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys">{{ t("structureEditor.foreignKeys") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.constraints" value="constraints">{{ t("structureEditor.constraints") }}</TabsTrigger>
               <TabsTrigger v-if="tableMetadataCapabilities.triggers" value="triggers">{{ t("structureEditor.triggers") }}</TabsTrigger>
+              <TabsTrigger v-if="tableMetadataCapabilities.partitions" value="partitions">{{ t("structureEditor.partitions") }}</TabsTrigger>
             </TabsList>
             <div class="flex shrink-0 items-center gap-1.5">
               <div class="flex items-center gap-1.5">
@@ -5182,6 +5228,46 @@ watch(
                   :placeholder="t('structureEditor.triggerStatement')"
                   :disabled="!canEditTriggerDraft(selectedTrigger)"
                 />
+              </div>
+            </div>
+          </TabsContent>
+
+          <TabsContent ref="partitionsScrollerRef" v-if="tableMetadataCapabilities.partitions" value="partitions" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
+            <div v-if="partitionsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
+              <Loader2 class="h-4 w-4 animate-spin" />
+              {{ t("common.loading") }}
+            </div>
+            <div v-else-if="partitionsError" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              {{ partitionsError }}
+            </div>
+            <div v-else-if="!partitioning || (!partitioning.isPartitioned && !partitioning.isPartition)" class="py-10 text-center text-muted-foreground">
+              {{ t("structureEditor.partitionsEmpty") }}
+            </div>
+            <div v-else class="space-y-2">
+              <div class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <Badge v-if="partitioning.isPartitioned" variant="outline">{{ partitionStrategyLabel(partitioning.strategy) }}</Badge>
+                  <Badge v-else variant="outline">{{ t("structureEditor.partitionMemberBadge") }}</Badge>
+                  <span v-if="partitioning.keyDefinition" class="truncate font-mono">{{ partitioning.keyDefinition }}</span>
+                </div>
+                <div v-if="partitioning.parent" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsParent") }}: {{ partitioning.parent }}</div>
+                <div v-if="partitioning.ownBound" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsOwnBound") }}: {{ pgPartitionBoundText(partitioning.ownBound) }}</div>
+                <div v-if="partitioning.defaultPartition" class="mt-1 truncate font-mono text-muted-foreground">{{ t("structureEditor.partitionsDefault") }}: {{ partitioning.defaultPartition }}</div>
+              </div>
+              <div v-if="partitionTreeRows.length === 0" class="py-10 text-center text-muted-foreground">
+                {{ t("structureEditor.partitionsEmptyChildren") }}
+              </div>
+              <div v-for="row in partitionTreeRows" :key="row.key" class="rounded-md border px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)]">
+                <div class="flex flex-wrap items-center gap-1.5" :style="{ paddingLeft: `${row.depth * 16}px` }">
+                  <span class="font-mono font-medium">{{ row.node.name }}</span>
+                  <Badge v-if="row.node.strategy" variant="outline">{{ partitionStrategyLabel(row.node.strategy) }}</Badge>
+                  <Badge v-if="row.node.bound?.kind === 'default'" variant="outline" class="text-muted-foreground">{{ t("structureEditor.partitionBoundDefault") }}</Badge>
+                </div>
+                <div v-if="pgPartitionNodeBoundText(row.node)" class="mt-1 truncate font-mono text-muted-foreground">{{ pgPartitionNodeBoundText(row.node) }}</div>
+                <div v-if="row.node.rowEstimate != null || row.node.totalBytes != null" class="mt-1 flex flex-wrap gap-3 text-muted-foreground">
+                  <span v-if="row.node.rowEstimate != null">{{ t("structureEditor.partitionsRowEstimate", { count: row.node.rowEstimate }) }}</span>
+                  <span v-if="row.node.totalBytes != null">{{ t("structureEditor.partitionsSize", { size: formatBytes(row.node.totalBytes) }) }}</span>
+                </div>
               </div>
             </div>
           </TabsContent>
