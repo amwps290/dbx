@@ -81,23 +81,19 @@ describe("TablePartitionsPanel", () => {
     expect(hinted?.getAttribute("title")).toContain("structureEditor.partitionsSize");
   });
 
-  it("draws nesting with CSS guide cells and a sub-partition badge", async () => {
+  it("indents sub-partitions and labels them, with no guide lines at all", async () => {
     const root = await mount({ partitioning: partitioned, loading: false, error: "" });
     const text = root.textContent ?? "";
 
-    // No character-art tree any more: guides are drawn as bordered cells.
     expect(text).not.toContain("├─");
     expect(text).not.toContain("└─");
-    const ancestors = root.querySelectorAll('[data-partition-guide="ancestor"]');
-    expect(ancestors).toHaveLength(1);
-    // sales_nested_cn's parent (sales_nested) is the last top-level partition, so
-    // no vertical line continues under it — a plain indent, not a stray `│`.
-    expect(ancestors[0].getAttribute("data-continues")).toBe("false");
-    const branches = root.querySelectorAll('[data-partition-guide="branch"]');
-    expect(branches).toHaveLength(3);
-    // sales_2024 and sales_nested have a later sibling; sales_nested_cn is last.
-    expect(Array.from(branches).map((cell) => cell.getAttribute("data-last"))).toEqual(["false", "true", "true"]);
-    // Depth > 0 rows are labelled as sub-partitions.
+    expect(root.querySelectorAll("[data-partition-guide]")).toHaveLength(0);
+
+    // One indent spacer per row: 0 for top-level rows, 16px for a sub-partition.
+    const indents = Array.from(root.querySelectorAll<HTMLElement>("[data-partition-depth]"));
+    expect(indents.map((cell) => cell.dataset.partitionDepth)).toEqual(["0", "0", "1"]);
+    expect(indents.map((cell) => cell.style.width)).toEqual(["0px", "0px", "16px"]);
+
     expect(text).toContain("structureEditor.partitionSubPartitionBadge");
   });
 

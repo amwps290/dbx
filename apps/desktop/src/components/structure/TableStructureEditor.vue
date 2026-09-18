@@ -59,8 +59,7 @@ import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/po
 import { getSqliteDataTypeHelp } from "@/lib/table/sqliteDataTypeHelp";
 import { getTableMetadataCapabilities, firstStructureMetadataTab, isStructureMetadataTabSupported } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
-import PartitionTreeGuides from "@/components/structure/PartitionTreeGuides.vue";
+import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, splitPgPartitionBoundValues, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
@@ -5702,8 +5701,8 @@ watch(
                   {{ t("structureEditor.partitionsEmptyChildren") }}
                 </div>
                 <div v-if="partitionTreeRows.length > 0" class="divide-y overflow-hidden rounded-md border">
-                  <div v-for="row in partitionVisibleRows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-stretch gap-1 px-[var(--structure-cell-px)] py-1.5 text-[length:var(--structure-font-size)]">
-                    <PartitionTreeGuides :row="row" />
+                  <div v-for="row in partitionVisibleRows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-start gap-1 px-[var(--structure-cell-px)] py-1.5 text-[length:var(--structure-font-size)]">
+                    <span :data-partition-depth="row.depth" :style="{ width: `${row.depth * PARTITION_TREE_INDENT_PX}px` }" class="shrink-0 self-stretch" aria-hidden="true"></span>
                     <button
                       v-if="row.node.children.length"
                       type="button"

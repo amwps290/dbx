@@ -2,8 +2,7 @@
 import { computed, ref, watch } from "vue";
 import { ChevronDown, ChevronRight, Loader2 } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
-import PartitionTreeGuides from "@/components/structure/PartitionTreeGuides.vue";
-import { flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
+import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText, pgPartitionKindLabelKey, pgPartitionNodeBoundText, pgPartitionRowHint, visiblePgPartitionRows } from "@/lib/table/pgPartitionPresentation";
 import { formatBytes } from "@/lib/database/serverMetrics";
 import type { PgPartitionKind, PgPartitionNode, PgTablePartitioning } from "@/types/database";
 
@@ -84,8 +83,8 @@ const rows = computed(() => {
       <div v-if="rows.length === 0" class="p-6 text-center text-xs text-muted-foreground">
         {{ props.searchQuery ? t("grid.tableInfoNoResults") : t("structureEditor.partitionsEmptyChildren") }}
       </div>
-      <div v-for="row in rows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-stretch gap-1 px-3 py-2 text-xs">
-        <PartitionTreeGuides :row="row" />
+      <div v-for="row in rows" :key="row.key" :title="partitionRowHint(row.node)" class="flex items-start gap-1 px-3 py-2 text-xs">
+        <span :data-partition-depth="row.depth" :style="{ width: `${row.depth * PARTITION_TREE_INDENT_PX}px` }" class="shrink-0 self-stretch" aria-hidden="true"></span>
         <button
           v-if="row.node.children.length"
           type="button"

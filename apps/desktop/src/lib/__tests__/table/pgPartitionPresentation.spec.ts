@@ -19,27 +19,14 @@ describe("pgPartitionPresentation", () => {
     expect(new Set(rows.map((row) => row.key)).size).toBe(rows.length);
   });
 
-  it("records the guide flags a tree renderer needs", () => {
-    // Two top-level partitions, the first with two children.
-    const tree = [node("p1", [node("p1a"), node("p1b")]), node("p2")];
-    const rows = flattenPgPartitionNodes(tree);
-
-    expect(rows.map((row) => [row.node.name, row.depth, row.isLastChild, row.ancestorGuides])).toEqual([
-      ["p1", 0, false, []],
-      ["p1a", 1, false, [true]],
-      ["p1b", 1, true, [true]],
-      ["p2", 0, true, []],
-    ]);
-  });
-
-  it("tracks the ancestor key chain used to fold a parent", () => {
+  it("tracks depth and the ancestor key chain used to fold and indent a parent", () => {
     const rows = flattenPgPartitionNodes([node("p1", [node("p1a", [node("p1a1")])]), node("p2")]);
 
-    expect(rows.map((row) => [row.node.name, row.ancestorKeys])).toEqual([
-      ["p1", []],
-      ["p1a", ["public.p1"]],
-      ["p1a1", ["public.p1", "public.p1/public.p1a"]],
-      ["p2", []],
+    expect(rows.map((row) => [row.node.name, row.depth, row.ancestorKeys])).toEqual([
+      ["p1", 0, []],
+      ["p1a", 1, ["public.p1"]],
+      ["p1a1", 2, ["public.p1", "public.p1/public.p1a"]],
+      ["p2", 0, []],
     ]);
   });
 

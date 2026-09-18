@@ -1,40 +1,34 @@
 import type { PgPartitionBound, PgPartitionKind, PgPartitionNode } from "@/types/database";
 
-/** One flattened row of a partition tree, carrying what a tree renderer needs. */
+/** One flattened row of a partition tree, carrying what a renderer needs. */
 export interface PgPartitionTreeRow {
   key: string;
   /** 0 for a top-level partition of the table; +1 per nesting level. */
   depth: number;
   node: PgPartitionNode;
-  /**
-   * One flag per ancestor level above this row: `true` means that ancestor has
-   * a later sibling, so a vertical guide line must continue through this row.
-   * Length equals `depth`.
-   */
-  ancestorGuides: boolean[];
-  /** This row is the last child of its parent (`└─` instead of `├─`). */
-  isLastChild: boolean;
   /** Keys of every ancestor above this row, outermost first (for collapse). */
   ancestorKeys: string[];
 }
 
 /**
- * Depth-first flatten of a partition tree so a renderer can draw multi-level
- * hierarchies without recursive components, keeping the guide flags needed to
- * show nesting clearly (a plain indent is too subtle for deep sub-partitions).
+ * Depth-first flatten of a partition tree so a renderer can show multi-level
+ * hierarchies without recursive components. Nesting is conveyed by indentation
+ * and the fold control; no tree guide lines are drawn.
  */
-export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorGuides: boolean[] = [], ancestorKeys: string[] = []): PgPartitionTreeRow[] {
+export function flattenPgPartitionNodes(nodes: PgPartitionNode[], depth = 0, keyPrefix = "", ancestorKeys: string[] = []): PgPartitionTreeRow[] {
   const rows: PgPartitionTreeRow[] = [];
-  nodes.forEach((node, index) => {
-    const isLastChild = index === nodes.length - 1;
+  for (const node of nodes) {
     const key = `${keyPrefix}${node.schema}.${node.name}`;
-    rows.push({ key, depth, node, ancestorGuides: [...ancestorGuides], isLastChild, ancestorKeys: [...ancestorKeys] });
+    rows.push({ key, depth, node, ancestorKeys: [...ancestorKeys] });
     if (node.children.length > 0) {
-      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorGuides, !isLastChild], [...ancestorKeys, key]));
+      rows.push(...flattenPgPartitionNodes(node.children, depth + 1, `${key}/`, [...ancestorKeys, key]));
     }
-  });
+  }
   return rows;
 }
+
+/** Pixels of indentation added per nesting level. */
+export const PARTITION_TREE_INDENT_PX = 16;
 
 /**
  * Drops rows hidden behind a collapsed ancestor, so a renderer can show a
