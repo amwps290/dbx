@@ -364,6 +364,12 @@ async function settle() {
   }
 }
 
+function buttonWithText(root: HTMLElement, text: string): HTMLButtonElement {
+  const button = Array.from(root.querySelectorAll("button")).find((item) => item.textContent?.includes(text));
+  if (!button) throw new Error(`Missing ${text} button`);
+  return button as HTMLButtonElement;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.ensureConnected.mockResolvedValue(undefined);
@@ -597,5 +603,40 @@ describe("TableStructureEditor partitions tab", () => {
 
     await settle();
     expect(root.textContent ?? "").toContain("permission denied");
+  });
+
+  it("applies pending partition operations inside a single transaction", async () => {
+    const operation = {
+      id: "op:1",
+      kind: "create",
+      parentSchema: "",
+      parentTable: "",
+      schema: "",
+      name: "sales_2025",
+      bound: { kind: "default" },
+      concurrently: false,
+    };
+    mocks.buildTablePartitionOperationSql.mockResolvedValue({
+      statements: ['CREATE TABLE "public"."sales_2025" PARTITION OF "public"."sales" DEFAULT;'],
+      warnings: [],
+    });
+
+    const root = await mountStructureEditor({
+      initialTab: "partitions",
+      initialTabRequestId: 1,
+      draft: structureDraft({ activeTab: "partitions", partitionOperations: [operation] }),
+    });
+    await vi.waitFor(() => expect(mocks.buildTablePartitionOperationSql).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    await vi.waitFor(() => expect(buttonWithText(root, "structureEditor.apply").disabled).toBe(false), { timeout: 3000 });
+    buttonWithText(root, "structureEditor.apply").click();
+    await vi.waitFor(() => expect(mocks.executeBatch).toHaveBeenCalledTimes(1), { timeout: 3000 });
+
+    // A failure must not leave a half-created hierarchy behind, so the batch is
+    // sent as one transaction (6th argument).
+    const call = mocks.executeBatch.mock.calls[0];
+    expect(call[2]).toEqual(['CREATE TABLE "public"."sales_2025" PARTITION OF "public"."sales" DEFAULT;']);
+    expect(call[5]).toBe(true);
   });
 });

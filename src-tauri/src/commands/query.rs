@@ -345,9 +345,18 @@ pub async fn execute_batch(
     statements: Vec<String>,
     schema: Option<String>,
     timeout_secs: Option<u64>,
+    use_transaction: Option<bool>,
 ) -> Result<db::QueryResult, String> {
-    dbx_core::query::execute_statements(&state, &connection_id, &database, &statements, schema.as_deref(), timeout_secs)
-        .await
+    dbx_core::query::execute_statements_with_transaction_option(
+        &state,
+        &connection_id,
+        &database,
+        &statements,
+        schema.as_deref(),
+        use_transaction == Some(true),
+        timeout_secs,
+    )
+    .await
 }
 
 #[tauri::command]

@@ -4141,6 +4141,13 @@ async function applyChanges() {
   // (a cancelled build leaves an INVALID index behind), and are blocked
   // up-front when a same-name INVALID index already exists.
   const hasConcurrentIndexBuild = pendingStatements.value.some((statement) => statement.includes("CONCURRENTLY"));
+  // Partition DDL (create parent + initial partitions, attach/detach/drop
+  // chains, ...) must land atomically: a mid-batch failure would otherwise
+  // leave a half-created hierarchy behind. CONCURRENTLY statements cannot run
+  // inside a transaction block, so their presence keeps the batch on the
+  // auto-commit path (the core also refuses that combination).
+  const partitionDdlPending = partitionOperations.value.length > 0 || (isCreateMode.value && createPartitioningEnabled.value);
+  const useTransaction = !hasConcurrentIndexBuild && partitionDdlPending;
   if (hasConcurrentIndexBuild && !isCreateMode.value && databaseType.value === "postgres" && props.tableName) {
     const concurrentIndexNames = concurrentIndexNamesInStatements(pendingStatements.value);
     if (concurrentIndexNames.length > 0) {
@@ -4178,7 +4185,7 @@ async function applyChanges() {
     const result =
       hasSqliteTypeChange.value && !ddlDirty.value
         ? await api.applySqliteTableStructureChange(props.connectionId, props.database, structureChangeOptions(), sqliteSchemaRevision.value!)
-        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs);
+        : await api.executeBatch(props.connectionId, props.database, pendingStatements.value, props.schema, executionTimeoutSecs, useTransaction);
     await recordStructureHistory(sql, startedAt, true, result);
     if (!isCreateMode.value && props.tableName) {
       const metadataMatch = { connectionId: props.connectionId, database: props.database, schema: metadataSchema.value, tableName: props.tableName };

@@ -4212,6 +4212,64 @@ pub async fn execute_statements(
     result
 }
 
+/// Execute a batch, optionally on a single transaction.
+///
+/// `use_transaction` is opt-in and only the structure editor sets it, for
+/// batches that change a partition hierarchy: a mid-batch failure there would
+/// otherwise leave a half-created hierarchy behind. The shared transaction
+/// kernel rejects backends whose DDL cannot roll back, and statements that
+/// cannot run inside a transaction block (`... CONCURRENTLY`) are refused up
+/// front rather than half-applied.
+pub async fn execute_statements_with_transaction_option(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    statements: &[String],
+    schema: Option<&str>,
+    use_transaction: bool,
+    timeout_secs: Option<u64>,
+) -> Result<db::QueryResult, String> {
+    if use_transaction && statements.len() > 1 {
+        if batch_has_concurrently_statement(statements) {
+            return Err(
+                "use_transaction cannot wrap CONCURRENTLY statements: they cannot run inside a transaction block. Run the batch without use_transaction."
+                    .to_string(),
+            );
+        }
+        let db_type = connection_database_type(state, connection_id).await;
+        if batch_transaction_ddl_is_unrollbackable(db_type, statements) {
+            return Err(
+                "use_transaction cannot be used with a batch whose DDL cannot be rolled back: DDL statements implicitly commit and cannot be undone. Run the batch without use_transaction (auto-commit, one result per statement) or split the DDL and DML into separate calls."
+                    .to_string(),
+            );
+        }
+        let result = execute_statements_in_transaction_typed(
+            state,
+            connection_id,
+            database,
+            statements,
+            schema,
+            None,
+            timeout_secs,
+        )
+        .await
+        .map_err(|error| error.into_legacy_string())?;
+        let invalidate = statements.iter().any(|sql| crate::object_cache::sql_may_change_object_metadata(sql, db_type));
+        if invalidate {
+            crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
+        }
+        return Ok(result);
+    }
+    execute_statements(state, connection_id, database, statements, schema, timeout_secs).await
+}
+
+/// Whether a batch contains a statement PostgreSQL-family servers refuse to run
+/// inside a transaction block (`CREATE/DROP INDEX CONCURRENTLY`,
+/// `ALTER TABLE ... DETACH PARTITION CONCURRENTLY`, ...).
+fn batch_has_concurrently_statement(statements: &[String]) -> bool {
+    statements.iter().any(|statement| statement.to_ascii_uppercase().contains("CONCURRENTLY"))
+}
+
 async fn execute_statements_inner(
     state: &AppState,
     connection_id: &str,
@@ -8422,6 +8480,22 @@ for line in sys.stdin:
         assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Sqlite), &ddl));
         // An unknown db type cannot be verified — do not risk rejecting valid DDL batches.
         assert!(!batch_transaction_ddl_is_unrollbackable(None, &ddl));
+    }
+
+    #[test]
+    fn batch_has_concurrently_statement_detects_transaction_block_escapees() {
+        assert!(batch_has_concurrently_statement(&["CREATE INDEX CONCURRENTLY idx ON t (id)".to_string(),]));
+        assert!(batch_has_concurrently_statement(&[
+            "ALTER TABLE parent DETACH PARTITION child CONCURRENTLY".to_string(),
+        ]));
+        // Case-insensitive, and a single CONCURRENTLY anywhere in the batch is enough.
+        assert!(batch_has_concurrently_statement(&[
+            "ALTER TABLE t ADD COLUMN c int".to_string(),
+            "drop index concurrently idx".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (1)".to_string(),
+        ]));
     }
 
     #[tokio::test]

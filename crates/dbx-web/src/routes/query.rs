@@ -75,6 +75,9 @@ pub struct ExecuteBatchRequest {
     pub catalog: Option<String>,
     pub timeout_secs: Option<u64>,
     pub destructive_confirmed: Option<bool>,
+    /// Opt-in single transaction for the whole batch (see
+    /// [`dbx_core::query::execute_statements_with_transaction_option`]).
+    pub use_transaction: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -638,12 +641,13 @@ pub async fn execute_batch(
         super::mcp_policy::ensure_sql(&state, &headers, &req.connection_id, &database, statement, false).await?;
     }
     tracing::debug!(connection_id = %req.connection_id, "execute_batch");
-    let result = dbx_core::query::execute_statements(
+    let result = dbx_core::query::execute_statements_with_transaction_option(
         &state.app,
         &req.connection_id,
         &database,
         &req.statements,
         req.schema.as_deref(),
+        req.use_transaction == Some(true),
         req.timeout_secs,
     )
     .await
