@@ -1192,7 +1192,7 @@ func (s *server) getTablePartitioning(schema, table string) (pgTablePartitioning
 		return pgTablePartitioning{}, err
 	}
 	if len(relations) == 0 {
-		return pgTablePartitioning{}, nil
+		return emptyPgTablePartitioning(), nil
 	}
 	rootIndex := -1
 	for index, relation := range relations {
@@ -1202,11 +1202,11 @@ func (s *server) getTablePartitioning(schema, table string) (pgTablePartitioning
 		}
 	}
 	if rootIndex < 0 {
-		return pgTablePartitioning{}, nil
+		return emptyPgTablePartitioning(), nil
 	}
 	root := relations[rootIndex]
-	result := pgTablePartitioning{KeyColumns: []string{}, Partitions: []pgPartitionNode{}}
-	result.IsPartitioned = root.Relkind == "p" && root.KeyDefinition.Valid && strings.TrimSpace(root.KeyDefinition.String) != ""
+	result := emptyPgTablePartitioning()
+	result.IsPartitioned = root.Relkind == "p"
 	result.IsPartition = root.ParentOID.Valid
 	if root.ParentSchema.Valid && root.ParentName.Valid {
 		result.ParentSchema, result.ParentTable = root.ParentSchema.String, root.ParentName.String
@@ -1215,6 +1215,7 @@ func (s *server) getTablePartitioning(schema, table string) (pgTablePartitioning
 	if root.KeyDefinition.Valid {
 		result.KeyDefinition = root.KeyDefinition.String
 		result.Strategy = partitionKindFromKeyDefinition(root.KeyDefinition.String)
+		result.KeyColumns = partitionKeyColumns(root.KeyDefinition.String)
 	}
 	result.OwnBound = parseKingbasePartitionBound(root.Bound)
 	children := make(map[int64][]partitionRelation)
@@ -1300,7 +1301,7 @@ func buildPartitionTreeQuery(catalog, prefix, boundFunction, partKeyFunction, sc
 		recursivePredicate = "tree.relkind = 'p' AND NOT c.oid = ANY(tree.path)"
 	}
 
-	boundExpression := fmt.Sprintf("CASE WHEN t.relkind IN ('r','f') THEN %s(c.relpartbound, c.oid) ELSE NULL END", boundFunction)
+	boundExpression := fmt.Sprintf("%s(c.relpartbound, c.oid)", boundFunction)
 	partKeyExpression := "CAST(NULL AS text)"
 	if options.partitionKey {
 		partKeyExpression = fmt.Sprintf("CASE WHEN t.relkind = 'p' THEN %s(c.oid) ELSE NULL END", partKeyFunction)
@@ -1387,6 +1388,50 @@ WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','f')`,
 		return pgTablePartitionStatus{}, err
 	}
 	return pgTablePartitionStatus{IsPartitionedParent: relkind == "p", IsPartition: isPartition}, nil
+}
+
+func emptyPgTablePartitioning() pgTablePartitioning {
+	return pgTablePartitioning{KeyColumns: []string{}, Partitions: []pgPartitionNode{}}
+}
+
+func partitionKeyColumns(definition string) []string {
+	start := strings.Index(definition, "(")
+	if start < 0 {
+		return []string{}
+	}
+	body, _, ok := takeParenGroup(definition[start:])
+	if !ok {
+		return []string{}
+	}
+	columns := make([]string, 0)
+	for _, item := range splitTopLevelCommas(body) {
+		if column, ok := simplePartitionKeyColumn(item); ok {
+			columns = append(columns, column)
+		}
+	}
+	return columns
+}
+
+func simplePartitionKeyColumn(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		return strings.ReplaceAll(value[1:len(value)-1], "\"\"", "\""), true
+	}
+	if value == "" {
+		return "", false
+	}
+	for index, character := range value {
+		if index == 0 {
+			if character != '_' && !unicode.IsLetter(character) {
+				return "", false
+			}
+			continue
+		}
+		if character != '_' && character != '$' && !unicode.IsLetter(character) && !unicode.IsDigit(character) {
+			return "", false
+		}
+	}
+	return value, true
 }
 
 func partitionKindFromKeyDefinition(definition string) string {

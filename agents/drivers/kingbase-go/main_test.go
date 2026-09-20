@@ -2332,11 +2332,8 @@ func TestGetTablePartitioningFallsBackWithoutPartKeyFunction(t *testing.T) {
 	if len(queries) != 3 {
 		t.Fatalf("expected the key function to be dropped last, got %d queries", len(queries))
 	}
-	if partitioning.IsPartitioned {
-		t.Fatalf("key definition is unavailable without get_partkeydef: %#v", partitioning)
-	}
-	if len(partitioning.Partitions) != 1 || partitioning.Partitions[0].Bound == nil || partitioning.Partitions[0].Bound.Kind != "default" {
-		t.Fatalf("children must still load without the key function: %#v", partitioning.Partitions)
+	if !partitioning.IsPartitioned || len(partitioning.Partitions) != 1 || partitioning.Partitions[0].Bound == nil || partitioning.Partitions[0].Bound.Kind != "default" {
+		t.Fatalf("partition parent status or children were lost without the key function: %#v", partitioning)
 	}
 }
 
@@ -2450,6 +2447,25 @@ func TestGetTablePartitionStatusUsesLightweightQuery(t *testing.T) {
 				t.Fatalf("unexpected status: %#v", status)
 			}
 		})
+	}
+}
+
+func TestPartitionKeyColumnsExtractsSimpleColumnsAndSkipsExpressions(t *testing.T) {
+	if got := partitionKeyColumns("RANGE (tenant_id, measured_at)"); !reflect.DeepEqual(got, []string{"tenant_id", "measured_at"}) {
+		t.Fatalf("unexpected simple partition columns: %#v", got)
+	}
+	if got := partitionKeyColumns(`LIST ("region", lower(code), "display""name")`); !reflect.DeepEqual(got, []string{"region", `display"name`}) {
+		t.Fatalf("unexpected mixed partition columns: %#v", got)
+	}
+}
+
+func TestEmptyPartitioningUsesJSONArrays(t *testing.T) {
+	encoded, err := json.Marshal(emptyPgTablePartitioning())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), `"keyColumns":null`) || strings.Contains(string(encoded), `"partitions":null`) {
+		t.Fatalf("empty partitioning must serialize arrays, got %s", encoded)
 	}
 }
 
