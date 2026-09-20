@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2240,6 +2241,218 @@ func TestGetTablePartitioningBuildsKingbaseHierarchy(t *testing.T) {
 		t.Fatalf("unexpected partition nodes: %#v", partitioning.Partitions)
 	}
 }
+
+func TestGetTablePartitioningGuardsInheritanceAndCycles(t *testing.T) {
+	var captured string
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		captured = query
+		return &valueRows{
+			columns: []string{"oid", "schema_name", "table_name", "parent_oid", "parent_schema", "parent_name", "relkind", "partition_bound", "partition_key"},
+			rows:    [][]driver.Value{},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	if _, err := server.getTablePartitioning("public", "sales"); err != nil {
+		t.Fatal(err)
+	}
+	// Both the anchor and the recursive edge must be scoped to declarative
+	// partitions so a legacy INHERITS child is never reported as a partition.
+	if strings.Count(captured, "AND c.relispartition") != 2 {
+		t.Fatalf("partition tree must scope both edges to declarative partitions: %s", captured)
+	}
+	if !strings.Contains(captured, "NOT c.oid = ANY(tree.path)") {
+		t.Fatalf("partition tree must carry a cycle guard: %s", captured)
+	}
+	if strings.Contains(captured, "c.relpartbound, c.oid, true") {
+		t.Fatalf("partition tree must use the two-argument deparser verified on sys_catalog: %s", captured)
+	}
+}
+
+func TestGetTablePartitioningFallsBackWithoutRelispartition(t *testing.T) {
+	var queries []string
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		queries = append(queries, query)
+		if strings.Contains(query, "c.relispartition") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "kb: column c.relispartition does not exist"}
+		}
+		return &valueRows{
+			columns: []string{"oid", "schema_name", "table_name", "parent_oid", "parent_schema", "parent_name", "relkind", "partition_bound", "partition_key"},
+			rows: [][]driver.Value{
+				{int64(1), "public", "sales", nil, nil, nil, "p", nil, "RANGE (id)"},
+				{int64(2), "public", "sales_2024", int64(1), "public", "sales", "r", "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)", nil},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	partitioning, err := server.getTablePartitioning("public", "sales")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 2 {
+		t.Fatalf("expected exactly one retry after relispartition is rejected, got %d", len(queries))
+	}
+	fallback := queries[1]
+	if !strings.Contains(fallback, "CASE WHEN pc.relkind = 'p'") || strings.Contains(fallback, "relispartition") {
+		t.Fatalf("fallback query must key the parent edge on relkind: %s", fallback)
+	}
+	if !strings.Contains(fallback, "tree.relkind = 'p'") {
+		t.Fatalf("fallback recursion must key on the parent relkind: %s", fallback)
+	}
+	if !partitioning.IsPartitioned || len(partitioning.Partitions) != 1 || partitioning.Partitions[0].Name != "sales_2024" {
+		t.Fatalf("unexpected partitioning from fallback: %#v", partitioning)
+	}
+}
+
+func TestGetTablePartitioningFallsBackWithoutPartKeyFunction(t *testing.T) {
+	var queries []string
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		queries = append(queries, query)
+		if strings.Contains(query, "get_partkeydef") {
+			return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "kb: function sys_catalog.sys_get_partkeydef(bigint) does not exist"}
+		}
+		return &valueRows{
+			columns: []string{"oid", "schema_name", "table_name", "parent_oid", "parent_schema", "parent_name", "relkind", "partition_bound", "partition_key"},
+			rows: [][]driver.Value{
+				{int64(1), "public", "sales", nil, nil, nil, "p", nil, nil},
+				{int64(2), "public", "sales_default", int64(1), "public", "sales", "r", "DEFAULT", nil},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	partitioning, err := server.getTablePartitioning("public", "sales")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 3 {
+		t.Fatalf("expected the key function to be dropped last, got %d queries", len(queries))
+	}
+	if partitioning.IsPartitioned {
+		t.Fatalf("key definition is unavailable without get_partkeydef: %#v", partitioning)
+	}
+	if len(partitioning.Partitions) != 1 || partitioning.Partitions[0].Bound == nil || partitioning.Partitions[0].Bound.Kind != "default" {
+		t.Fatalf("children must still load without the key function: %#v", partitioning.Partitions)
+	}
+}
+
+func TestParseKingbasePartitionBoundReadsEveryShape(t *testing.T) {
+	intP := func(value int) *int { return &value }
+	nullable := func(value string) sql.NullString { return sql.NullString{String: value, Valid: true} }
+	cases := []struct {
+		definition string
+		want       *pgPartitionBound
+	}{
+		{"DEFAULT", &pgPartitionBound{Kind: "default"}},
+		{"  default  ", &pgPartitionBound{Kind: "default"}},
+		{
+			"FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')",
+			&pgPartitionBound{Kind: "range", From: []string{"'2024-01-01'"}, To: []string{"'2025-01-01'"}},
+		},
+		{
+			"FOR VALUES FROM ('a', 'a') TO ('b', MAXVALUE)",
+			&pgPartitionBound{Kind: "range", From: []string{"'a'", "'a'"}, To: []string{"'b'", "MAXVALUE"}},
+		},
+		{"FOR VALUES IN ('a,b', 'c')", &pgPartitionBound{Kind: "list", Values: []string{"'a,b'", "'c'"}}},
+		{
+			"FOR VALUES WITH (modulus 2, remainder 1)",
+			&pgPartitionBound{Kind: "hash", Modulus: intP(2), Remainder: intP(1)},
+		},
+		{
+			// remainder 0 must survive even though it is the zero value.
+			"FOR VALUES WITH (MODULUS 4, REMAINDER 0)",
+			&pgPartitionBound{Kind: "hash", Modulus: intP(4), Remainder: intP(0)},
+		},
+	}
+	for _, test := range cases {
+		if got := parseKingbasePartitionBound(nullable(test.definition)); !reflect.DeepEqual(got, test.want) {
+			t.Fatalf("parseKingbasePartitionBound(%q) = %#v, want %#v", test.definition, got, test.want)
+		}
+	}
+	for _, definition := range []string{"", "NOT A BOUND", "FOR VALUES INTO (1)"} {
+		if got := parseKingbasePartitionBound(nullable(definition)); got != nil {
+			t.Fatalf("parseKingbasePartitionBound(%q) = %#v, want nil", definition, got)
+		}
+	}
+	if got := parseKingbasePartitionBound(sql.NullString{}); got != nil {
+		t.Fatalf("a NULL bound must stay nil, got %#v", got)
+	}
+}
+
+func TestGetTablePartitioningParsesNodeBounds(t *testing.T) {
+	state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+		return &valueRows{
+			columns: []string{"oid", "schema_name", "table_name", "parent_oid", "parent_schema", "parent_name", "relkind", "partition_bound", "partition_key"},
+			rows: [][]driver.Value{
+				{int64(1), "public", "sales", nil, nil, nil, "p", nil, "RANGE (id)"},
+				{int64(2), "public", "sales_2024", int64(1), "public", "sales", "r", "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')", nil},
+			},
+		}, nil
+	}}
+	server := newServer()
+	server.db = openMetadataDB(t, state)
+
+	partitioning, err := server.getTablePartitioning("public", "sales")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(partitioning.Partitions) != 1 || partitioning.Partitions[0].Bound == nil || partitioning.Partitions[0].Bound.Kind != "range" {
+		t.Fatalf("tree node bound was not parsed: %#v", partitioning.Partitions)
+	}
+	if partitioning.Partitions[0].BoundDefinition != "FOR VALUES FROM ('2024-01-01') TO ('2025-01-01')" {
+		t.Fatalf("raw bound definition must be retained: %#v", partitioning.Partitions[0])
+	}
+}
+
+func TestGetTablePartitionStatusUsesLightweightQuery(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		relkind         string
+		exists          bool
+		wantPartitioned bool
+		wantPartition   bool
+	}{
+		{name: "partitioned parent", relkind: "p", exists: false, wantPartitioned: true},
+		{name: "leaf partition", relkind: "r", exists: true, wantPartition: true},
+		{name: "plain table", relkind: "r", exists: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var captured string
+			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
+				captured = query
+				return &valueRows{
+					columns: []string{"relkind", "is_partition"},
+					rows:    [][]driver.Value{{test.relkind, test.exists}},
+				}, nil
+			}}
+			server := newServer()
+			server.db = openMetadataDB(t, state)
+
+			result, shutdown, err := server.dispatch("get_table_partition_status", map[string]json.RawMessage{
+				"schema": json.RawMessage(`"public"`),
+				"table":  json.RawMessage(`"sales"`),
+			})
+			if err != nil || shutdown {
+				t.Fatalf("dispatch failed: shutdown=%v err=%v", shutdown, err)
+			}
+			if strings.Contains(captured, "WITH RECURSIVE") || !strings.Contains(captured, "EXISTS (") {
+				t.Fatalf("status probe must not walk the whole partition tree: %s", captured)
+			}
+			status, ok := result.(pgTablePartitionStatus)
+			if !ok {
+				t.Fatalf("unexpected result type: %#v", result)
+			}
+			if status.IsPartitionedParent != test.wantPartitioned || status.IsPartition != test.wantPartition {
+				t.Fatalf("unexpected status: %#v", status)
+			}
+		})
+	}
+}
+
 func TestListTablesCachesMissingCatalogOIDCapability(t *testing.T) {
 	for _, test := range []struct {
 		name            string

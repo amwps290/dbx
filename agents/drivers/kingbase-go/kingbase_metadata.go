@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"gitea.com/kingbase/gokb"
 )
@@ -73,8 +75,8 @@ type pgPartitionBound struct {
 	From      []string `json:"from,omitempty"`
 	To        []string `json:"to,omitempty"`
 	Values    []string `json:"values,omitempty"`
-	Modulus   int      `json:"modulus,omitempty"`
-	Remainder int      `json:"remainder,omitempty"`
+	Modulus   *int     `json:"modulus,omitempty"`
+	Remainder *int     `json:"remainder,omitempty"`
 }
 
 type pgPartitionNode struct {
@@ -101,7 +103,6 @@ type pgTablePartitioning struct {
 	KeyExpression    string            `json:"keyExpression,omitempty"`
 	DefaultPartition string            `json:"defaultPartition,omitempty"`
 	Partitions       []pgPartitionNode `json:"partitions"`
-	ServerVersionNum *int              `json:"serverVersionNum,omitempty"`
 }
 
 type partitionRelation struct {
@@ -1174,31 +1175,7 @@ func (s *server) getTablePartitioning(schema, table string) (pgTablePartitioning
 	prefix := catalogPrefix(catalog)
 	partKeyFunction := kingbaseCatalogFunction(catalog, "sys_get_partkeydef", "pg_get_partkeydef")
 	boundFunction := kingbaseCatalogFunction(catalog, "sys_get_expr", "pg_get_expr")
-	query := fmt.Sprintf(`WITH RECURSIVE tree AS (
-SELECT c.oid::bigint AS oid, n.nspname AS schema_name, c.relname AS table_name,
-       i.inhparent::bigint AS parent_oid, pn.nspname AS parent_schema, pc.relname AS parent_name,
-       c.relkind::text AS relkind
-FROM %s.%s_class c
-JOIN %s.%s_namespace n ON n.oid = c.relnamespace
-LEFT JOIN %s.%s_inherits i ON i.inhrelid = c.oid
-LEFT JOIN %s.%s_class pc ON pc.oid = i.inhparent
-LEFT JOIN %s.%s_namespace pn ON pn.oid = pc.relnamespace
-WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','f')
-UNION ALL
-SELECT c.oid::bigint, n.nspname, c.relname, tree.oid, tree.schema_name, tree.table_name, c.relkind::text
-FROM %s.%s_inherits i
-JOIN %s.%s_class c ON c.oid = i.inhrelid
-JOIN %s.%s_namespace n ON n.oid = c.relnamespace
-JOIN tree ON tree.oid = i.inhparent
-WHERE c.relkind IN ('r','p','f')
-)
-SELECT t.oid, t.schema_name, t.table_name, t.parent_oid, t.parent_schema, t.parent_name, t.relkind,
-       CASE WHEN t.relkind IN ('r','f') THEN %s(c.relpartbound, c.oid, true) ELSE NULL END AS partition_bound,
-       CASE WHEN t.relkind = 'p' THEN %s(c.oid) ELSE NULL END AS partition_key
-FROM tree t
-JOIN %s.%s_class c ON c.oid = t.oid
-ORDER BY t.oid`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLiteral(table), catalog, prefix, catalog, prefix, catalog, prefix, boundFunction, partKeyFunction, catalog, prefix)
-	rows, err := s.metadataQuery(query)
+	rows, err := s.queryPartitionTree(catalog, prefix, boundFunction, partKeyFunction, effective, table)
 	if err != nil {
 		return pgTablePartitioning{}, err
 	}
@@ -1257,6 +1234,161 @@ ORDER BY t.oid`, catalog, prefix, catalog, prefix, catalog, prefix, catalog, pre
 	return result, nil
 }
 
+// partitionTreeQueryOptions is the catalog-compatibility tier for the
+// partition-tree query. Kingbase derivatives differ in which catalog columns and
+// deparser functions exist, so `queryPartitionTree` retries progressively
+// simpler variants instead of failing the whole RPC.
+type partitionTreeQueryOptions struct {
+	relispartition bool
+	partitionKey   bool
+}
+
+// Partition-tree query variants, most faithful first. `relispartition`
+// distinguishes declarative partitions from legacy INHERITS children (without
+// it, an inherited table would be mistaken for a partition and offered invalid
+// DETACH DDL); `partitionKey` needs sys_get_partkeydef/pg_get_partkeydef.
+func partitionTreeQueryVariants() []partitionTreeQueryOptions {
+	return []partitionTreeQueryOptions{
+		{relispartition: true, partitionKey: true},
+		{relispartition: false, partitionKey: true},
+		{relispartition: false, partitionKey: false},
+	}
+}
+
+func (s *server) queryPartitionTree(catalog, prefix, boundFunction, partKeyFunction, schema, table string) (*sql.Rows, error) {
+	var lastErr error
+	for _, options := range partitionTreeQueryVariants() {
+		rows, err := s.metadataQuery(buildPartitionTreeQuery(catalog, prefix, boundFunction, partKeyFunction, schema, table, options))
+		if err == nil {
+			return rows, nil
+		}
+		lastErr = err
+		if options.relispartition && isUndefinedColumn(err, "relispartition") {
+			continue
+		}
+		if options.partitionKey && isUndefinedFunction(err, "get_partkeydef") {
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+// buildPartitionTreeQuery renders the recursive partition-tree query. Bounds are
+// read with the two-argument deparser (sys_get_expr(relpartbound, oid)), which
+// Kingbase exposes on every supported release; the three-argument pretty form is
+// not guaranteed on sys_catalog. The recursion carries a path array and filters
+// on relispartition so a corrupted catalog cannot loop forever and a legacy
+// INHERITS child is never reported as a partition.
+func buildPartitionTreeQuery(catalog, prefix, boundFunction, partKeyFunction, schema, table string, options partitionTreeQueryOptions) string {
+	classTable := fmt.Sprintf("%s.%s_class", catalog, prefix)
+	namespaceTable := fmt.Sprintf("%s.%s_namespace", catalog, prefix)
+	inheritsTable := fmt.Sprintf("%s.%s_inherits", catalog, prefix)
+
+	anchorColumns := "c.oid::bigint AS oid, n.nspname AS schema_name, c.relname AS table_name,\n       i.inhparent::bigint AS parent_oid, pn.nspname AS parent_schema, pc.relname AS parent_name,\n       c.relkind::text AS relkind, ARRAY[c.oid::bigint] AS path"
+	anchorInheritsJoin := fmt.Sprintf("LEFT JOIN %s i ON i.inhrelid = c.oid", inheritsTable)
+	recursiveChildJoin := fmt.Sprintf("JOIN %s c ON c.oid = i.inhrelid", classTable)
+	recursivePredicate := "NOT c.oid = ANY(tree.path)"
+	if options.relispartition {
+		anchorInheritsJoin = fmt.Sprintf("LEFT JOIN %s i ON i.inhrelid = c.oid AND c.relispartition", inheritsTable)
+		recursiveChildJoin = fmt.Sprintf("JOIN %s c ON c.oid = i.inhrelid AND c.relispartition", classTable)
+	} else {
+		// Older catalogs lack relispartition. A declarative partition's parent
+		// always has relkind 'p' (traditional INHERITS parents are relkind 'r'),
+		// so scope the parent edge to partitioned parents instead.
+		anchorColumns = "c.oid::bigint AS oid, n.nspname AS schema_name, c.relname AS table_name,\n       CASE WHEN pc.relkind = 'p' THEN i.inhparent::bigint END AS parent_oid,\n       CASE WHEN pc.relkind = 'p' THEN pn.nspname END AS parent_schema,\n       CASE WHEN pc.relkind = 'p' THEN pc.relname END AS parent_name,\n       c.relkind::text AS relkind, ARRAY[c.oid::bigint] AS path"
+		recursivePredicate = "tree.relkind = 'p' AND NOT c.oid = ANY(tree.path)"
+	}
+
+	boundExpression := fmt.Sprintf("CASE WHEN t.relkind IN ('r','f') THEN %s(c.relpartbound, c.oid) ELSE NULL END", boundFunction)
+	partKeyExpression := "CAST(NULL AS text)"
+	if options.partitionKey {
+		partKeyExpression = fmt.Sprintf("CASE WHEN t.relkind = 'p' THEN %s(c.oid) ELSE NULL END", partKeyFunction)
+	}
+
+	return fmt.Sprintf(`WITH RECURSIVE tree AS (
+SELECT %s
+FROM %s c
+JOIN %s n ON n.oid = c.relnamespace
+%s
+LEFT JOIN %s pc ON pc.oid = i.inhparent
+LEFT JOIN %s pn ON pn.oid = pc.relnamespace
+WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','f')
+UNION ALL
+SELECT c.oid::bigint, n.nspname, c.relname, tree.oid, tree.schema_name, tree.table_name, c.relkind::text,
+       tree.path || c.oid::bigint
+FROM %s i
+%s
+JOIN %s n ON n.oid = c.relnamespace
+JOIN tree ON tree.oid = i.inhparent
+WHERE %s
+)
+SELECT t.oid, t.schema_name, t.table_name, t.parent_oid, t.parent_schema, t.parent_name, t.relkind,
+       %s AS partition_bound,
+       %s AS partition_key
+FROM tree t
+JOIN %s c ON c.oid = t.oid
+ORDER BY t.oid`,
+		anchorColumns,
+		classTable, namespaceTable, anchorInheritsJoin,
+		classTable, namespaceTable,
+		quoteLiteral(schema), quoteLiteral(table),
+		inheritsTable,
+		recursiveChildJoin,
+		namespaceTable,
+		recursivePredicate,
+		boundExpression, partKeyExpression,
+		classTable,
+	)
+}
+
+// pgTablePartitionStatus mirrors the native table_partition_status_core result.
+type pgTablePartitionStatus struct {
+	IsPartitionedParent bool `json:"isPartitionedParent"`
+	IsPartition         bool `json:"isPartition"`
+}
+
+// getTablePartitionStatus answers the cheap "does this table participate in
+// declarative partitioning?" probe without materializing the whole tree. It
+// keys the parent edge on relkind 'p' (as listTables does), so it works even on
+// releases whose catalog lacks relispartition, and a legacy INHERITS child is
+// never reported as a partition.
+func (s *server) getTablePartitionStatus(schema, table string) (pgTablePartitionStatus, error) {
+	effective, err := s.effectiveSchema(schema)
+	if err != nil {
+		return pgTablePartitionStatus{}, err
+	}
+	catalog := "sys_catalog"
+	if s.mode.postgresCatalog {
+		catalog = "pg_catalog"
+	}
+	prefix := catalogPrefix(catalog)
+	query := fmt.Sprintf(`SELECT c.relkind::text,
+EXISTS (
+  SELECT 1 FROM %s.%s_inherits i
+  JOIN %s.%s_class pc ON pc.oid = i.inhparent
+  WHERE i.inhrelid = c.oid AND pc.relkind = 'p'
+)
+FROM %s.%s_class c
+JOIN %s.%s_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relname = %s AND c.relkind IN ('r','p','f')`,
+		catalog, prefix, catalog, prefix, catalog, prefix, catalog, prefix, quoteLiteral(effective), quoteLiteral(table))
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return pgTablePartitionStatus{}, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return pgTablePartitionStatus{}, rows.Err()
+	}
+	var relkind string
+	var isPartition bool
+	if err := rows.Scan(&relkind, &isPartition); err != nil {
+		return pgTablePartitionStatus{}, err
+	}
+	return pgTablePartitionStatus{IsPartitionedParent: relkind == "p", IsPartition: isPartition}, nil
+}
+
 func partitionKindFromKeyDefinition(definition string) string {
 	fields := strings.Fields(strings.TrimSpace(definition))
 	if len(fields) == 0 {
@@ -1296,9 +1428,161 @@ func parseKingbasePartitionBound(value sql.NullString) *pgPartitionBound {
 	if strings.EqualFold(definition, "DEFAULT") {
 		return &pgPartitionBound{Kind: "default"}
 	}
+	rest, ok := stripASCIICasePrefix(definition, "FOR VALUES")
+	if !ok {
+		return nil
+	}
+	rest = strings.TrimSpace(rest)
+	if body, matched := stripASCIICasePrefix(rest, "FROM"); matched {
+		from, tail, ok := takeParenGroup(body)
+		if !ok {
+			return nil
+		}
+		toBody, matched := stripASCIICasePrefix(strings.TrimSpace(tail), "TO")
+		if !matched {
+			return nil
+		}
+		to, _, ok := takeParenGroup(toBody)
+		if !ok {
+			return nil
+		}
+		return &pgPartitionBound{Kind: "range", From: splitBoundItems(from), To: splitBoundItems(to)}
+	}
+	if body, matched := stripASCIICasePrefix(rest, "IN"); matched {
+		values, _, ok := takeParenGroup(body)
+		if !ok {
+			return nil
+		}
+		return &pgPartitionBound{Kind: "list", Values: splitBoundItems(values)}
+	}
+	if body, matched := stripASCIICasePrefix(rest, "WITH"); matched {
+		options, _, ok := takeParenGroup(body)
+		if !ok {
+			return nil
+		}
+		modulus, remainder := -1, -1
+		for _, option := range splitTopLevelCommas(options) {
+			fields := strings.Fields(option)
+			if len(fields) != 2 {
+				return nil
+			}
+			number, err := strconv.Atoi(fields[1])
+			if err != nil {
+				return nil
+			}
+			switch strings.ToLower(fields[0]) {
+			case "modulus":
+				modulus = number
+			case "remainder":
+				remainder = number
+			}
+		}
+		if modulus < 0 || remainder < 0 {
+			return nil
+		}
+		return &pgPartitionBound{Kind: "hash", Modulus: &modulus, Remainder: &remainder}
+	}
 	// Keep the raw catalog definition when a Kingbase version renders a bound
-	// shape that this lightweight parser does not recognize.
+	// shape that this parser does not recognize.
 	return nil
+}
+
+// stripASCIICasePrefix removes a case-insensitive prefix, requiring a token
+// boundary so `IN` never matches `INTO` and `TO` never matches `TOAST`.
+func stripASCIICasePrefix(input, prefix string) (string, bool) {
+	if len(input) < len(prefix) || !strings.EqualFold(input[:len(prefix)], prefix) {
+		return "", false
+	}
+	rest := input[len(prefix):]
+	if rest == "" {
+		return rest, true
+	}
+	runeValue, _ := utf8.DecodeRuneInString(rest)
+	if unicode.IsSpace(runeValue) || runeValue == '(' {
+		return rest, true
+	}
+	return "", false
+}
+
+// takeParenGroup splits `( ... )` off the front of `input`, honoring single
+// quotes, doubled-single-quote escapes, double quotes, and nested parentheses.
+// It returns the inner text and the remainder after the closing parenthesis.
+func takeParenGroup(input string) (string, string, bool) {
+	input = strings.TrimLeftFunc(input, unicode.IsSpace)
+	if input == "" || input[0] != '(' {
+		return "", "", false
+	}
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for index := 0; index < len(input); index++ {
+		switch ch := input[index]; {
+		case ch == '\'' && !inDouble:
+			if inSingle && index+1 < len(input) && input[index+1] == '\'' {
+				index++
+				continue
+			}
+			inSingle = !inSingle
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+		case ch == '(' && !inSingle && !inDouble:
+			depth++
+		case ch == ')' && !inSingle && !inDouble:
+			depth--
+			if depth == 0 {
+				return input[1:index], input[index+1:], true
+			}
+		}
+	}
+	return "", "", false
+}
+
+func splitBoundItems(input string) []string {
+	items := []string{}
+	for _, item := range splitTopLevelCommas(input) {
+		if item != "" {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+// splitTopLevelCommas splits on top-level commas only; commas inside quotes,
+// nested parentheses, or doubled-single-quote escapes stay in the item.
+func splitTopLevelCommas(input string) []string {
+	items := []string{}
+	var current strings.Builder
+	depth := 0
+	inSingle := false
+	inDouble := false
+	for index := 0; index < len(input); index++ {
+		switch ch := input[index]; {
+		case ch == '\'' && !inDouble:
+			if inSingle && index+1 < len(input) && input[index+1] == '\'' {
+				current.WriteString("''")
+				index++
+				continue
+			}
+			inSingle = !inSingle
+			current.WriteByte(ch)
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+			current.WriteByte(ch)
+		case ch == '(' && !inSingle && !inDouble:
+			depth++
+			current.WriteByte(ch)
+		case ch == ')' && !inSingle && !inDouble:
+			depth--
+			current.WriteByte(ch)
+		case ch == ',' && !inSingle && !inDouble && depth == 0:
+			items = append(items, strings.TrimSpace(current.String()))
+			current.Reset()
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	items = append(items, strings.TrimSpace(current.String()))
+	return items
 }
 func (s *server) listObjects(schema string, constraints metadataListConstraints) ([]objectInfo, error) {
 	effective, err := s.effectiveSchema(schema)
