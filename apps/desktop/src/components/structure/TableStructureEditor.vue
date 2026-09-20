@@ -445,6 +445,10 @@ async function probePartitionsTabVisibility() {
     if (requestId !== partitionTabProbeRequestId) return;
     isPartitionedParent.value = false;
     isTablePartition.value = false;
+    // A failed probe leaves the concurrent-index availability unknown, so keep
+    // the documented fail-closed behavior (disable Concurrent) instead of
+    // assuming the table is a plain, non-partitioned one.
+    partitionStatusKnown.value = false;
     partitionStatusResolved.value = true;
   }
 }

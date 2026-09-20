@@ -5305,6 +5305,27 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn detects_unsupported_agent_partition_method_errors() {
+        assert!(super::is_agent_partition_method_unsupported(
+            "Agent RPC error (-1): unknown method: get_table_partitioning",
+            "get_table_partitioning",
+        ));
+        assert!(super::is_agent_partition_method_unsupported(
+            "Agent RPC error (-32601): Method not found: get_table_partition_status",
+            "get_table_partition_status",
+        ));
+        // A different method in the same error must not match.
+        assert!(!super::is_agent_partition_method_unsupported(
+            "Agent RPC error (-1): unknown method: get_table_partitioning",
+            "get_table_partition_status",
+        ));
+        assert!(!super::is_agent_partition_method_unsupported(
+            "Agent RPC error (-1): Connection failed",
+            "get_table_partitioning",
+        ));
+    }
+
+    #[test]
     fn clickhouse_metadata_prefers_schema_qualifier() {
         assert_eq!(clickhouse_metadata_database("", "testdb"), "testdb");
         assert_eq!(clickhouse_metadata_database("testdb", ""), "testdb");
@@ -6188,6 +6209,15 @@ fn is_agent_completion_assistant_unsupported(error: &str) -> bool {
     error.contains("unknown method: completion_assistant_search_v1")
         || error.contains("method not found: completion_assistant_search_v1")
         || error.contains("completion assistant search is not supported")
+}
+
+/// True when an agent built against an older protocol does not implement a
+/// table-partition RPC. A mixed-version deployment (new core, old agent) must
+/// hide the Partitions tab rather than fail every probe, so callers degrade to
+/// the default value instead of surfacing the error.
+fn is_agent_partition_method_unsupported(error: &str, method: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains(method) && (error.contains("unknown method") || error.contains("method not found"))
 }
 
 async fn completion_assistant_fallback_core(
@@ -7851,15 +7881,15 @@ pub async fn table_partition_status_core(
                 let info = db::postgres::get_table_partition_info(pool, schema, table).await?;
                 Ok(TablePartitionStatus { is_partitioned_parent: info.key.is_some(), is_partition: info.is_partition })
             }
-            Some(PoolKind::Agent(client))
-                if connection_config(state, connection_id)
-                    .await
-                    .as_ref()
-                    .is_some_and(|config| config.db_type == DatabaseType::Kingbase) =>
-            {
+            Some(PoolKind::Agent(client)) => {
+                // Resolve the config once: it gates the arm and feeds the RPC
+                // timeout.
                 let db_config = connection_config(state, connection_id).await;
+                if !db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
+                    return Ok(TablePartitionStatus::default());
+                }
                 let mut client = client.lock().await;
-                client
+                match client
                     .get_table_partition_status::<TablePartitionStatus>(
                         database,
                         schema,
@@ -7867,6 +7897,13 @@ pub async fn table_partition_status_core(
                         agent_metadata_timeout(db_config.as_ref()),
                     )
                     .await
+                {
+                    Ok(status) => Ok(status),
+                    Err(error) if is_agent_partition_method_unsupported(&error, "get_table_partition_status") => {
+                        Ok(TablePartitionStatus::default())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             _ => Ok(TablePartitionStatus::default()),
         }
@@ -7890,15 +7927,15 @@ pub async fn get_table_partitioning_core(
         let pool_handle = state.pool_handle(&pool_key).await;
         match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => db::postgres::get_table_partitioning(pool, schema, table).await,
-            Some(PoolKind::Agent(client))
-                if connection_config(state, connection_id)
-                    .await
-                    .as_ref()
-                    .is_some_and(|config| config.db_type == DatabaseType::Kingbase) =>
-            {
+            Some(PoolKind::Agent(client)) => {
+                // Resolve the config once: it gates the arm and feeds the RPC
+                // timeout.
                 let db_config = connection_config(state, connection_id).await;
+                if !db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
+                    return Ok(db::PgTablePartitioning::default());
+                }
                 let mut client = client.lock().await;
-                client
+                match client
                     .get_table_partitioning::<db::PgTablePartitioning>(
                         database,
                         schema,
@@ -7906,6 +7943,13 @@ pub async fn get_table_partitioning_core(
                         agent_metadata_timeout(db_config.as_ref()),
                     )
                     .await
+                {
+                    Ok(partitioning) => Ok(partitioning),
+                    Err(error) if is_agent_partition_method_unsupported(&error, "get_table_partitioning") => {
+                        Ok(db::PgTablePartitioning::default())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             _ => Ok(db::PgTablePartitioning::default()),
         }
