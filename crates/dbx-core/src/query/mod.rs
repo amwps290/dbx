@@ -4003,7 +4003,36 @@ pub async fn execute_statements_with_transaction_option(
 /// inside a transaction block (`CREATE/DROP INDEX CONCURRENTLY`,
 /// `ALTER TABLE ... DETACH PARTITION CONCURRENTLY`, ...).
 fn batch_has_concurrently_statement(statements: &[String]) -> bool {
-    statements.iter().any(|statement| statement.to_ascii_uppercase().contains("CONCURRENTLY"))
+    statements.iter().any(|statement| {
+        let upper = statement.to_ascii_uppercase();
+        // Real CONCURRENTLY statements always start with one of these verbs.
+        // Requiring the verb plus a standalone keyword keeps the word inside
+        // string literals, comments or plain identifiers (e.g. a table named
+        // `concurrently`) from silently demoting the batch to auto-commit; the
+        // direction stays fail-safe because no CONCURRENTLY statement form
+        // starts with another verb.
+        let trimmed = upper.trim_start();
+        let starts_with_ddl_verb =
+            ["CREATE ", "DROP ", "REINDEX", "REFRESH ", "ALTER "].iter().any(|verb| trimmed.starts_with(verb));
+        starts_with_ddl_verb && contains_standalone_concurrently_keyword(&upper)
+    })
+}
+
+fn contains_standalone_concurrently_keyword(upper: &str) -> bool {
+    let keyword = "CONCURRENTLY";
+    let mut search_from = 0;
+    while let Some(pos) = upper[search_from..].find(keyword) {
+        let pos = search_from + pos;
+        let boundary =
+            |ch: Option<char>| ch.map(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '"').unwrap_or(false);
+        let before = boundary(upper[..pos].chars().next_back());
+        let after = boundary(upper[pos + keyword.len()..].chars().next());
+        if !before && !after {
+            return true;
+        }
+        search_from = pos + 1;
+    }
+    false
 }
 
 async fn execute_statements_inner(
@@ -8243,6 +8272,21 @@ for line in sys.stdin:
         assert!(!batch_has_concurrently_statement(&[
             "CREATE TABLE child PARTITION OF parent FOR VALUES FROM (0) TO (1)".to_string(),
         ]));
+        // The word inside literals or plain identifiers must not demote a batch
+        // that would otherwise run in one transaction.
+        assert!(!batch_has_concurrently_statement(&[
+            "INSERT INTO notes (body) VALUES ('run CREATE INDEX CONCURRENTLY later')".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "SELECT id FROM concurrently WHERE label = 'drop index concurrently idx'".to_string(),
+        ]));
+        assert!(!batch_has_concurrently_statement(&[
+            "-- refresh materialized view concurrently next".to_string(),
+            "SELECT 1".to_string(),
+        ]));
+        // REINDEX/REFRESH forms still detect.
+        assert!(batch_has_concurrently_statement(&["REINDEX TABLE CONCURRENTLY t".to_string()]));
+        assert!(batch_has_concurrently_statement(&["REFRESH MATERIALIZED VIEW CONCURRENTLY mv".to_string()]));
     }
 
     #[tokio::test]
