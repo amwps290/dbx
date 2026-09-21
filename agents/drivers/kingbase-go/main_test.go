@@ -2130,7 +2130,7 @@ func TestListTablesPreservesKingbaseObjectTypesAndComments(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
-				if !strings.Contains(query, "FROM "+test.wantCatalog) || !strings.Contains(query, "LEFT JOIN "+test.wantInherits) || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") || !strings.Contains(query, "obj_description(c.oid)") {
+				if !strings.Contains(query, "SELECT DISTINCT c.relname") || !strings.Contains(query, "FROM "+test.wantCatalog) || !strings.Contains(query, "LEFT JOIN "+test.wantInherits) || !strings.Contains(query, "c.relkind IN ('r','p','v','m','f')") || !strings.Contains(query, "obj_description(c.oid)") {
 					return nil, errors.New("unexpected query: " + query)
 				}
 				return &valueRows{

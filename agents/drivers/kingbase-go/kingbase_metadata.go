@@ -416,7 +416,10 @@ LEFT JOIN %s.%s_class pc ON pc.oid = i.inhparent
 LEFT JOIN %s.%s_namespace pn ON pn.oid = pc.relnamespace`, catalog, prefix, catalog, prefix, catalog, prefix)
 	}
 	prefix := catalogPrefix(catalog)
-	query := fmt.Sprintf(`SELECT c.relname,
+	// DISTINCT collapses the rows fanned out by the pg_inherits join when a
+	// table has several legacy INHERITS parents (each such row is identical —
+	// only declarative partition parents fill the parent columns).
+	query := fmt.Sprintf(`SELECT DISTINCT c.relname,
 CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED_VIEW' WHEN 'f' THEN 'FOREIGN_TABLE' ELSE 'TABLE' END,
 %s,
 %s,
