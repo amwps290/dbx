@@ -1296,6 +1296,7 @@ mod tests {
             catalog: None,
             timeout_secs: None,
             destructive_confirmed: None,
+            use_transaction: None,
         };
 
         let result = execute_script_with_2pc(AxumState(state), Json(req))
@@ -1321,6 +1322,7 @@ mod tests {
             catalog: None,
             timeout_secs: None,
             destructive_confirmed: None,
+            use_transaction: None,
         };
 
         let result = execute_script_with_2pc(AxumState(state), Json(req)).await.expect("empty deploy should succeed");
@@ -1343,6 +1345,7 @@ mod tests {
             catalog: None,
             timeout_secs: None,
             destructive_confirmed: None,
+            use_transaction: None,
         };
 
         let result = execute_script_with_2pc(AxumState(state), Json(req))
@@ -1367,6 +1370,7 @@ mod tests {
             catalog: None,
             timeout_secs: None,
             destructive_confirmed: None,
+            use_transaction: None,
         };
 
         let result = execute_script_with_2pc(AxumState(state), Json(req))
