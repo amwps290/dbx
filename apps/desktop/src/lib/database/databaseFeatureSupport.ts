@@ -122,9 +122,13 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
  * `mqtt`) belong to the same group: brokers have no SQL engine, and their
  * workbench is the MQ/MQTT admin tab. The sidebar entry used to open a plain
  * SQL editor against a broker (issue #8415).
+ *
+ * Meilisearch exposes its own index search and management workspaces rather
+ * than a general-purpose SQL query surface, so the generic sidebar action is
+ * hidden there as well (issue #9609).
  */
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "plugin" && dbType !== "mq" && dbType !== "mqtt";
+  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "plugin" && dbType !== "mq" && dbType !== "mqtt" && dbType !== "meilisearch";
 }
 
 /**
@@ -267,7 +271,7 @@ const ORACLE_STICKY_TRANSACTION_TYPES: ReadonlySet<string> = new Set(["oracle", 
 
 /** Databases whose manual-transaction toolbar hides Commit/Rollback until an
  *  unproven statement dirties the session. Mirrors the Rust proof gate
- *  (crates/dbx-core/src/query.rs + sql_risk.rs `prove_read_only_for_database`).
+ *  (crates/dbx-core/src/query/mod.rs + sql_risk.rs `prove_read_only_for_database`).
  *  Every member must also be in TRANSACTION_SUPPORTED_TYPES above: a database
  *  cannot reach manual mode (and this UX) without explicit transaction control
  *  (#9018). Family members like doris/kingbase join only when their transaction

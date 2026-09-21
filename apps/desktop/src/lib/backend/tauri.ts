@@ -3,6 +3,9 @@ import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRest
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
 import { assertUpdateAllowsCommand } from "@/lib/app/updatePreparation";
 import { collectBrowserSupportInfo } from "@/lib/app/supportInfo";
+// Re-exported below so the HTTP transport shares one definition; imported here
+// for this module's own signatures (a re-export does not bind local names).
+import type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 
 function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   assertUpdateAllowsCommand(command);
@@ -17,7 +20,7 @@ import { ExternalSqlFileTooLargeError } from "@/lib/sql/sqlFileOpen";
 import { appendDebugLog, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
 import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type MeilisearchDocumentPage, type MeilisearchDocumentPageWire, type MeilisearchSearchResult, type MeilisearchSearchWireResult } from "@/lib/backend/meilisearchTransport";
 import type { XuguTablespaceInfo } from "@/types/database";
-import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
+import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchCreateIndexInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
@@ -101,6 +104,7 @@ import type {
   PluginRollbackResult,
   PluginTrustedKey,
   PluginUiAssetPayload,
+  TableVGroupLayout,
 } from "@/types/database";
 import type {
   DataGridColumnDistinctValuesSqlOptions,
@@ -206,6 +210,17 @@ export interface AgentOfflineExportResult {
 export interface AgentOfflineImportResult {
   count: number;
   jreCount: number;
+  /** Items the package could not install; the rest of the import still ran. */
+  failures: AgentOfflineImportFailure[];
+}
+
+export interface AgentOfflineImportFailure {
+  /** Managed JRE key (e.g. "21") or driver key (e.g. "oracle"). */
+  key: string;
+  /** True when the failed item is a managed JRE runtime rather than a driver. */
+  is_jre: boolean;
+  /** Failure text, including the underlying OS error when there is one. */
+  error: string;
 }
 
 export type JavaRuntimeMode = "managed" | "system" | "custom";
@@ -357,10 +372,11 @@ export interface WebDavSyncSecretsStatus {
   hasSavedPassphrase: boolean;
 }
 
-export type SnippetProvider = "github" | "gitee";
+export type SnippetProvider = "github" | "gitee" | "gitlab";
 
 export interface SnippetSyncConfig {
   provider: SnippetProvider;
+  instanceUrl?: string;
   token?: string;
   snippetId?: string;
   replaceLegacySnippet?: boolean;
@@ -426,6 +442,7 @@ export interface QueryPaginationExecutionPlan {
   countSql?: string;
   exactQueryRowBound?: number;
   useAgentResultSession: boolean;
+  paginationRowNumberColumn?: string;
 }
 
 export type QuerySortDirection = "asc" | "desc";
@@ -778,6 +795,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
 }
 
 export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+/** Shared with `@/lib/plugins/pluginHostBridge`; re-exported so the HTTP transport reuses one definition. */
+export type { PluginPlanCapabilities, PluginPlanRequest, PluginPlanResult } from "@/types/pluginPlan";
 import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 import { uuid } from "@/lib/common/utils";
 
@@ -787,6 +806,19 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   return invoke("save_editor_settings", { settings });
+}
+
+export interface GlobalSearchSettings {
+  roots: string[];
+  extensions: string[];
+}
+
+export function loadGlobalSearchSettings(): Promise<GlobalSearchSettings | null> {
+  return invoke("load_global_search_settings");
+}
+
+export function saveGlobalSearchSettings(settings: GlobalSearchSettings): Promise<void> {
+  return invoke("save_global_search_settings", { settings });
 }
 
 export interface BackgroundImageInfo {
@@ -952,12 +984,12 @@ export async function forgetSnippetSavedToken(config: SnippetSyncConfig): Promis
   return invoke("forget_snippet_saved_token", { config });
 }
 
-export async function snippetSyncSettings(provider: SnippetProvider): Promise<SnippetSyncSettings> {
-  return invoke("snippet_sync_settings", { provider });
+export async function snippetSyncSettings(provider: SnippetProvider, instanceUrl?: string): Promise<SnippetSyncSettings> {
+  return invoke("snippet_sync_settings", { provider, instanceUrl });
 }
 
-export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string): Promise<void> {
-  return invoke("save_snippet_sync_id", { provider, snippetId });
+export async function saveSnippetSyncId(provider: SnippetProvider, snippetId?: string, instanceUrl?: string): Promise<void> {
+  return invoke("save_snippet_sync_id", { provider, snippetId, instanceUrl });
 }
 
 export async function retrySnippetLegacyCleanup(config: SnippetSyncConfig): Promise<SnippetSyncSettings> {
@@ -1077,6 +1109,31 @@ export async function renameSqlFileInFolder(rootPath: string, filePath: string, 
 
 export async function deleteSqlFileInFolder(rootPath: string, filePath: string): Promise<void> {
   return invoke("delete_sql_file_in_folder", { rootPath, filePath });
+}
+
+export interface GlobalSearchRequest {
+  roots: string[];
+  query: string;
+  extensions?: string[];
+  caseSensitive?: boolean;
+  useRegex?: boolean;
+  wholeWord?: boolean;
+  limit?: number;
+}
+
+export interface GlobalSearchMatch {
+  path: string;
+  fileName: string;
+  /** 1-based line number. */
+  line: number;
+  /** 1-based char column within the line (for CodeMirror). */
+  column: number;
+  matchText: string;
+  lineText: string;
+}
+
+export async function globalSearch(request: GlobalSearchRequest): Promise<GlobalSearchMatch[]> {
+  return invoke("global_search", { request });
 }
 
 // --- AI Conversations ---
@@ -1757,6 +1814,19 @@ export async function getExplainInfo(connectionId: string, database: string | un
   });
 }
 
+/** Plugin Host API: what the host and this connection can plan. Never connects. */
+export async function getPluginPlanCapabilities(connectionId: string): Promise<PluginPlanCapabilities> {
+  return invoke<PluginPlanCapabilities>("get_plugin_plan_capabilities", { connectionId });
+}
+
+/**
+ * Plugin Host API: acquires the estimated plan for caller-supplied SQL. The
+ * backend generates and owns the EXPLAIN statement; the request cannot carry one.
+ */
+export async function getPluginEstimatedPlan(request: PluginPlanRequest): Promise<PluginPlanResult> {
+  return invoke<PluginPlanResult>("get_plugin_estimated_plan", { request });
+}
+
 export async function buildDroppedFilePreviewSql(options: DroppedFilePreviewSqlOptions): Promise<string | undefined> {
   const result = await invoke<string | null>("build_dropped_file_preview_sql", {
     options,
@@ -2367,6 +2437,53 @@ export async function sendPluginBinary(pluginId: string, channel: string, dataBa
   return invoke("send_plugin_binary", { pluginId, channel, dataBase64 });
 }
 
+export interface PluginLocalFileHandle {
+  handleId: number;
+  name: string;
+  size: number;
+  contentType: string;
+  write: boolean;
+}
+
+export interface PluginLocalFileChunk {
+  dataBase64: string;
+  length: number;
+  eof: boolean;
+}
+
+export interface PluginLocalFileWriteResult {
+  written: number;
+  nextOffset: number;
+}
+
+export async function openPluginLocalFile(pluginId: string, path: string, write: boolean): Promise<PluginLocalFileHandle> {
+  return invoke("plugin_file_open", { pluginId, path, write });
+}
+
+export async function readPluginLocalFileChunk(pluginId: string, handleId: number, offset: number, length?: number): Promise<PluginLocalFileChunk> {
+  return invoke("plugin_file_read", { pluginId, handleId, offset, length });
+}
+
+export async function writePluginLocalFileChunk(pluginId: string, handleId: number, offset: number, dataBase64: string): Promise<PluginLocalFileWriteResult> {
+  return invoke("plugin_file_write", { pluginId, handleId, offset, dataBase64 });
+}
+
+export async function closePluginLocalFile(pluginId: string, handleId: number): Promise<void> {
+  return invoke("plugin_file_close", { pluginId, handleId });
+}
+
+export async function getPluginUiStorage(pluginId: string, key: string): Promise<unknown> {
+  return invoke("plugin_ui_storage_get", { pluginId, key });
+}
+
+export async function setPluginUiStorage(pluginId: string, key: string, value: unknown): Promise<void> {
+  return invoke("plugin_ui_storage_set", { pluginId, key, value });
+}
+
+export async function deletePluginUiStorage(pluginId: string, key: string): Promise<void> {
+  return invoke("plugin_ui_storage_delete", { pluginId, key });
+}
+
 export async function listPluginFilesystemEntries(pluginId: string, providerId: string, options: { connectionId?: string; uri?: string; cursor?: string; limit?: number } = {}): Promise<PluginFilesystemListResult> {
   return invoke("list_plugin_filesystem_entries", { pluginId, providerId, ...options });
 }
@@ -2642,6 +2759,18 @@ export async function saveSidebarLayout(layout: import("@/types/database").Sideb
 
 export async function loadSidebarLayout(): Promise<import("@/types/database").SidebarLayout | null> {
   return invoke("load_sidebar_layout");
+}
+
+export async function saveTableVGroups(scopeKey: string, layout: TableVGroupLayout): Promise<void> {
+  return invoke("save_table_vgroups", { scopeKey, layout });
+}
+
+export async function loadTableVGroups(): Promise<Record<string, import("@/types/database").TableVGroupLayout>> {
+  return invoke("load_table_vgroups");
+}
+
+export async function deleteTableVGroupsForConnection(connectionId: string): Promise<void> {
+  return invoke("delete_table_vgroups_for_connection", { connectionId });
 }
 
 // --- Updates ---
@@ -4246,7 +4375,7 @@ export interface ElasticsearchDeleteByQueryResult {
   failures: string[];
 }
 
-export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, any>> {
+export async function elasticsearchGetIndexMetadata(connectionId: string, index: string, kind: ElasticsearchIndexMetadataKind): Promise<Record<string, unknown>> {
   return invoke("elasticsearch_get_index_metadata", {
     connectionId,
     index,
@@ -4620,6 +4749,10 @@ export async function meilisearchGetIndexOverview(connectionId: string, index: s
   });
 }
 
+export async function meilisearchCreateIndex(connectionId: string, input: MeilisearchCreateIndexInput): Promise<void> {
+  return invoke("meilisearch_create_index", { connectionId, input });
+}
+
 export async function meilisearchDeleteIndex(connectionId: string, index: string): Promise<void> {
   return invoke("meilisearch_delete_index", {
     connectionId,
@@ -4818,6 +4951,7 @@ export interface SqlFileRequest {
   database: string;
   filePath: string;
   continueOnError: boolean;
+  txnSessionId?: string;
   selectedTables?: SqlFileTable[];
   partCooldownMs?: number;
   skipRelationalConstraints?: boolean;
@@ -5400,6 +5534,8 @@ export interface TableExportRequest {
   csvQuoteMode?: CsvQuoteMode;
   columns?: string[];
   columnTypes?: Array<string | null | undefined>;
+  /** 与 `columns` 对齐的列 EXTRA 元数据（identity 等），用于 SQL INSERT 导出的 `SET IDENTITY_INSERT`。 */
+  columnExtras?: Array<string | null | undefined>;
   columnComments?: Array<string | null> | null;
   primaryKeys?: string[];
   /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
@@ -5462,6 +5598,11 @@ export interface QueryResultExportRequest {
   dateTimeFormat?: string;
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
+  /**
+   * 结果列对应的原表 EXTRA 元数据（identity 等）。后端据此为 SQL INSERT 导出
+   * 补上 `SET IDENTITY_INSERT` 包裹，缺省表示未知。
+   */
+  exportColumnExtras?: Array<string | null | undefined>;
   numericColumnRightAlign?: boolean;
   columnComments?: Array<string | null> | null;
   autoFilter?: boolean;

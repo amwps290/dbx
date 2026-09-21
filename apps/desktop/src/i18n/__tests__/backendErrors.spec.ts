@@ -46,7 +46,7 @@ const STRUCTURED_BACKEND_ERROR_KEYS = [
   "backendErrors.unknown",
 ] as const;
 
-// Reproduces the exact string crates/dbx-core/src/agent_service.rs builds on
+// Reproduces the exact string crates/dbx-drivers/src/agent_service.rs builds on
 // Windows: `\` line continuations strip the newline plus the following indent.
 const WINDOWS_JRE_REMOVE_ERROR = [
   "Failed to remove the old JRE directory: C:\\dbx\\jre21",
@@ -70,6 +70,16 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     name: "plugin update waits for active operations",
     message: "Plugin update blocked by active operations. Please wait for them to finish.",
     key: "pluginPlatform.updateBlockedByOperations",
+  },
+  {
+    name: "plugin update from a changed source needs confirmation",
+    message: "Plugin update source change requires confirmation: the offering repository, publisher, or signing key differs from the recorded install",
+    key: "pluginPlatform.updateSourceChangeRequired",
+  },
+  {
+    name: "plugin downgrade is rejected",
+    message: "Plugin downgrade to version 1.0.5 is not allowed (installed 1.1.0)",
+    key: "pluginPlatform.updateDowngradeRejected",
   },
   {
     name: "connection admission waits for plugin update",
@@ -123,7 +133,7 @@ const CASES: { name: string; message: string; key: string; params?: Record<strin
     key: "mongo.import.legacyInsertUnsupported",
   },
   {
-    // crates/dbx-core/src/mongodb_import_export.rs attributes a batch-level failure to a row.
+    // crates/dbx-core/src/data/mongodb_import_export.rs attributes a batch-level failure to a row.
     name: "MongoDB Legacy insertMany unsupported on a located row",
     message: "row 1: MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver",
     key: "mongo.import.legacyInsertUnsupported",
@@ -602,15 +612,17 @@ describe("backend error wording is pinned to the Rust sources", () => {
   const rust = (path: string) => readFileSync(new URL(`../../../../../${path}`, import.meta.url), "utf8");
 
   test.each([
-    ["crates/dbx-core/src/query_result_export.rs", "Streaming export is unsupported for this query. Simplify it or use a supported driver."],
-    ["crates/dbx-core/src/query_result_export.rs", "Streaming export needs a result-set session, but this driver returned no session_id."],
-    ["crates/dbx-core/src/mongodb_import_export.rs", "MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver"],
-    ["crates/dbx-core/src/mongodb_import_export.rs", "MongoDB Legacy Agent returned an invalid find cursor"],
-    ["crates/dbx-core/src/mongo_ops.rs", "MongoDB Legacy Agent rejected "],
-    ["crates/dbx-core/src/agent_service.rs", "Failed to remove the old JRE directory: "],
-    ["crates/dbx-core/src/agent_service.rs", "is in use by drivers: "],
-    ["crates/dbx-core/src/agent_service.rs", "agent-registry.json not found in the ZIP; not a valid offline driver package."],
-    ["crates/dbx-core/src/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
+    ["crates/dbx-core/src/data/query_result_export.rs", "Streaming export is unsupported for this query. Simplify it or use a supported driver."],
+    ["crates/dbx-core/src/data/query_result_export.rs", "Streaming export needs a result-set session, but this driver returned no session_id."],
+    ["crates/dbx-core/src/data/mongodb_import_export.rs", "MongoDB Legacy Agent does not support insertMany; upgrade or reinstall the MongoDB Legacy driver"],
+    ["crates/dbx-core/src/data/mongodb_import_export.rs", "MongoDB Legacy Agent returned an invalid find cursor"],
+    ["crates/dbx-core/src/query/mongo_ops.rs", "MongoDB Legacy Agent rejected "],
+    ["crates/dbx-drivers/src/agent_service.rs", "Failed to remove the old JRE directory: "],
+    ["crates/dbx-drivers/src/agent_service.rs", "is in use by drivers: "],
+    ["crates/dbx-drivers/src/agent_service.rs", "agent-registry.json not found in the ZIP; not a valid offline driver package."],
+    ["crates/dbx-core/src/admin/mq/adapters/kafka.rs", "Kafka does not support unloading topics"],
+    ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin update source change requires confirmation:"],
+    ["crates/dbx-plugin-runtime/src/plugins/installer.rs", "Plugin downgrade to version "],
     ["crates/dbx-web/src/auth.rs", "Please try again in {remaining}s"],
     ["crates/dbx-web/src/routes/agents.rs", "Close these database connections before updating drivers: "],
     ["src-tauri/src/commands/agents.rs", "Close these database connections before updating drivers: "],

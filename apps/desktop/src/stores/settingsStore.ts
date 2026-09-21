@@ -19,6 +19,7 @@ import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTar
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
 import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
+import { REDIS_DATABASE_DISPLAY_LIMIT_DEFAULT, REDIS_DATABASE_DISPLAY_LIMIT_MIN, REDIS_DATABASE_DISPLAY_LIMIT_MAX } from "@/lib/redis/redisDatabaseAlias";
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { normalizeSidebarCopyTableNameSeparator } from "@/lib/sidebar/sidebarTableNameCopy";
 import type { SidebarActivation } from "@/lib/sidebar/treeNodeClick";
@@ -457,8 +458,8 @@ export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
     group: "partner",
     provider: "openai-compatible",
     endpoint: "https://api.jalapeno-cloud.ai/v1",
-    model: "GLM-5.2",
-    models: [{ name: "GLM-5.2" }, { name: "DeepSeek-V4-Pro" }, { name: "MiniMax-M3" }],
+    model: "GLM-5.3",
+    models: [{ name: "GLM-5.3" }, { name: "DeepSeek-V4-Pro" }, { name: "MiniMax-M3" }],
     apiStyle: "completions",
     authMethod: "bearer",
     requiresApiKey: true,
@@ -473,8 +474,8 @@ export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
     group: "partner",
     provider: "openai-compatible",
     endpoint: "https://api.hualong.online/v1",
-    model: "gpt-5.6-terra",
-    models: [{ name: "gpt-5.6-terra" }],
+    model: "deepseek-v4.1-flash",
+    models: [{ name: "deepseek-v4.1-flash" }],
     apiStyle: "completions",
     authMethod: "bearer",
     requiresApiKey: true,
@@ -672,6 +673,13 @@ export const SIDEBAR_INDENT_DEFAULT = 16;
 const DISCONNECT_TAB_HANDLING_MODES = ["close-tabs", "keep-tabs-clear-results", "keep-tabs-keep-results"] as const;
 export type DisconnectTabHandlingMode = (typeof DISCONNECT_TAB_HANDLING_MODES)[number];
 
+/**
+ * 删除连接（连接配置已从磁盘移除，无法再重连）时，对该连接已打开页签的处理策略。
+ * 与 {@link DisconnectTabHandlingMode} 分开：断开连接仍可重连，删除则不会。
+ */
+const DELETE_CONNECTION_TAB_HANDLING_MODES = ["close-tabs", "keep-sql-tabs", "keep-pinned-sql-tabs", "keep-all-tabs"] as const;
+export type DeleteConnectionTabHandlingMode = (typeof DELETE_CONNECTION_TAB_HANDLING_MODES)[number];
+
 const CLICK_TABLE_NAVIGATION_TARGETS = ["data", "ddl"] as const;
 export type ClickTableNavigationTarget = (typeof CLICK_TABLE_NAVIGATION_TARGETS)[number];
 
@@ -743,6 +751,16 @@ export const DEFAULT_CUSTOM_THEMES: CustomTheme[] = [
 
 export type SidebarObjectInfoMode = "comment-inline" | "comment-aligned" | "comment-right" | "size" | "hidden";
 
+/**
+ * 删除连接时记住的「连接名 → 数据库」。带上 `dbType` 是为了只在新建同名**同类型**
+ * 连接时回填——像 "test"/"local" 这类名字常被不同数据库类型复用，跨类型回填会把
+ * 无意义的库名写进新连接配置。
+ */
+export interface RememberedConnectionDatabase {
+  database: string;
+  dbType: string;
+}
+
 export interface EditorSettings {
   fontFamily: string;
   fontSize: number;
@@ -770,9 +788,11 @@ export interface EditorSettings {
   showInsertValueHints: boolean;
   autoAliasTables: boolean;
   insertSpaceAfterCompletion: boolean;
+  sqlServerSpaceConfirmsCompletion: boolean;
   sortCompletionColumnsAlphabetically: boolean;
   selectFirstCompletionOnOpen: boolean;
   wordWrap: boolean;
+  showWhitespace: boolean;
   tableDdlWordWrap: boolean;
   refreshDdlOnOpen: boolean;
   excludeDdlStorage: boolean;
@@ -793,6 +813,9 @@ export interface EditorSettings {
   appLayout: "separated" | "classic";
   pageSize: number;
   tableOpenPageSize: number;
+  tableOpenSortMode: "none" | "database" | "local";
+  tableDatabaseSortDirection: "asc" | "desc";
+  tableLocalSortDirection: "asc" | "desc";
   queryResultMaxRowsEnabled: boolean;
   queryResultMaxRows: number;
   externalSqlEditorMaxMb: number;
@@ -857,14 +880,26 @@ export interface EditorSettings {
   sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: number;
   openTabsRestoreMode: OpenTabsRestoreMode;
   disconnectTabHandlingMode: DisconnectTabHandlingMode;
+  deleteConnectionTabHandlingMode: DeleteConnectionTabHandlingMode;
+  /** 删除连接时记住「连接名 → 数据库名」，新建同名同类型连接时自动回填并重绑保留的 SQL 页签。 */
+  rememberConnectionDatabaseOnDelete: boolean;
+  /** 已记住的「连接名 → { 数据库名, 数据库类型 }」映射，用于新建同名连接时自动选中数据库。 */
+  rememberedConnectionDatabases: Record<string, RememberedConnectionDatabase>;
   dataTabReuseMode: DataTabReuseMode;
   openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
   generateSqlIncludeDatabaseName: boolean;
   generateSqlQuoteIdentifiers: boolean;
   formatSqlOnSqlFileSave: boolean;
+  /** Legacy alias retained for settings-file compatibility. Mirrors autoUpdateApp. */
   updateNotificationsEnabled: boolean;
+  /** Legacy setting retained for compatibility. Mirrors autoUpdateApp after the centralized update controls are enabled. */
   autoDownloadUpdates: boolean;
+  autoUpdateApp: boolean;
+  autoUpdateDrivers: boolean;
+  autoUpdateJdbc: boolean;
+  autoUpdateMcp: boolean;
+  autoUpdatePlugins: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarCopyTableNameSeparator: ColumnNameCopySeparator;
   sidebarCopyTableNameIncludeSchema: boolean;
@@ -886,6 +921,8 @@ export interface EditorSettings {
   csvQuoteMode: CsvQuoteMode;
   /** Global Redis key-search templates; overridden by non-empty connection templates. */
   redisKeyTemplates: string[];
+  /** Sidebar database-list cap for Redis connections; the rest are revealed via "load more". */
+  redisDatabaseDisplayLimit: number;
   exportRowLimitEnabled: boolean;
   exportRowLimit: number;
   queryExportKeysetOptimizationEnabled: boolean;
@@ -1015,9 +1052,11 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   showInsertValueHints: true,
   autoAliasTables: true,
   insertSpaceAfterCompletion: true,
+  sqlServerSpaceConfirmsCompletion: false,
   sortCompletionColumnsAlphabetically: true,
   selectFirstCompletionOnOpen: true,
   wordWrap: false,
+  showWhitespace: false,
   tableDdlWordWrap: true,
   refreshDdlOnOpen: false,
   excludeDdlStorage: true,
@@ -1038,6 +1077,9 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   appLayout: "classic",
   pageSize: 100,
   tableOpenPageSize: 100,
+  tableOpenSortMode: "none",
+  tableDatabaseSortDirection: "asc",
+  tableLocalSortDirection: "asc",
   queryResultMaxRowsEnabled: true,
   queryResultMaxRows: DEFAULT_QUERY_RESULT_MAX_ROWS,
   externalSqlEditorMaxMb: 64,
@@ -1101,6 +1143,9 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
   openTabsRestoreMode: "all",
   disconnectTabHandlingMode: "close-tabs",
+  deleteConnectionTabHandlingMode: "close-tabs",
+  rememberConnectionDatabaseOnDelete: true,
+  rememberedConnectionDatabases: {},
   dataTabReuseMode: DEFAULT_DATA_TAB_REUSE_MODE,
   openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
@@ -1108,7 +1153,12 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
   updateNotificationsEnabled: true,
-  autoDownloadUpdates: false,
+  autoDownloadUpdates: true,
+  autoUpdateApp: true,
+  autoUpdateDrivers: true,
+  autoUpdateJdbc: true,
+  autoUpdateMcp: true,
+  autoUpdatePlugins: true,
   sidebarHiddenTablePrefixes: [],
   sidebarCopyTableNameSeparator: "comma",
   sidebarCopyTableNameIncludeSchema: false,
@@ -1129,6 +1179,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   exportBatchSize: 2000,
   csvQuoteMode: DEFAULT_CSV_QUOTE_MODE,
   redisKeyTemplates: [],
+  redisDatabaseDisplayLimit: REDIS_DATABASE_DISPLAY_LIMIT_DEFAULT,
   exportRowLimitEnabled: false,
   exportRowLimit: 100000,
   queryExportKeysetOptimizationEnabled: true,
@@ -1282,6 +1333,35 @@ function normalizeDisconnectTabHandlingMode(value: unknown, legacyCloseTabsOnDis
     return legacyCloseTabsOnDisconnect ? "close-tabs" : "keep-tabs-clear-results";
   }
   return DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
+}
+
+function normalizeDeleteConnectionTabHandlingMode(value: unknown): DeleteConnectionTabHandlingMode {
+  if (DELETE_CONNECTION_TAB_HANDLING_MODES.includes(value as DeleteConnectionTabHandlingMode)) {
+    return value as DeleteConnectionTabHandlingMode;
+  }
+  // 兼容早期试验值：把「保留页签」统一收敛到最接近的正式取值。
+  if (value === "keep-tabs" || value === "keep-sql") return "keep-sql-tabs";
+  if (value === "keep-pinned" || value === "keep-fixed-tabs") return "keep-pinned-sql-tabs";
+  if (value === "keep-all") return "keep-all-tabs";
+  return DEFAULT_EDITOR_SETTINGS.deleteConnectionTabHandlingMode;
+}
+
+/** 记住的连接名 → 数据库映射：只保留合法条目，并限制条目数量避免无限增长。 */
+const REMEMBERED_CONNECTION_DATABASES_LIMIT = 200;
+
+function normalizeRememberedConnectionDatabases(value: unknown): Record<string, RememberedConnectionDatabase> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const entries: [string, RememberedConnectionDatabase][] = [];
+  for (const [name, entry] of Object.entries(value as Record<string, unknown>)) {
+    const key = name.trim();
+    if (!key || !entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const { database, dbType } = entry as { database?: unknown; dbType?: unknown };
+    if (typeof database !== "string" || !database.trim() || typeof dbType !== "string") continue;
+    entries.push([key, { database, dbType }]);
+  }
+  if (entries.length <= REMEMBERED_CONNECTION_DATABASES_LIMIT) return Object.fromEntries(entries);
+  // 超出上限时保留最后写入的部分（对象插入顺序即写入顺序）。
+  return Object.fromEntries(entries.slice(entries.length - REMEMBERED_CONNECTION_DATABASES_LIMIT));
 }
 
 function normalizeClickTableNavigationTarget(value: unknown): ClickTableNavigationTarget {
@@ -1439,6 +1519,17 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
   const normalizedExtractorOptions = normalizeDataGridExtractorOptions(settings.dataGridExtractorOptions);
   const isLegacyExtractorOptions = typeof savedExtractorMigrationVersion !== "number" || savedExtractorMigrationVersion < DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION;
   const dataGridExtractorOptions = isLegacyExtractorOptions && normalizedExtractorOptions.dsv.nullText === "NULL" ? { ...normalizedExtractorOptions, dsv: { ...normalizedExtractorOptions.dsv, nullText: "" } } : normalizedExtractorOptions;
+  // Preserve the explicit intent behind the legacy update controls. Disabling
+  // update reminders was a full opt-out; disabling automatic downloads only
+  // opted out of downloading the DBX package itself.
+  const legacyUpdateOptOut = settings.updateNotificationsEnabled === false;
+  const legacyAutoDownload = typeof settings.autoDownloadUpdates === "boolean" ? settings.autoDownloadUpdates : undefined;
+  const autoUpdateApp = typeof settings.autoUpdateApp === "boolean" ? settings.autoUpdateApp : legacyUpdateOptOut ? false : (legacyAutoDownload ?? DEFAULT_EDITOR_SETTINGS.autoUpdateApp);
+  const autoDownloadUpdates = autoUpdateApp;
+  const autoUpdateDrivers = typeof settings.autoUpdateDrivers === "boolean" ? settings.autoUpdateDrivers : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateDrivers;
+  const autoUpdateJdbc = typeof settings.autoUpdateJdbc === "boolean" ? settings.autoUpdateJdbc : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateJdbc;
+  const autoUpdateMcp = typeof settings.autoUpdateMcp === "boolean" ? settings.autoUpdateMcp : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdateMcp;
+  const autoUpdatePlugins = typeof settings.autoUpdatePlugins === "boolean" ? settings.autoUpdatePlugins : legacyUpdateOptOut ? false : DEFAULT_EDITOR_SETTINGS.autoUpdatePlugins;
   return {
     fontFamily: normalizeFontFamily(settings.fontFamily, DEFAULT_EDITOR_SETTINGS.fontFamily),
     fontSize: settings.fontSize ?? DEFAULT_EDITOR_SETTINGS.fontSize,
@@ -1499,9 +1590,11 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showInsertValueHints: typeof settings.showInsertValueHints === "boolean" ? settings.showInsertValueHints : DEFAULT_EDITOR_SETTINGS.showInsertValueHints,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
     insertSpaceAfterCompletion: typeof settings.insertSpaceAfterCompletion === "boolean" ? settings.insertSpaceAfterCompletion : DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion,
+    sqlServerSpaceConfirmsCompletion: typeof settings.sqlServerSpaceConfirmsCompletion === "boolean" ? settings.sqlServerSpaceConfirmsCompletion : DEFAULT_EDITOR_SETTINGS.sqlServerSpaceConfirmsCompletion,
     sortCompletionColumnsAlphabetically: typeof settings.sortCompletionColumnsAlphabetically === "boolean" ? settings.sortCompletionColumnsAlphabetically : DEFAULT_EDITOR_SETTINGS.sortCompletionColumnsAlphabetically,
     selectFirstCompletionOnOpen: typeof settings.selectFirstCompletionOnOpen === "boolean" ? settings.selectFirstCompletionOnOpen : DEFAULT_EDITOR_SETTINGS.selectFirstCompletionOnOpen,
     wordWrap: settings.wordWrap ?? DEFAULT_EDITOR_SETTINGS.wordWrap,
+    showWhitespace: typeof settings.showWhitespace === "boolean" ? settings.showWhitespace : DEFAULT_EDITOR_SETTINGS.showWhitespace,
     tableDdlWordWrap: typeof settings.tableDdlWordWrap === "boolean" ? settings.tableDdlWordWrap : DEFAULT_EDITOR_SETTINGS.tableDdlWordWrap,
     excludeDdlStorage: typeof settings.excludeDdlStorage === "boolean" ? settings.excludeDdlStorage : DEFAULT_EDITOR_SETTINGS.excludeDdlStorage,
     refreshDdlOnOpen: typeof settings.refreshDdlOnOpen === "boolean" ? settings.refreshDdlOnOpen : DEFAULT_EDITOR_SETTINGS.refreshDdlOnOpen,
@@ -1522,6 +1615,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     appLayout: settings.appLayout ?? DEFAULT_EDITOR_SETTINGS.appLayout,
     pageSize: normalizeResultPageSize(settings.pageSize),
     tableOpenPageSize: normalizeResultPageSize(settings.tableOpenPageSize, DEFAULT_EDITOR_SETTINGS.tableOpenPageSize),
+    tableOpenSortMode: settings.tableOpenSortMode === "database" || settings.tableOpenSortMode === "local" ? settings.tableOpenSortMode : "none",
+    tableDatabaseSortDirection: settings.tableDatabaseSortDirection === "desc" ? "desc" : "asc",
+    tableLocalSortDirection: settings.tableLocalSortDirection === "desc" ? "desc" : "asc",
     queryResultMaxRowsEnabled: settings.queryResultMaxRowsEnabled !== false,
     queryResultMaxRows: normalizeQueryResultMaxRows(settings.queryResultMaxRows),
     externalSqlEditorMaxMb: normalizeExternalSqlEditorMaxMb(settings.externalSqlEditorMaxMb),
@@ -1608,6 +1704,9 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
         }
       ).closeQueryTabsOnDisconnect,
     ),
+    deleteConnectionTabHandlingMode: normalizeDeleteConnectionTabHandlingMode(settings.deleteConnectionTabHandlingMode),
+    rememberConnectionDatabaseOnDelete: typeof settings.rememberConnectionDatabaseOnDelete === "boolean" ? settings.rememberConnectionDatabaseOnDelete : DEFAULT_EDITOR_SETTINGS.rememberConnectionDatabaseOnDelete,
+    rememberedConnectionDatabases: normalizeRememberedConnectionDatabases(settings.rememberedConnectionDatabases),
     dataTabReuseMode: normalizeDataTabReuseMode(
       settings.dataTabReuseMode,
       (
@@ -1621,8 +1720,13 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     generateSqlIncludeDatabaseName: settings.generateSqlIncludeDatabaseName === true,
     generateSqlQuoteIdentifiers: typeof settings.generateSqlQuoteIdentifiers === "boolean" ? settings.generateSqlQuoteIdentifiers : DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers,
     formatSqlOnSqlFileSave: settings.formatSqlOnSqlFileSave === true,
-    updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
-    autoDownloadUpdates: settings.autoDownloadUpdates === true,
+    updateNotificationsEnabled: autoUpdateApp,
+    autoDownloadUpdates,
+    autoUpdateApp,
+    autoUpdateDrivers,
+    autoUpdateJdbc,
+    autoUpdateMcp,
+    autoUpdatePlugins,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarCopyTableNameSeparator: normalizeSidebarCopyTableNameSeparator(settings.sidebarCopyTableNameSeparator),
     sidebarCopyTableNameIncludeSchema: settings.sidebarCopyTableNameIncludeSchema === true,
@@ -1660,6 +1764,10 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     exportBatchSize: typeof settings.exportBatchSize === "number" && settings.exportBatchSize >= 100 && settings.exportBatchSize <= 100000 ? Math.round(settings.exportBatchSize) : DEFAULT_EDITOR_SETTINGS.exportBatchSize,
     csvQuoteMode: normalizeCsvQuoteMode(settings.csvQuoteMode),
     redisKeyTemplates: normalizeRedisKeyTemplates(settings.redisKeyTemplates),
+    redisDatabaseDisplayLimit:
+      typeof settings.redisDatabaseDisplayLimit === "number" && settings.redisDatabaseDisplayLimit >= REDIS_DATABASE_DISPLAY_LIMIT_MIN && settings.redisDatabaseDisplayLimit <= REDIS_DATABASE_DISPLAY_LIMIT_MAX
+        ? Math.round(settings.redisDatabaseDisplayLimit)
+        : DEFAULT_EDITOR_SETTINGS.redisDatabaseDisplayLimit,
     exportRowLimitEnabled: typeof settings.exportRowLimitEnabled === "boolean" ? settings.exportRowLimitEnabled : DEFAULT_EDITOR_SETTINGS.exportRowLimitEnabled,
     exportRowLimit: typeof settings.exportRowLimit === "number" && settings.exportRowLimit >= 100 && settings.exportRowLimit <= 2147483647 ? Math.round(settings.exportRowLimit) : DEFAULT_EDITOR_SETTINGS.exportRowLimit,
     queryExportKeysetOptimizationEnabled: typeof settings.queryExportKeysetOptimizationEnabled === "boolean" ? settings.queryExportKeysetOptimizationEnabled : DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled,
@@ -2263,9 +2371,11 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showInsertValueHints !== undefined) editorSettings.value.showInsertValueHints = partial.showInsertValueHints === true;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
     if (partial.insertSpaceAfterCompletion !== undefined) editorSettings.value.insertSpaceAfterCompletion = partial.insertSpaceAfterCompletion === true;
+    if (partial.sqlServerSpaceConfirmsCompletion !== undefined) editorSettings.value.sqlServerSpaceConfirmsCompletion = partial.sqlServerSpaceConfirmsCompletion === true;
     if (partial.sortCompletionColumnsAlphabetically !== undefined) editorSettings.value.sortCompletionColumnsAlphabetically = partial.sortCompletionColumnsAlphabetically === true;
     if (partial.selectFirstCompletionOnOpen !== undefined) editorSettings.value.selectFirstCompletionOnOpen = partial.selectFirstCompletionOnOpen === true;
     if (partial.wordWrap !== undefined) editorSettings.value.wordWrap = partial.wordWrap;
+    if (partial.showWhitespace !== undefined) editorSettings.value.showWhitespace = partial.showWhitespace === true;
     if (partial.tableDdlWordWrap !== undefined) editorSettings.value.tableDdlWordWrap = partial.tableDdlWordWrap === true;
     if (partial.excludeDdlStorage !== undefined) editorSettings.value.excludeDdlStorage = partial.excludeDdlStorage === true;
     if (partial.refreshDdlOnOpen !== undefined) editorSettings.value.refreshDdlOnOpen = partial.refreshDdlOnOpen === true;
@@ -2289,6 +2399,9 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.appLayout !== undefined) editorSettings.value.appLayout = partial.appLayout;
     if (partial.pageSize !== undefined) editorSettings.value.pageSize = normalizeResultPageSize(partial.pageSize);
     if (partial.tableOpenPageSize !== undefined) editorSettings.value.tableOpenPageSize = normalizeResultPageSize(partial.tableOpenPageSize, DEFAULT_EDITOR_SETTINGS.tableOpenPageSize);
+    if (partial.tableOpenSortMode !== undefined) editorSettings.value.tableOpenSortMode = partial.tableOpenSortMode === "database" || partial.tableOpenSortMode === "local" ? partial.tableOpenSortMode : "none";
+    if (partial.tableDatabaseSortDirection !== undefined) editorSettings.value.tableDatabaseSortDirection = partial.tableDatabaseSortDirection === "desc" ? "desc" : "asc";
+    if (partial.tableLocalSortDirection !== undefined) editorSettings.value.tableLocalSortDirection = partial.tableLocalSortDirection === "desc" ? "desc" : "asc";
     if (partial.queryResultMaxRowsEnabled !== undefined) editorSettings.value.queryResultMaxRowsEnabled = Boolean(partial.queryResultMaxRowsEnabled);
     if (partial.queryResultMaxRows !== undefined) editorSettings.value.queryResultMaxRows = normalizeQueryResultMaxRows(partial.queryResultMaxRows, editorSettings.value.queryResultMaxRows);
     if (partial.externalSqlEditorMaxMb !== undefined) editorSettings.value.externalSqlEditorMaxMb = normalizeExternalSqlEditorMaxMb(partial.externalSqlEditorMaxMb);
@@ -2358,14 +2471,34 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.sidebarBrowseObjectsOnDatabaseActivation !== undefined) editorSettings.value.sidebarBrowseObjectsOnDatabaseActivation = partial.sidebarBrowseObjectsOnDatabaseActivation === true;
     if (partial.openTabsRestoreMode !== undefined) editorSettings.value.openTabsRestoreMode = normalizeOpenTabsRestoreMode(partial.openTabsRestoreMode);
     if (partial.disconnectTabHandlingMode !== undefined) editorSettings.value.disconnectTabHandlingMode = normalizeDisconnectTabHandlingMode(partial.disconnectTabHandlingMode);
+    if (partial.deleteConnectionTabHandlingMode !== undefined) editorSettings.value.deleteConnectionTabHandlingMode = normalizeDeleteConnectionTabHandlingMode(partial.deleteConnectionTabHandlingMode);
+    if (partial.rememberConnectionDatabaseOnDelete !== undefined) editorSettings.value.rememberConnectionDatabaseOnDelete = partial.rememberConnectionDatabaseOnDelete === true;
+    if (partial.rememberedConnectionDatabases !== undefined) editorSettings.value.rememberedConnectionDatabases = normalizeRememberedConnectionDatabases(partial.rememberedConnectionDatabases);
     if (partial.dataTabReuseMode !== undefined) editorSettings.value.dataTabReuseMode = normalizeDataTabReuseMode(partial.dataTabReuseMode);
     if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
     if (partial.generateSqlIncludeDatabaseName !== undefined) editorSettings.value.generateSqlIncludeDatabaseName = partial.generateSqlIncludeDatabaseName === true;
     if (partial.generateSqlQuoteIdentifiers !== undefined) editorSettings.value.generateSqlQuoteIdentifiers = partial.generateSqlQuoteIdentifiers === true;
     if (partial.formatSqlOnSqlFileSave !== undefined) editorSettings.value.formatSqlOnSqlFileSave = partial.formatSqlOnSqlFileSave === true;
-    if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
-    if (partial.autoDownloadUpdates !== undefined) editorSettings.value.autoDownloadUpdates = partial.autoDownloadUpdates === true;
+    if (partial.updateNotificationsEnabled !== undefined) {
+      editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
+      editorSettings.value.autoUpdateApp = partial.updateNotificationsEnabled;
+      editorSettings.value.autoDownloadUpdates = partial.updateNotificationsEnabled;
+    }
+    if (partial.autoUpdateApp !== undefined) {
+      editorSettings.value.autoUpdateApp = partial.autoUpdateApp;
+      editorSettings.value.updateNotificationsEnabled = partial.autoUpdateApp;
+      editorSettings.value.autoDownloadUpdates = partial.autoUpdateApp;
+    }
+    if (partial.autoDownloadUpdates !== undefined) {
+      editorSettings.value.autoDownloadUpdates = partial.autoDownloadUpdates === true;
+      editorSettings.value.autoUpdateApp = partial.autoDownloadUpdates === true;
+      editorSettings.value.updateNotificationsEnabled = partial.autoDownloadUpdates === true;
+    }
+    if (partial.autoUpdateDrivers !== undefined) editorSettings.value.autoUpdateDrivers = partial.autoUpdateDrivers;
+    if (partial.autoUpdateJdbc !== undefined) editorSettings.value.autoUpdateJdbc = partial.autoUpdateJdbc;
+    if (partial.autoUpdateMcp !== undefined) editorSettings.value.autoUpdateMcp = partial.autoUpdateMcp;
+    if (partial.autoUpdatePlugins !== undefined) editorSettings.value.autoUpdatePlugins = partial.autoUpdatePlugins;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarCopyTableNameSeparator !== undefined) editorSettings.value.sidebarCopyTableNameSeparator = normalizeSidebarCopyTableNameSeparator(partial.sidebarCopyTableNameSeparator);
     if (partial.sidebarCopyTableNameIncludeSchema !== undefined) editorSettings.value.sidebarCopyTableNameIncludeSchema = partial.sidebarCopyTableNameIncludeSchema === true;
@@ -2386,6 +2519,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.exportBatchSize !== undefined) editorSettings.value.exportBatchSize = Math.min(100000, Math.max(100, Math.round(partial.exportBatchSize)));
     if (partial.csvQuoteMode !== undefined) editorSettings.value.csvQuoteMode = normalizeCsvQuoteMode(partial.csvQuoteMode);
     if (partial.redisKeyTemplates !== undefined) editorSettings.value.redisKeyTemplates = normalizeRedisKeyTemplates(partial.redisKeyTemplates);
+    if (partial.redisDatabaseDisplayLimit !== undefined) editorSettings.value.redisDatabaseDisplayLimit = Math.min(REDIS_DATABASE_DISPLAY_LIMIT_MAX, Math.max(REDIS_DATABASE_DISPLAY_LIMIT_MIN, Math.round(partial.redisDatabaseDisplayLimit)));
     if (partial.exportRowLimitEnabled !== undefined) editorSettings.value.exportRowLimitEnabled = partial.exportRowLimitEnabled;
     if (partial.exportRowLimit !== undefined) editorSettings.value.exportRowLimit = Math.min(2147483647, Math.max(100, Math.round(partial.exportRowLimit)));
     if (partial.queryExportKeysetOptimizationEnabled !== undefined) editorSettings.value.queryExportKeysetOptimizationEnabled = partial.queryExportKeysetOptimizationEnabled;
@@ -2450,6 +2584,46 @@ export const useSettingsStore = defineStore("settings", () => {
         throw error;
       }
     });
+  }
+
+  /**
+   * 批量记住「连接名 → 数据库名 + 类型」；数据库名或类型为空表示清除该条目。
+   * 删除连接时写入，新建同名同类型连接时回填。整体只触发一次设置落盘。
+   */
+  function rememberConnectionDatabases(entries: Iterable<readonly [string, string | undefined, string | undefined]>) {
+    const next = { ...editorSettings.value.rememberedConnectionDatabases };
+    let changed = false;
+    for (const [connectionName, database, dbType] of entries) {
+      const name = connectionName.trim();
+      const value = database?.trim();
+      if (!name || !value || !dbType) {
+        if (name && name in next) {
+          delete next[name];
+          changed = true;
+        }
+        continue;
+      }
+      const previous = next[name];
+      if (previous?.database === value && previous.dbType === dbType) continue;
+      // 重新插入以刷新写入顺序，让上限裁剪优先淘汰最旧的条目。
+      delete next[name];
+      next[name] = { database: value, dbType };
+      changed = true;
+    }
+    if (!changed) return;
+    updateEditorSettings({ rememberedConnectionDatabases: next });
+  }
+
+  /** 只在连接名与数据库类型都匹配时返回记住的数据库；类型不同视为无关记录。 */
+  function rememberedDatabaseForConnection(connectionName: string, dbType: string): string {
+    const name = connectionName.trim();
+    if (!name || !dbType) return "";
+    const entry = editorSettings.value.rememberedConnectionDatabases[name];
+    return entry && entry.dbType === dbType ? entry.database : "";
+  }
+
+  function clearRememberedConnectionDatabases() {
+    updateEditorSettings({ rememberedConnectionDatabases: {} });
   }
 
   function updateColumnFormatter(key: string, formatter: ColumnFormatterConfig | undefined) {
@@ -2603,6 +2777,9 @@ export const useSettingsStore = defineStore("settings", () => {
     initMcpGlobalPolicy,
     updateMcpGlobalPolicy,
     updateColumnFormatter,
+    rememberConnectionDatabases,
+    rememberedDatabaseForConnection,
+    clearRememberedConnectionDatabases,
     customColumnFormatterDeleteVersion,
     upsertCustomColumnFormatter,
     deleteCustomColumnFormatter,

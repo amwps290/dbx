@@ -1,9 +1,11 @@
 // @vitest-environment happy-dom
 
 import { createApp, nextTick, type App, type ComponentPublicInstance } from "vue";
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { InstalledPlugin, PluginRepositoryCatalogResult } from "@/types/database";
 import type { MarketplacePluginListing } from "@/lib/plugins/pluginMarketplace";
+import { COMPONENT_PLUGINS_UPDATED_EVENT, COMPONENT_UPDATES_CHANGED_EVENT } from "@/lib/updates/componentUpdateEvents";
 
 const mocks = vi.hoisted(() => ({
   listPlugins: vi.fn(),
@@ -20,13 +22,16 @@ const mocks = vi.hoisted(() => ({
   savePluginTrustedKey: vi.fn(),
   removePluginTrustedKey: vi.fn(),
   toast: vi.fn(),
+  isTauriRuntime: vi.fn(),
+  refreshPluginWorkbenches: vi.fn(),
 }));
 
 vi.mock("@/lib/backend/api", () => mocks);
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/stores/connectionStore", () => ({ useConnectionStore: () => ({ connections: [] }) }));
 vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({}) }));
-vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: mocks.isTauriRuntime }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
 vi.mock("vue-i18n", async () => {
   const { ref } = await import("vue");
   return { useI18n: () => ({ locale: ref("en"), t: (key: string, values = {}) => `${key}:${JSON.stringify(values)}` }) };
@@ -63,6 +68,7 @@ type PanelState = {
   marketplaceListings: MarketplacePluginListing[];
   catalogResults: PluginRepositoryCatalogResult[];
   installedPlugins: InstalledPlugin[];
+  repositories: PluginRepositoryCatalogResult["repository"][];
   selectedListingKeys: Set<string>;
   selectedInstalledIds: Set<string>;
   selectedPluginId: string;
@@ -78,7 +84,7 @@ type PanelState = {
   runBatchInstallUpdate: () => Promise<void>;
   runBatchUninstall: () => Promise<void>;
   installMarketplaceListing: (listing: MarketplacePluginListing) => Promise<void>;
-  installPlugin: (source: string) => Promise<void>;
+  installPlugin: (source: string | File) => Promise<void>;
   installPluginFromUrl: () => Promise<void>;
   uninstallSelectedPlugin: () => Promise<void>;
   rollbackSelectedPlugin: () => Promise<void>;
@@ -89,6 +95,18 @@ type PanelState = {
   removeTrustedKey: (keyId: string) => Promise<void>;
   toggleBatchMode: () => void;
   toggleInstalledSelection: (pluginId: string) => void;
+  installedUpdateIndex: Map<string, { listing: MarketplacePluginListing; repositoryName: string }>;
+  installedUpdateCount: number;
+  installedUpdateProgress: { current: number; total: number } | null;
+  catalogChecked: boolean;
+  marketplaceUnavailable: boolean;
+  catalogPartialFailure: boolean;
+  pendingSourceChange: { listing: MarketplacePluginListing } | null;
+  installedUnsupportedListingFor: (pluginId: string) => MarketplacePluginListing | null;
+  updateInstalledPlugin: (pluginId: string) => Promise<void>;
+  runUpdateAllInstalled: () => Promise<void>;
+  proceedUpdateSourceChange: () => void;
+  refreshMarketplace: () => Promise<void>;
 };
 
 function installed(id: string, version = "1.0.0"): InstalledPlugin {
@@ -118,6 +136,14 @@ function catalog(repositoryId: string, ids: string[], version = "3.0.0"): Plugin
       })),
     },
   };
+}
+
+function unsupportedCatalog(repositoryId: string, ids: string[], version = "3.0.0"): PluginRepositoryCatalogResult {
+  const result = catalog(repositoryId, ids, version);
+  // No artifact for this platform on the catalog's latest version: the listing is "unsupported"
+  // rather than updatable, so the installed tab has to say so instead of reading as up to date.
+  for (const plugin of result.catalog!.plugins) plugin.versions[0].artifacts = [];
+  return result;
 }
 
 function deferred<T>() {
@@ -165,6 +191,7 @@ async function expectBusyControls() {
 
 beforeEach(async () => {
   vi.resetAllMocks();
+  mocks.isTauriRuntime.mockReturnValue(false);
   localStorage.clear();
   vi.stubGlobal("fetch", vi.fn().mockResolvedValue({}));
   vi.stubGlobal("confirm", vi.fn().mockReturnValue(true));
@@ -180,7 +207,7 @@ beforeEach(async () => {
   mocks.removePluginTrustedKey.mockResolvedValue([]);
   host = document.createElement("div");
   document.body.append(host);
-  app = createApp(PluginContributionsPanel);
+  app = createApp(PluginContributionsPanel, { onPluginRuntimeReplaced: mocks.refreshPluginWorkbenches });
   const instance = app.mount(host) as ComponentPublicInstance & { $: { setupState: PanelState } };
   state = instance.$.setupState;
   await flushUi();
@@ -240,6 +267,202 @@ describe("PluginContributionsPanel batch source validation", () => {
   });
 });
 
+describe("PluginContributionsPanel update center synchronization", () => {
+  it("notifies after a single marketplace update without duplicating per batch item", async () => {
+    const listener = vi.fn();
+    window.addEventListener(COMPONENT_UPDATES_CHANGED_EVENT, listener);
+    try {
+      await state.installMarketplaceListing(state.marketplaceListings[0]);
+      expect(listener).toHaveBeenCalledOnce();
+
+      listener.mockClear();
+      state.selectAllUpdatable();
+      await state.runBatchInstallUpdate();
+      expect(listener).toHaveBeenCalledOnce();
+    } finally {
+      window.removeEventListener(COMPONENT_UPDATES_CHANGED_EVENT, listener);
+    }
+  });
+});
+
+describe("PluginContributionsPanel installed plugin pin controls", () => {
+  it("renders selection and pin actions as sibling native buttons", async () => {
+    state.batchMode = false;
+    await nextTick();
+
+    const pinButton = [...host.querySelectorAll<HTMLElement>("[title]")].find((element) => element.title.startsWith("pluginPlatform.pinPlugin:"));
+    expect(pinButton).toBeInstanceOf(HTMLButtonElement);
+    expect(pinButton?.parentElement?.tagName).toBe("DIV");
+    expect(pinButton?.parentElement?.querySelectorAll(":scope > button")).toHaveLength(2);
+    expect(pinButton?.parentElement?.querySelector("button [role='button']")).toBeNull();
+    expect(pinButton?.getAttribute("aria-pressed")).toBe("false");
+    expect(pinButton?.getAttribute("aria-label")).toBe(pinButton?.title);
+
+    state.batchMode = true;
+    await nextTick();
+    expect(host.querySelector("[title^='pluginPlatform.pinPlugin:'], [title^='pluginPlatform.unpinPlugin:']")).toBeNull();
+    expect(host.querySelector("[data-plugin-id='a']")?.querySelectorAll(":scope > button")).toHaveLength(1);
+  });
+
+  it("keeps pin click and keyboard activation isolated from row selection", async () => {
+    state.batchMode = false;
+    state.selectedPluginId = "a";
+    await nextTick();
+
+    const row = host.querySelector<HTMLElement>("[data-plugin-id='b']")!;
+    const [selectButton, pinButton] = [...row.querySelectorAll<HTMLButtonElement>(":scope > button")];
+    expect(selectButton).toBeInstanceOf(HTMLButtonElement);
+    expect(pinButton).toBeInstanceOf(HTMLButtonElement);
+    expect(selectButton.tabIndex).toBe(0);
+    expect(pinButton.tabIndex).toBe(0);
+
+    pinButton.click();
+    await nextTick();
+    expect(state.selectedPluginId).toBe("a");
+    expect(localStorage.getItem("dbx-plugin-pinned-ids")).toBe('["b"]');
+    expect(pinButton.getAttribute("aria-pressed")).toBe("true");
+
+    pinButton.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await nextTick();
+    expect(state.selectedPluginId).toBe("a");
+    expect(localStorage.getItem("dbx-plugin-pinned-ids")).toBe("[]");
+
+    pinButton.dispatchEvent(new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true }));
+    await nextTick();
+    expect(state.selectedPluginId).toBe("a");
+    expect(localStorage.getItem("dbx-plugin-pinned-ids")).toBe('["b"]');
+
+    selectButton.click();
+    await nextTick();
+    expect(state.selectedPluginId).toBe("b");
+    expect(localStorage.getItem("dbx-plugin-pinned-ids")).toBe('["b"]');
+  });
+});
+
+describe("PluginContributionsPanel installed-tab updates", () => {
+  it("updates an installed plugin through the marketplace install path", async () => {
+    state.batchMode = false;
+    state.selectedPluginId = "a";
+    await nextTick();
+    expect(state.installedUpdateCount).toBe(3);
+
+    await state.updateInstalledPlugin("a");
+    expect(mocks.installMarketplacePlugin).toHaveBeenCalledExactlyOnceWith({ repositoryId: "first", pluginId: "a", version: "3.0.0" });
+    expect(mocks.listPlugins).toHaveBeenCalledTimes(1);
+  });
+
+  it("updates all installed updatable plugins in one batch run", async () => {
+    state.batchMode = false;
+    mocks.installMarketplacePlugin.mockRejectedValueOnce(new Error("update denied"));
+    await state.runUpdateAllInstalled();
+    expect(mocks.installMarketplacePlugin).toHaveBeenCalledTimes(3);
+    expect(state.error).toBe("a: update denied");
+    expect(state.installedUpdateProgress).toBeNull();
+    expect(state.batchRunning).toBe(false);
+  });
+
+  it("keeps source-changed plugins out of batch update and reports them", async () => {
+    const moved = installed("a");
+    moved.provenance = { repositoryId: "other-repo", publisher: "DBX", signingKeyId: "test.key", source: "marketplace" };
+    state.installedPlugins = [moved, installed("b"), installed("c")];
+    await nextTick();
+    state.batchMode = false;
+
+    await state.runUpdateAllInstalled();
+    expect(mocks.installMarketplacePlugin).toHaveBeenCalledTimes(2);
+    expect(mocks.toast).toHaveBeenCalledWith(expect.stringContaining("pluginPlatform.batchSourceChangeSkipped"), 8000);
+  });
+
+  it("confirms a source change before updating with allowSourceChange", async () => {
+    const moved = installed("a");
+    moved.provenance = { repositoryId: "other-repo", publisher: "DBX", signingKeyId: "test.key", source: "marketplace" };
+    state.installedPlugins = [moved, installed("b"), installed("c")];
+    await nextTick();
+    state.batchMode = false;
+    state.selectedPluginId = "a";
+
+    await state.updateInstalledPlugin("a");
+    expect(mutationCount()).toBe(0);
+    expect(state.pendingSourceChange).not.toBeNull();
+
+    state.proceedUpdateSourceChange();
+    await flushUi();
+    expect(mocks.installMarketplacePlugin).toHaveBeenCalledExactlyOnceWith({ repositoryId: "first", pluginId: "a", version: "3.0.0", allowSourceChange: true });
+    expect(state.pendingSourceChange).toBeNull();
+  });
+
+  it("treats a failing enabled repository as an incomplete check, not as up to date", async () => {
+    state.batchMode = false;
+    state.repositories = [
+      { id: "first", name: "first", kind: "custom", enabled: true, managed: false },
+      { id: "second", name: "second", kind: "custom", enabled: true, managed: false },
+    ];
+    // "first" answers fine (a is up to date through it); "second" — b's only source — errors.
+    state.catalogResults = [catalog("first", ["a"]), { ...catalog("second", ["b"]), catalog: undefined, error: "catalog offline" }];
+    state.installedPlugins = [installed("a", "3.0.0"), installed("b", "1.0.0")];
+    await nextTick();
+
+    expect(state.catalogPartialFailure).toBe(true);
+    // a is up to date via the first catalog, but the check is incomplete: no "all up to date".
+    expect(host.textContent).not.toContain("pluginPlatform.allPluginsUpToDate");
+    // b's only repository failed: it must not be labelled "not in repositories".
+    expect(host.textContent).not.toContain("pluginPlatform.notInRepositories");
+    // The incomplete state is surfaced instead, with the failing repository named.
+    expect(host.textContent).toContain("pluginPlatform.updateCheckPartialFailure");
+    expect(host.textContent).toContain("second: catalog offline");
+  });
+
+  it("flips to the up-to-date state only after a real catalog check", async () => {
+    state.batchMode = false;
+    state.repositories = [{ id: "first", name: "first", kind: "custom", enabled: true, managed: false }];
+    await nextTick();
+    expect(state.catalogChecked).toBe(true);
+    expect(state.installedUpdateCount).toBe(3);
+
+    mocks.fetchPluginMarketplaceCatalogs.mockRejectedValueOnce(new Error("offline"));
+    await state.refreshMarketplace();
+    expect(state.marketplaceUnavailable).toBe(true);
+    expect(state.catalogChecked).toBe(false);
+
+    await state.refreshMarketplace();
+    expect(state.marketplaceUnavailable).toBe(false);
+
+    state.installedPlugins = [installed("a", "3.0.0"), installed("b", "3.0.0"), installed("c", "3.0.0")];
+    await nextTick();
+    expect(state.catalogChecked).toBe(true);
+    expect(state.installedUpdateCount).toBe(0);
+  });
+
+  it("surfaces installed plugins whose catalog version has no artifact for this platform", async () => {
+    state.batchMode = false;
+    state.catalogResults = [unsupportedCatalog("first", ["a", "b", "c"])];
+    await nextTick();
+
+    expect(state.installedUpdateCount).toBe(0);
+    expect(state.installedUnsupportedListingFor("a")?.target).toBe("darwin-arm64");
+    expect(host.querySelector('[data-plugin-id="a"]')?.textContent).toContain("pluginPlatform.marketplaceStatus.unsupported:");
+
+    // The unsupported badge replaces the amber update marker, never both.
+    state.catalogResults = [catalog("first", ["a", "b", "c"])];
+    await nextTick();
+    expect(state.installedUnsupportedListingFor("a")).toBeNull();
+    expect(host.querySelector('[data-plugin-id="a"]')?.textContent).not.toContain("pluginPlatform.marketplaceStatus.unsupported:");
+  });
+});
+
+describe("PluginContributionsPanel external component updates", () => {
+  it("refreshes installed plugins when the update center updates plugins", async () => {
+    expect(state.marketplaceListings.every((listing) => listing.status === "update")).toBe(true);
+    mocks.listPlugins.mockResolvedValueOnce([installed("a", "3.0.0"), installed("b", "3.0.0"), installed("c", "3.0.0")]);
+
+    window.dispatchEvent(new Event(COMPONENT_PLUGINS_UPDATED_EVENT));
+    await flushUi();
+
+    expect(mocks.listPlugins).toHaveBeenCalledOnce();
+    expect(state.marketplaceListings.every((listing) => listing.status === "installed")).toBe(true);
+  });
+});
+
 const batches = ["install", "uninstall"] as const;
 type Batch = (typeof batches)[number];
 const singles = ["marketplace", "uninstall", "rollback", "package", "url"] as const;
@@ -267,6 +490,86 @@ function startSingle(single: Single) {
 function singleApi(single: Single) {
   return { marketplace: mocks.installMarketplacePlugin, uninstall: mocks.uninstallPlugin, rollback: mocks.rollbackPlugin, package: mocks.installPluginPackage, url: mocks.installPluginPackageFromUrl }[single];
 }
+
+const replacements = ["marketplace", "rollback", "package", "url"] as const;
+
+describe("PluginContributionsPanel workbench refresh", () => {
+  it("connects the panel event to the App workbench refresh entry", () => {
+    const source = readFileSync("apps/desktop/src/App.vue", "utf8");
+    expect(source).toMatch(/<PluginCenterPage\b[^>]*@plugin-runtime-replaced="refreshPluginWorkbenches"/);
+  });
+
+  it.each(replacements)("refreshes once with the returned plugin ID after Web %s succeeds", async (single) => {
+    singleApi(single).mockResolvedValueOnce({ plugin: installed("replaced", "2.0.0") });
+    await startSingle(single);
+    expect(mocks.refreshPluginWorkbenches).toHaveBeenCalledExactlyOnceWith("replaced");
+  });
+
+  it("refreshes after uploading a Web package File", async () => {
+    const file = new File(["package"], "plugin.dbxp");
+    await state.installPlugin(file);
+    expect(mocks.installPluginPackage).toHaveBeenCalledExactlyOnceWith(file, false);
+    expect(mocks.refreshPluginWorkbenches).toHaveBeenCalledExactlyOnceWith("a");
+  });
+
+  it.each(replacements)("does not refresh after Web %s fails", async (single) => {
+    singleApi(single).mockRejectedValueOnce(new Error("replacement denied"));
+    await startSingle(single);
+    expect(mocks.refreshPluginWorkbenches).not.toHaveBeenCalled();
+  });
+
+  it.each(replacements)("still refreshes after Web %s succeeds but the panel list reload fails", async (single) => {
+    mocks.listPlugins.mockRejectedValue(new Error("list unavailable"));
+    await startSingle(single);
+    expect(mocks.refreshPluginWorkbenches).toHaveBeenCalledExactlyOnceWith("a");
+  });
+
+  it.each(replacements)("leaves Tauri %s refresh to the native runtime event", async (single) => {
+    mocks.isTauriRuntime.mockReturnValue(true);
+    await startSingle(single);
+    expect(singleApi(single)).toHaveBeenCalledOnce();
+    expect(mocks.refreshPluginWorkbenches).not.toHaveBeenCalled();
+  });
+
+  it("refreshes each successful Web batch replacement without waiting for the batch to finish", async () => {
+    const pending = deferred<unknown>();
+    state.selectAllUpdatable();
+    mocks.installMarketplacePlugin.mockImplementation(async ({ pluginId }: { pluginId: string }) => {
+      if (pluginId === "b") throw new Error("replacement denied");
+      if (pluginId === "c") return pending.promise;
+      return { plugin: installed(pluginId, "3.0.0") };
+    });
+    const running = state.runBatchInstallUpdate();
+    try {
+      await flushUi();
+      expect(mocks.refreshPluginWorkbenches.mock.calls).toEqual([["a"]]);
+    } finally {
+      pending.resolve({ plugin: installed("c", "3.0.0") });
+      await running;
+    }
+    expect(mocks.refreshPluginWorkbenches.mock.calls).toEqual([["a"], ["c"]]);
+    expect(state.error).toContain("replacement denied");
+  });
+
+  it("leaves Tauri batch refresh to the native runtime events", async () => {
+    mocks.isTauriRuntime.mockReturnValue(true);
+    state.selectAllUpdatable();
+    await state.runBatchInstallUpdate();
+    expect(mocks.installMarketplacePlugin).toHaveBeenCalledTimes(3);
+    expect(mocks.refreshPluginWorkbenches).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh for rejected confirmation, invalid URLs, or uninstall", async () => {
+    vi.mocked(window.confirm).mockReturnValueOnce(false);
+    await state.rollbackSelectedPlugin();
+    state.installUrl = "file:///plugin.dbxp";
+    await state.installPluginFromUrl();
+    expect(mutationCount()).toBe(0);
+    await state.uninstallSelectedPlugin();
+    expect(mocks.uninstallPlugin).toHaveBeenCalledOnce();
+    expect(mocks.refreshPluginWorkbenches).not.toHaveBeenCalled();
+  });
+});
 
 describe("PluginContributionsPanel mutation exclusion", () => {
   it.each(singles.flatMap((single) => [false, true].map((reject) => ({ single, reject }))))("releases single $single exclusion after rejection=$reject", async ({ single, reject }) => {

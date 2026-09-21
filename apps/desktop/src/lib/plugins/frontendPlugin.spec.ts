@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { InstalledPlugin, PluginConnectionProviderContribution, PluginFormFieldValue } from "@/types/database";
-import { buildPluginConnectionConfig, createFrontendPluginRegistry, initialPluginFormValues, parsePluginConnectionProviderOptionValue, pluginConnectionActionsForDialog, pluginConnectionFormValues, pluginConnectionProviderIcon, pluginConnectionProviderOptionValue } from "./frontendPlugin";
+import {
+  buildPluginConnectionConfig,
+  createFrontendPluginRegistry,
+  initialPluginFormValues,
+  parsePluginConnectionProviderOptionValue,
+  pluginConnectionActionsForDialog,
+  pluginConnectionConnectTimeoutDefault,
+  pluginConnectionFormValues,
+  pluginConnectionProviderIcon,
+  pluginConnectionProviderOptionValue,
+} from "./frontendPlugin";
 
 function installedPlugin(id: string, contributions: InstalledPlugin["manifest"]["contributions"] = []): InstalledPlugin {
   return {
@@ -70,6 +80,28 @@ describe("FrontendPluginRegistry", () => {
     expect(transient.save_password).toBe(false);
   });
 
+  it("materializes the provider's connect_timeout_secs default into the typed timeout", () => {
+    const provider = connectionProvider({
+      fields: [{ key: "connect_timeout_secs", label: "Connect timeout", type: "number", default: 30 }],
+    });
+    expect(pluginConnectionConnectTimeoutDefault(provider)).toBe(30);
+    expect(buildPluginConnectionConfig("example.plugin", provider, {}).connect_timeout_secs).toBe(30);
+    // An advanced-form value the user tuned is mirrored into the typed field too.
+    expect(buildPluginConnectionConfig("example.plugin", provider, { connect_timeout_secs: 60 }).connect_timeout_secs).toBe(60);
+
+    // Once the provider declares the field, its resolved value is the single
+    // source of truth: a stale typed value from before the declaration is
+    // healed to the declared default.
+    const existing = buildPluginConnectionConfig("example.plugin", connectionProvider({ fields: [] }), {});
+    existing.connect_timeout_secs = 7;
+    expect(buildPluginConnectionConfig("example.plugin", provider, {}, existing).connect_timeout_secs).toBe(30);
+
+    // Providers without the well-known field keep the generic 10s default.
+    const generic = connectionProvider({ fields: [] });
+    expect(pluginConnectionConnectTimeoutDefault(generic)).toBeUndefined();
+    expect(buildPluginConnectionConfig("example.plugin", generic, {}).connect_timeout_secs).toBe(10);
+  });
+
   it("round-trips plugin connection provider picker values", () => {
     const value = pluginConnectionProviderOptionValue("example/plugin", "ssh:main");
     expect(parsePluginConnectionProviderOptionValue(value)).toEqual({ pluginId: "example/plugin", providerId: "ssh:main" });
@@ -114,6 +146,68 @@ describe("FrontendPluginRegistry", () => {
     expect(views).toHaveLength(1);
     expect(views[0]?.contribution.id).toBe("example.graph");
     expect(views[0]?.contribution.label).toBe("Graph");
+  });
+
+  it("resolves the plugin UI contribution behind a workbench or result-view tab", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "workbench", id: "example.main", label: "Example Workbench", icon: "assets/main.svg" },
+        { type: "result-view", id: "example.graph", label: "Graph", icon: "assets/graph.svg" },
+      ]),
+    ]);
+
+    const workbench = registry.findUiContribution("com.example.plugin", "example.main");
+    expect(workbench?.contribution).toMatchObject({ type: "workbench", id: "example.main", label: "Example Workbench", icon: "assets/main.svg" });
+
+    // The result-view keeps its own id and display metadata: the plugin UI is
+    // told which declared contribution the user opened, and it is not a workbench.
+    const resultView = registry.findUiContribution("com.example.plugin", "example.graph");
+    expect(resultView?.contribution).toMatchObject({ type: "result-view", id: "example.graph", label: "Graph", icon: "assets/graph.svg" });
+  });
+
+  it("keeps workbench lookups scoped to workbench contributions", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "workbench", id: "example.main", label: "Example Workbench" },
+        { type: "result-view", id: "example.graph", label: "Graph" },
+      ]),
+    ]);
+
+    // `findWorkbench` answers `host.openWorkbench` and `connection-provider.workbench`:
+    // a result-view id must never satisfy it.
+    expect(registry.findWorkbench("com.example.plugin", "example.graph")).toBeUndefined();
+    expect(registry.findWorkbench("com.example.plugin", "example.main")?.contribution.id).toBe("example.main");
+  });
+
+  it("does not resolve unknown, foreign, or non-UI contributions as plugin UI", () => {
+    const registry = createFrontendPluginRegistry([
+      installedPlugin("com.example.plugin", [
+        { type: "result-view", id: "example.graph", label: "Graph" },
+        { type: "context-menu", id: "example.inspect", label: "Inspect", menu: "connection" },
+        { type: "filesystem-provider", id: "example.files", label: "Files", schemes: ["example"] },
+      ]),
+      installedPlugin("com.example.other", []),
+    ]);
+
+    expect(registry.findUiContribution("com.example.plugin", "example.graph")?.contribution.type).toBe("result-view");
+    expect(registry.findUiContribution("com.example.plugin", "example.missing")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.other", "example.graph")).toBeUndefined();
+    // Context menus render natively and filesystem providers own their tab mode.
+    expect(registry.findUiContribution("com.example.plugin", "example.inspect")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.plugin", "example.files")).toBeUndefined();
+  });
+
+  it("does not resolve plugin UI contributions of incompatible plugins", () => {
+    const plugin = installedPlugin("com.example.plugin", [
+      { type: "workbench", id: "example.main", label: "Example Workbench" },
+      { type: "result-view", id: "example.graph", label: "Graph" },
+    ]);
+    plugin.compatibility = { compatible: false, errors: ["Unsupported host API"] };
+
+    const registry = createFrontendPluginRegistry([plugin]);
+
+    expect(registry.findUiContribution("com.example.plugin", "example.main")).toBeUndefined();
+    expect(registry.findUiContribution("com.example.plugin", "example.graph")).toBeUndefined();
   });
 
   it("indexes context-menu contributions per menu surface", () => {
@@ -194,6 +288,10 @@ describe("FrontendPluginRegistry", () => {
         database_type: "unsafe",
         fields: [],
       },
+      // Every contribution the host renders through the plugin UI entrypoint
+      // resolves its icon asset path the same way.
+      { type: "workbench", id: "unsafe.main", label: "Unsafe workbench", icon: "../outside.svg" },
+      { type: "result-view", id: "unsafe.graph", label: "Unsafe graph", icon: "/outside.svg" },
     ]);
     plugin.manifest.icon = "\\outside.svg";
 
@@ -202,6 +300,8 @@ describe("FrontendPluginRegistry", () => {
 
     expect(definition.plugin.manifest.icon).toBeUndefined();
     expect(pluginConnectionProviderIcon(entry)).toBeUndefined();
+    expect(createFrontendPluginRegistry([plugin]).listWorkbenches()[0]?.contribution.icon).toBeUndefined();
+    expect(createFrontendPluginRegistry([plugin]).listResultViews()[0]?.contribution.icon).toBeUndefined();
   });
 
   it("localizes plugin metadata, contributions, and form fields", () => {

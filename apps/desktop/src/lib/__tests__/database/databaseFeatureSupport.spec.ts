@@ -119,6 +119,10 @@ describe("connection query actions", () => {
     expect(supportsConnectionQueryActions("mq")).toBe(false);
     expect(supportsConnectionQueryActions("mqtt")).toBe(false);
   });
+
+  it("hides the sidebar new-query entry for Meilisearch", () => {
+    expect(supportsConnectionQueryActions("meilisearch")).toBe(false);
+  });
 });
 
 describe("message queue query capabilities", () => {
@@ -321,6 +325,10 @@ describe("supportsTableVacuum", () => {
 describe("supportsTableImport", () => {
   it("enables OceanBase Oracle table import", () => {
     expect(supportsTableImport("oceanbase-oracle")).toBe(true);
+  });
+
+  it("keeps Xugu table import available", () => {
+    expect(supportsTableImport("xugu")).toBe(true);
   });
 });
 

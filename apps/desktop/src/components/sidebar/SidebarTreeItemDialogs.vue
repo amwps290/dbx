@@ -113,6 +113,12 @@ const {
   cloneMongoCollectionLoading,
   confirmCloneMongoCollection,
   showCreateMongoIndexDialog,
+  showCreateMeilisearchIndexDialog,
+  meilisearchCreateIndexUid,
+  meilisearchCreateIndexPrimaryKey,
+  meilisearchCreateIndexError,
+  meilisearchCreateIndexLoading,
+  confirmCreateMeilisearchIndex,
   mongoCreateIndexForm,
   mongoCreateIndexFieldOptions,
   mongoCreateIndexError,
@@ -208,6 +214,7 @@ watch(
     showRenameMongoCollectionDialog,
     showCloneMongoCollectionDialog,
     showCreateMongoIndexDialog,
+    showCreateMeilisearchIndexDialog,
     showMongoIndexManagerDialog,
     showRedisDatabaseAliasDialog,
     showCreateSchemaDialog,
@@ -396,6 +403,33 @@ watch(
         <Button :disabled="mongoCreateIndexLoading || !mongoCreateIndexCanSubmit" @click="confirmCreateMongoIndex">
           <Loader2 v-if="mongoCreateIndexLoading" class="mr-2 h-4 w-4 animate-spin" />
           {{ t("contextMenu.createMongoIndex") }}
+        </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showCreateMeilisearchIndexDialog">
+    <DialogContent class="sm:max-w-[420px]">
+      <DialogHeader>
+        <DialogTitle>{{ t("meilisearch.createIndex") }}</DialogTitle>
+      </DialogHeader>
+      <div class="grid gap-3">
+        <label class="grid gap-1.5 text-sm font-medium">
+          {{ t("meilisearch.createIndexUid") }}
+          <Input v-model="meilisearchCreateIndexUid" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexUidPlaceholder')" @keydown.enter.prevent="confirmCreateMeilisearchIndex" />
+        </label>
+        <label class="grid gap-1.5 text-sm font-medium">
+          {{ t("meilisearch.createIndexPrimaryKey") }}
+          <Input v-model="meilisearchCreateIndexPrimaryKey" :disabled="meilisearchCreateIndexLoading" :placeholder="t('meilisearch.createIndexPrimaryKeyPlaceholder')" />
+          <span class="text-xs font-normal text-muted-foreground">{{ t("meilisearch.createIndexPrimaryKeyHelp") }}</span>
+        </label>
+        <p v-if="meilisearchCreateIndexError" class="text-sm text-destructive">{{ meilisearchCreateIndexError }}</p>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" :disabled="meilisearchCreateIndexLoading" @click="showCreateMeilisearchIndexDialog = false">{{ t("dangerDialog.cancel") }}</Button>
+        <Button :disabled="meilisearchCreateIndexLoading || !meilisearchCreateIndexUid.trim()" @click="confirmCreateMeilisearchIndex">
+          <Loader2 v-if="meilisearchCreateIndexLoading" class="mr-2 h-4 w-4 animate-spin" />
+          {{ t("meilisearch.createIndex") }}
         </Button>
       </DialogFooter>
     </DialogContent>
@@ -600,21 +634,23 @@ watch(
   </Dialog>
 
   <Dialog :open="showCreateDatabasePreviewDialog" @update:open="updateCreateDatabasePreviewDialog">
-    <DialogContent class="sm:max-w-[720px]">
+    <DialogContent class="sm:max-w-[720px] grid-rows-[auto_minmax(0,1fr)_auto]">
       <DialogHeader>
         <DialogTitle>{{ t("contextMenu.createDatabaseSqlPreview") }}</DialogTitle>
       </DialogHeader>
-      <pre class="max-h-[48vh] min-h-44 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
-      <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid gap-2 rounded-md border p-3">
-        <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
-          <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
-          <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
-          <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
-          <span class="min-w-0">
-            <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
-            <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
-            <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
-          </span>
+      <div class="grid min-h-0 max-h-full min-w-0 gap-3 overflow-hidden" :class="createDatabaseAuthorizationResults.length > 0 ? 'h-[70vh] grid-rows-[minmax(0,1fr)_minmax(0,1fr)]' : 'h-[48vh] grid-rows-[minmax(0,1fr)]'">
+        <pre class="min-h-0 min-w-0 overflow-auto overscroll-contain whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
+        <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid min-h-0 min-w-0 content-start gap-2 overflow-y-auto overscroll-contain rounded-md border p-3">
+          <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
+            <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+            <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+            <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
+            <span class="min-w-0">
+              <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
+              <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
+              <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
+            </span>
+          </div>
         </div>
       </div>
       <DialogFooter>

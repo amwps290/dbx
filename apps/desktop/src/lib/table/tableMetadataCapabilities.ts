@@ -47,6 +47,11 @@ const capabilityByType: Partial<Record<DatabaseType, Partial<TableMetadataCapabi
     constraints: true,
     partitions: true,
   },
+  // SQL Server reports PK/UNIQUE/FOREIGN KEY/CHECK/DEFAULT constraints from the
+  // sys.* catalog views through list_constraints.
+  sqlserver: {
+    constraints: true,
+  },
   mongodb: {
     columns: false,
     foreignKeys: false,

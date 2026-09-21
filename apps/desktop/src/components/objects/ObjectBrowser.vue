@@ -124,7 +124,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import MySqlEventEditor from "@/components/objects/MySqlEventEditor.vue";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
-import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
+import { applyDdlDatabaseQualifier, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
@@ -155,7 +155,7 @@ import {
   type ObjectBrowserSortDirection,
   type ObjectBrowserSortKey,
 } from "@/lib/table/objectBrowserRows";
-import { isSourceOnlyObjectBrowserRow, resolveRowClickAction, shouldDeferSingleClick, type ObjectBrowserRowAction } from "@/lib/table/objectBrowserRowAction";
+import { isSourceOnlyObjectBrowserRow, resolveRowClickAction, shouldDeferSingleClick, singleClickRowAction, type ObjectBrowserRowAction } from "@/lib/table/objectBrowserRowAction";
 import { objectBrowserTableSelectionAnchor, objectBrowserTableSelectionRange } from "@/lib/table/objectBrowserSelection";
 import { customTypeCapabilities, supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
@@ -1025,13 +1025,18 @@ function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
   if (row.type === "TABLE") tableSelectionAnchorId.value = row.id;
   const activation = settingsStore.editorSettings.sidebarActivation;
   const { action, isDouble } = resolveRowClickAction(row, event.detail, activation, effectiveDatabaseType.value);
-  // Double click: cancel any pending single-click and fire immediately
+  // Double click: cancel any pending single-click and fire immediately. When
+  // the row's single/double actions are identical (e.g. VIEW → open-source),
+  // this gesture's first click already ran it — re-executing would toggle the
+  // just-opened side panel back off (or emit open-table twice for MongoDB).
   if (isDouble) {
     if (singleClickTimer) {
       clearTimeout(singleClickTimer);
       singleClickTimer = null;
     }
-    executeRowAction(row, action);
+    if (action !== singleClickRowAction(row, effectiveDatabaseType.value)) {
+      executeRowAction(row, action);
+    }
     return;
   }
   // Single click: defer when the row has a distinct double-click action so a
@@ -1193,7 +1198,8 @@ async function fetchTableDdl(force = settingsStore.editorSettings.refreshDdlOnOp
     const { ddl } = await loadObjectDdl(tableMetadataRequest(row), { force });
     if (sidePanelGuard.isStale(epoch)) return;
     const formatDialect = sqlFormatDialectForDbType(effectiveDatabaseType.value);
-    rawTableDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? ddl : omitDdlIdentifierQuotes(ddl, formatDialect);
+    const unqualified = applyDdlDatabaseQualifier(ddl, formatDialect, effectiveDatabaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.database, props.catalog);
+    rawTableDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? unqualified : omitDdlIdentifierQuotes(unqualified, formatDialect);
     loadedSuccessfully = true;
   } catch (e: any) {
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1511,7 +1517,7 @@ async function openSource(row: ObjectBrowserRow) {
   try {
     const result = await api.getObjectSource(connectionId, database, schema, row.name, row.type as ObjectSourceKind, row.signature ?? undefined);
     if (sidePanelGuard.isStale(epoch)) return;
-    sourceCanEdit.value = result.editable !== false && !["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY"].includes(row.type);
+    sourceCanEdit.value = result.editable !== false && !["TRIGGER", "TYPE", "TYPE_BODY"].includes(row.type) && (row.type !== "SEQUENCE" || effectiveDatabaseType.value === "oceanbase-oracle");
     const editable = sourceCanEdit.value
       ? await api.buildEditableObjectSource({
           databaseType: effectiveDatabaseType.value,
@@ -1525,9 +1531,9 @@ async function openSource(row: ObjectBrowserRow) {
     // Viewing database source must preserve its original whitespace and comments;
     // formatting remains an explicit editor action instead of altering it on open.
     sourceEditableText.value = editable;
-    sourceContent.value = editable;
+    sourceContent.value = row.type === "SEQUENCE" ? result.source : editable;
     sourceDraft.value = editable;
-    sourceEditing.value = sourceCanEdit.value;
+    sourceEditing.value = sourceCanEdit.value && row.type !== "SEQUENCE";
     if (!sourceCanEdit.value && row.type !== "SEQUENCE") {
       toast(t("objects.sourceReadOnly"), 3000);
     }
@@ -3156,7 +3162,11 @@ function clearObjectSearch() {
   getSearchInput()?.focus();
 }
 
-defineExpose({ focusSearch, refresh });
+function matchesRefreshScope(scope: { schema?: string; catalog?: string }): boolean {
+  return (selectedSchema.value || "") === (scope.schema || "") && (props.catalog || "") === (scope.catalog || "");
+}
+
+defineExpose({ focusSearch, refresh, matchesRefreshScope });
 
 onBeforeUnmount(() => {
   objectBrowserRowsLoadGuard.invalidate();
@@ -3438,8 +3448,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           {{ props.database }}
         </span>
       </div>
-      <div class="flex min-w-24 flex-1 items-center gap-2">
-        <div class="relative min-w-0 flex-1">
+      <div class="flex flex-1 items-center gap-2">
+        <div class="relative min-w-[6rem] flex-1">
           <Search class="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input v-model="search" data-object-search-input class="h-7 pl-8 pr-6 text-xs" :placeholder="isMongodb ? t('objects.searchCollections') : t('objects.search')" @keydown="onSearchKeydown" />
           <button v-if="search" type="button" class="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('common.clear')" @click="clearObjectSearch">
@@ -3447,7 +3457,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           </button>
         </div>
         <div v-if="showObjectFilter && showInlineObjectFilter" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
-          <button v-for="filter in objectFilters" :key="filter" type="button" class="h-6 rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }" @click="selectObjectFilter(filter)">
+          <button
+            v-for="filter in objectFilters"
+            :key="filter"
+            type="button"
+            class="h-6 shrink-0 whitespace-nowrap rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }"
+            @click="selectObjectFilter(filter)"
+          >
             {{ filterLabel(filter) }}
           </button>
         </div>

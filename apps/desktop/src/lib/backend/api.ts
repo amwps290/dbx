@@ -23,6 +23,10 @@ async function getBackend(): Promise<Backend> {
 // ---------------------------------------------------------------------------
 
 function forward<K extends keyof Backend>(name: K): Backend[K] {
+  // SAFETY: the resolved module is one of exactly two implementations of the same
+  // surface — `http.ts` imports its request/response types from `tauri.ts` on
+  // purpose, so both transports are kept signature-compatible by construction.
+  // TypeScript cannot express that cross-module equivalence, hence the cast.
   return (async (...args: unknown[]) => {
     const startedAt = performance.now();
     const operation = String(name);
@@ -263,6 +267,8 @@ export const prepareQueryPaginationExecutionPlan = forward("prepareQueryPaginati
 export const buildSortedQuerySql = forward("buildSortedQuerySql");
 export const buildExplainSql = forward("buildExplainSql");
 export const getExplainInfo = forward("getExplainInfo");
+export const getPluginPlanCapabilities = forward("getPluginPlanCapabilities");
+export const getPluginEstimatedPlan = forward("getPluginEstimatedPlan");
 export const buildCreateUserSql = forward("buildCreateUserSql");
 export const buildDroppedFilePreviewSql = forward("buildDroppedFilePreviewSql");
 export const buildTableSelectSql = forward("buildTableSelectSql");
@@ -430,6 +436,9 @@ export const inspectExternalSqlFile = forward("inspectExternalSqlFile");
 export const writeExternalSqlFile = forward("writeExternalSqlFile");
 export const saveExternalSqlFile = forward("saveExternalSqlFile");
 export const listSqlFilesInFolder = forward("listSqlFilesInFolder");
+export const globalSearch = forward("globalSearch");
+export const loadGlobalSearchSettings = forward("loadGlobalSearchSettings");
+export const saveGlobalSearchSettings = forward("saveGlobalSearchSettings");
 export const createSqlFileInFolder = forward("createSqlFileInFolder");
 export const renameSqlFileInFolder = forward("renameSqlFileInFolder");
 export const deleteSqlFileInFolder = forward("deleteSqlFileInFolder");
@@ -838,6 +847,7 @@ export const meilisearchGetIndexSettings = forward("meilisearchGetIndexSettings"
 export const meilisearchUpdateIndexSettings = forward("meilisearchUpdateIndexSettings");
 export const meilisearchGetIndexStats = forward("meilisearchGetIndexStats");
 export const meilisearchGetIndexOverview = forward("meilisearchGetIndexOverview");
+export const meilisearchCreateIndex = forward("meilisearchCreateIndex");
 export const meilisearchDeleteIndex = forward("meilisearchDeleteIndex");
 export const meilisearchDeleteAllDocuments = forward("meilisearchDeleteAllDocuments");
 export const meilisearchGetSystemOverview = forward("meilisearchGetSystemOverview");
@@ -896,6 +906,9 @@ export const getAppSupportInfo = forward("getAppSupportInfo");
 // Layout
 export const saveSidebarLayout = forward("saveSidebarLayout");
 export const loadSidebarLayout = forward("loadSidebarLayout");
+export const saveTableVGroups = forward("saveTableVGroups");
+export const loadTableVGroups = forward("loadTableVGroups");
+export const deleteTableVGroupsForConnection = forward("deleteTableVGroupsForConnection");
 
 // ---------------------------------------------------------------------------
 // Re-export all types from tauri.ts (shared between both backends)
@@ -921,6 +934,8 @@ export type {
   AgentOfflineExportCandidate,
   AgentOfflineExportPreview,
   AgentOfflineExportResult,
+  AgentOfflineImportFailure,
+  AgentOfflineImportResult,
   DriverStoreUsage,
   DriverStoreUsageItem,
   DriverRuntimeHealth,
@@ -1069,6 +1084,9 @@ export type {
   QueryResultExportRequest,
   AgentEvent,
   SqlFileEntry,
+  GlobalSearchRequest,
+  GlobalSearchMatch,
+  GlobalSearchSettings,
 } from "@/lib/backend/tauri";
 
 // MQTT

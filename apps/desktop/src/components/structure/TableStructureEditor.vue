@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, Settings, SlidersHorizontal, Trash2, UserRound, X } from "@lucide/vue";
+import { AlertTriangle, Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, ClipboardList, Copy, Database, Info, KeyRound, ListChevronsUpDown, Loader2, Maximize2, Pencil, Plus, RefreshCw, RotateCcw, Save, Search, Settings, SlidersHorizontal, Trash2, UserRound, X } from "@lucide/vue";
 import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -28,12 +28,14 @@ import { useTheme } from "@/composables/useTheme";
 import { editorFontTheme, loadEditorTheme } from "@/lib/editor/editorThemes";
 import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect";
 import { useToast } from "@/composables/useToast";
+import { useVerticalOverlayScrollbar } from "@/composables/useVerticalOverlayScrollbar";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
-import { formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
+import { applyDdlDatabaseQualifier, formatGeneratedDdlIdentifierQuotes, omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import DataGridCopyColumnNamesDialog from "@/components/grid/DataGridCopyColumnNamesDialog.vue";
+import { formatSqlForDisplay, sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { queryTimeoutSecsForConcurrentIndex, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
 import { invalidateObjectDdl, loadObjectDdl } from "@/lib/metadata/objectDdlCache";
@@ -115,8 +117,12 @@ import {
   structureColumnSelectionRange,
   isSyntheticContextMenuClick,
   resolveColumnSelectionActiveId,
+  structureColumnCommentsForCopy,
+  structureColumnNamesForCopy,
   tableStructureIdentifierComparisonKey,
   toColumnNames,
+  copySourceColumnDetails,
+  matchesCopySourceColumnSearch,
 } from "@/lib/table/tableStructureEditorState";
 import { CREATE_DATABASE_CHARSET_OPTIONS, createDatabaseCollationOptionsForCharset, fallbackCreateDatabaseCharsetMetadata, normalizeCreateDatabaseCharsetKey, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import type { CreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
@@ -141,6 +147,9 @@ const triggersScrollerRef = ref<StructureScrollerRef>();
 const partitionsScrollerRef = ref<StructureScrollerRef>();
 const ddlScrollerRef = ref<StructureScrollerRef>();
 const structureHorizontalScrollbarTrackRef = ref<HTMLDivElement>();
+const columnsTableRef = ref<HTMLElement | null>(null);
+const indexesTableRef = ref<HTMLElement | null>(null);
+const structureVerticalScrollbarTrackRef = ref<HTMLElement | null>(null);
 const structureHorizontalScrollbarThumbRef = ref<HTMLDivElement>();
 const hasStructureHorizontalOverflow = ref(false);
 const dynamicDataTypeOptionsCache = new Map<string, string[]>();
@@ -180,6 +189,21 @@ const emit = defineEmits<{
 }>();
 
 const activeTab = ref<TableInfoTab>("columns");
+
+// DBX hides native scrollbars, so the columns/indexes tables only had the custom
+// horizontal bar. Render the same overlay affordance vertically for whichever
+// table tab is active; the bar occupies the tab panel's second grid column.
+const activeStructureTableScrollerRef = computed<HTMLElement | null>(() => structureScrollerElement(activeTab.value === "indexes" ? indexesScrollerRef.value : columnsScrollerRef.value) ?? null);
+const activeStructureTableContentRef = computed<HTMLElement | null>(() => (activeTab.value === "indexes" ? indexesTableRef.value : columnsTableRef.value) ?? null);
+const {
+  hasOverflow: hasStructureVerticalOverflow,
+  isScrolling: isStructureVerticalScrollbarScrolling,
+  isDragging: isStructureVerticalScrollbarDragging,
+  thumbStyle: structureVerticalScrollbarThumbStyle,
+  onScroll: onStructureVerticalScrollerScroll,
+  onTrackPointerDown: onStructureVerticalScrollbarTrackPointerDown,
+  onThumbPointerDown: onStructureVerticalScrollbarThumbPointerDown,
+} = useVerticalOverlayScrollbar(activeStructureTableScrollerRef, activeStructureTableContentRef, structureVerticalScrollbarTrackRef);
 const loading = ref(false);
 const saving = ref(false);
 const postSaveRefreshing = ref(false);
@@ -354,6 +378,17 @@ function scheduleDdlEditorInit() {
   });
 }
 
+/**
+ * Applies the DDL display preferences (database qualifier + identifier quoting)
+ * to DDL shown by the structure editor, whether loaded from the server or
+ * generated from the pending structure changes.
+ */
+function formatDdlForDisplay(sql: string, dialect: SqlFormatDialect, generated = false): string {
+  const unqualified = applyDdlDatabaseQualifier(sql, dialect, databaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.database, props.catalog);
+  if (settingsStore.editorSettings.generateSqlQuoteIdentifiers) return unqualified;
+  return generated ? formatGeneratedDdlIdentifierQuotes(unqualified, dialect, false) : omitDdlIdentifierQuotes(unqualified, dialect);
+}
+
 function ddlRequest() {
   return {
     connectionId: props.connectionId,
@@ -372,7 +407,7 @@ async function fetchDdl(force = false) {
     const { ddl } = await loadObjectDdl(ddlRequest(), { force });
     const dialect = sqlFormatDialectForDbType(databaseType.value);
     const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-    rawDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+    rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
     ddlFetched.value = true;
   } catch (e: any) {
     rawDdlContent.value = `-- Error: ${e?.message || e}`;
@@ -1707,7 +1742,10 @@ function restoreStructureScrollPosition(tab = activeTab.value) {
 function onStructureContentScroll(tab: TableInfoTab, event: Event) {
   const target = event.currentTarget;
   if (!(target instanceof HTMLElement)) return;
-  if (tab === "columns" || tab === "indexes") updateStructureHorizontalScrollbar(target);
+  if (tab === "columns" || tab === "indexes") {
+    updateStructureHorizontalScrollbar(target);
+    if (activeTab.value === tab) onStructureVerticalScrollerScroll();
+  }
   const position: TableStructureEditorViewport = {
     scrollTop: Math.max(0, Math.round(target.scrollTop)),
     scrollLeft: Math.max(0, Math.round(target.scrollLeft)),
@@ -1856,7 +1894,7 @@ async function hydrateRestoredDraftFromDatabase() {
         const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog });
         const dialect = sqlFormatDialectForDbType(databaseType.value);
         const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-        rawDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+        rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
         ddlFetched.value = true;
         nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
       } catch {
@@ -2156,7 +2194,7 @@ async function refreshSqlPreview() {
     if (requestId !== sqlPreviewRequestId) return;
     const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : []), ...partitionResult.statements];
     // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
-    pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers !== false || hasSqliteTypeChange.value ? statements : statements.map((statement) => formatGeneratedDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value), false));
+    pendingStatements.value = hasSqliteTypeChange.value ? statements : statements.map((statement) => formatDdlForDisplay(statement, sqlFormatDialectForDbType(databaseType.value), true));
     warnings.value = [...result.warnings, ...ownerResult.warnings, ...partitionResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
@@ -2572,7 +2610,7 @@ async function loadStructure(
           const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog }, { force: options.forceDdl });
           const dialect = sqlFormatDialectForDbType(databaseType.value);
           const formatted = await formatSqlForDisplay(ddl, dialect, settingsStore.editorSettings.sqlFormatter);
-          rawDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, dialect);
+          rawDdlContent.value = formatDdlForDisplay(formatted, dialect);
           ddlFetched.value = true;
           nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
         } catch {
@@ -2872,14 +2910,14 @@ const copyableSourceColumns = computed(() => {
   const existingNames = new Set(columns.value.filter((column) => !column.markedForDrop).map((column) => tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)));
   return copySourceColumns.value.map((column) => ({
     column,
+    details: copySourceColumnDetails(column, databaseType.value),
     alreadyExists: existingNames.has(tableStructureIdentifierComparisonKey(column.name, databaseType.value, databaseInfo)),
   }));
 });
 
 const filteredCopyableSourceColumns = computed(() => {
-  const search = normalizedColumnSearch(copySourceColumnSearch.value);
-  if (!search) return copyableSourceColumns.value;
-  return copyableSourceColumns.value.filter(({ column }) => [column.name, column.data_type, column.comment ?? ""].some((value) => normalizedColumnSearch(value).includes(search)));
+  if (!normalizedColumnSearch(copySourceColumnSearch.value)) return copyableSourceColumns.value;
+  return copyableSourceColumns.value.filter(({ column }) => matchesCopySourceColumnSearch(column, copySourceColumnSearch.value, databaseType.value));
 });
 
 const copyableSourceColumnNames = computed(() => copyableSourceColumns.value.filter(({ alreadyExists }) => !alreadyExists).map(({ column }) => column.name));
@@ -4080,6 +4118,20 @@ async function recordStructureHistory(sql: string, start: number, success: boole
   }
 }
 
+const copyColumnNamesDialogOpen = ref(false);
+// Fields marked for drop no longer exist after saving, so they are excluded.
+const copyableStructureColumnNames = computed(() => structureColumnNamesForCopy(columns.value));
+const copyableStructureColumnComments = computed(() => structureColumnCommentsForCopy(columns.value));
+
+async function copyColumnNamesText(text: string) {
+  try {
+    await copyToClipboard(text);
+    toast(t("grid.copied"));
+  } catch (e: any) {
+    toast(t("grid.copyFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
 async function copyPreviewSql() {
   if (sqlPreviewPending.value || sqlPreviewLoading.value || !previewSqlText.value.trim()) return;
   try {
@@ -4761,8 +4813,8 @@ watch(
 
     <div v-else class="flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
       <div class="min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border">
-        <Tabs v-model="activeTab" class="flex h-full min-h-0 flex-col">
-          <div class="flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
+        <Tabs v-model="activeTab" class="structure-tabs h-full min-h-0">
+          <div class="col-start-1 row-start-1 flex shrink-0 items-center justify-between gap-2 border-b px-2 py-[var(--structure-header-py)]">
             <TabsList>
               <TabsTrigger v-if="tableMetadataCapabilities.ddl && !isCreateMode" value="ddl">
                 DDL
@@ -4841,6 +4893,10 @@ watch(
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.copyColumns") }}
               </Button>
+              <Button v-if="activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="copyableStructureColumnNames.length === 0" @click="copyColumnNamesDialogOpen = true">
+                <ClipboardList :class="structureIconClass" />
+                {{ t("grid.copyColumnNames") }}
+              </Button>
               <Button v-if="isCreateMode && activeTab === 'columns'" size="sm" variant="outline" :class="structureToolbarButtonClass" :disabled="!canAddColumn" @click="applyColumnTemplate(PRESET_FIELDS_TEMPLATE_ID)">
                 <Copy :class="structureIconClass" />
                 {{ t("structureEditor.columnTemplates") }}
@@ -4881,8 +4937,8 @@ watch(
             </div>
           </div>
 
-          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
-            <table class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+          <TabsContent ref="columnsScrollerRef" v-if="tableMetadataCapabilities.columns" value="columns" class="col-start-1 row-start-2 structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('columns', $event)">
+            <table ref="columnsTableRef" class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: visibleColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -5339,7 +5395,7 @@ watch(
             </table>
           </TabsContent>
 
-          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
+          <TabsContent ref="indexesScrollerRef" v-if="tableMetadataCapabilities.indexes" value="indexes" class="col-start-1 row-start-2 structure-table-scroller m-0 min-h-0 flex-1 overflow-auto p-0" @scroll.passive="onStructureContentScroll('indexes', $event)">
             <div v-if="indexesLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5347,7 +5403,7 @@ watch(
             <div v-else-if="secondaryMetadataErrors.indexes" class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
               {{ secondaryMetadataErrors.indexes }}
             </div>
-            <table v-else class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
+            <table v-else ref="indexesTableRef" class="structure-edit-grid border-separate border-spacing-0 text-[length:var(--structure-font-size)] leading-[var(--structure-line-height)]" :style="{ minWidth: indexColWidths.reduce((a, w) => a + w, 0) + 'px' }">
               <thead class="sticky top-0 z-10 bg-background">
                 <tr>
                   <th
@@ -5453,11 +5509,27 @@ watch(
             </table>
           </TabsContent>
 
-          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar" @pointerdown="startStructureHorizontalScrollbarDrag">
+          <div v-if="hasStructureHorizontalOverflow && (activeTab === 'columns' || activeTab === 'indexes')" ref="structureHorizontalScrollbarTrackRef" class="structure-horizontal-scrollbar col-start-1 row-start-3" @pointerdown="startStructureHorizontalScrollbarDrag">
             <div ref="structureHorizontalScrollbarThumbRef" class="structure-horizontal-scrollbar__thumb" />
           </div>
 
-          <TabsContent ref="foreignKeysScrollerRef" v-if="tableMetadataCapabilities.foreignKeys" value="foreignKeys" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('foreignKeys', $event)">
+          <div
+            v-if="hasStructureVerticalOverflow && (activeTab === 'columns' || activeTab === 'indexes')"
+            ref="structureVerticalScrollbarTrackRef"
+            class="structure-vertical-scrollbar col-start-2 row-start-2"
+            :class="{ 'structure-vertical-scrollbar--scrolling': isStructureVerticalScrollbarScrolling, 'structure-vertical-scrollbar--dragging': isStructureVerticalScrollbarDragging }"
+            @pointerdown="onStructureVerticalScrollbarTrackPointerDown"
+          >
+            <div class="structure-vertical-scrollbar__thumb" :style="structureVerticalScrollbarThumbStyle" @pointerdown.stop="onStructureVerticalScrollbarThumbPointerDown" />
+          </div>
+
+          <TabsContent
+            ref="foreignKeysScrollerRef"
+            v-if="tableMetadataCapabilities.foreignKeys"
+            value="foreignKeys"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('foreignKeys', $event)"
+          >
             <div v-if="foreignKeysLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5510,7 +5582,13 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="constraintsScrollerRef" v-if="tableMetadataCapabilities.constraints" value="constraints" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('constraints', $event)">
+          <TabsContent
+            ref="constraintsScrollerRef"
+            v-if="tableMetadataCapabilities.constraints"
+            value="constraints"
+            class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]"
+            @scroll.passive="onStructureContentScroll('constraints', $event)"
+          >
             <div v-if="constraintsLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5536,7 +5614,7 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
+          <TabsContent ref="triggersScrollerRef" v-if="tableMetadataCapabilities.triggers" value="triggers" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('triggers', $event)">
             <div v-if="triggersLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5622,7 +5700,7 @@ watch(
             </div>
           </TabsContent>
 
-          <TabsContent ref="partitionsScrollerRef" v-if="showPartitionsTab" value="partitions" class="m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
+          <TabsContent ref="partitionsScrollerRef" v-if="showPartitionsTab" value="partitions" class="col-start-1 row-start-2 structure-card-scroller m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)]" @scroll.passive="onStructureContentScroll('partitions', $event)">
             <div v-if="isCreateMode" class="space-y-3">
               <label class="flex items-center gap-2 text-[length:var(--structure-font-size)]">
                 <input v-model="createPartitioningEnabled" type="checkbox" />
@@ -5765,7 +5843,14 @@ watch(
             </template>
           </TabsContent>
 
-          <TabsContent ref="ddlScrollerRef" v-if="tableMetadataCapabilities.ddl" value="ddl" force-mount class="relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden" @scroll.passive="onStructureContentScroll('ddl', $event)">
+          <TabsContent
+            ref="ddlScrollerRef"
+            v-if="tableMetadataCapabilities.ddl"
+            value="ddl"
+            force-mount
+            class="col-start-1 row-start-2 structure-card-scroller relative m-0 min-h-0 flex-1 overflow-auto p-[var(--structure-cell-px)] data-[state=inactive]:hidden"
+            @scroll.passive="onStructureContentScroll('ddl', $event)"
+          >
             <div v-if="ddlLoading" class="flex items-center justify-center gap-2 py-10 text-muted-foreground">
               <Loader2 class="h-4 w-4 animate-spin" />
               {{ t("common.loading") }}
@@ -5857,6 +5942,7 @@ watch(
       </Button>
     </div>
 
+    <DataGridCopyColumnNamesDialog v-model:open="copyColumnNamesDialogOpen" :column-names="copyableStructureColumnNames" :database-type="databaseType" :column-comments="copyableStructureColumnComments" @copy="copyColumnNamesText" />
     <Dialog v-model:open="copyColumnsDialogOpen">
       <DialogContent class="max-w-xl">
         <DialogHeader>
@@ -5936,10 +6022,18 @@ watch(
               {{ t("structureEditor.copyColumnsNoMatchingFields") }}
             </div>
             <div v-else class="max-h-72 overflow-y-auto rounded-md border">
-              <label v-for="{ column, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-center gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
-                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="size-4 rounded border-input" />
-                <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
-                <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+              <label v-for="{ column, details, alreadyExists } in filteredCopyableSourceColumns" :key="column.name" class="flex cursor-pointer items-start gap-2 border-b px-3 py-2 last:border-b-0 hover:bg-muted/50" :class="alreadyExists ? 'cursor-not-allowed opacity-60' : ''">
+                <input v-model="selectedCopySourceColumnNames" type="checkbox" :value="column.name" :disabled="alreadyExists" class="mt-0.5 size-4 shrink-0 rounded border-input" />
+                <span class="min-w-0 flex-1">
+                  <span class="flex min-w-0 items-center gap-2">
+                    <span class="min-w-0 flex-1 truncate font-mono text-sm">{{ column.name }}</span>
+                    <span class="shrink-0 text-xs text-muted-foreground">{{ column.data_type }}</span>
+                  </span>
+                  <span v-if="(columnEditorControls.defaultValue && details.defaultValue) || (columnEditorControls.comment && details.comment)" class="mt-0.5 flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+                    <span v-if="columnEditorControls.defaultValue && details.defaultValue" class="min-w-0 truncate" :title="`${t('structureEditor.defaultValue')}: ${details.defaultValue}`">{{ t("structureEditor.defaultValue") }}: {{ details.defaultValue }}</span>
+                    <span v-if="columnEditorControls.comment && details.comment" class="min-w-0 truncate" :title="`${t('structureEditor.comment')}: ${details.comment}`">{{ t("structureEditor.comment") }}: {{ details.comment }}</span>
+                  </span>
+                </span>
                 <Badge v-if="alreadyExists" variant="secondary" class="shrink-0 text-[10px]">{{ t("structureEditor.copyColumnsAlreadyExists") }}</Badge>
               </label>
             </div>
@@ -6049,9 +6143,124 @@ watch(
   background: var(--dbx-editor-selection-background, rgba(59, 130, 246, 0.35)) !important;
 }
 
+/* DDL (CodeMirror) scrollbars match the grid scroller style. */
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar) {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-track) {
+  background: transparent;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb) {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor :deep(.cm-scroller::-webkit-scrollbar-thumb:hover) {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+/* Tab panel layout: toolbar, scrollable content and the custom horizontal bar
+   stack in the first column, while the custom vertical bar occupies the second
+   column of the content row. */
+.structure-tabs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+/* Both native scrollbars are replaced: the horizontal one by
+   `.structure-horizontal-scrollbar`, the vertical one by
+   `.structure-vertical-scrollbar`. */
 .structure-table-scroller::-webkit-scrollbar {
-  width: 8px;
+  width: 0;
   height: 0;
+}
+
+/* Foreign keys / constraints / triggers card lists: both scrollbars match. */
+.structure-card-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-card-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-table-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-table-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+.structure-vertical-scrollbar {
+  position: relative;
+  width: 10px;
+  cursor: default;
+  touch-action: none;
+}
+
+.structure-vertical-scrollbar__thumb {
+  position: absolute;
+  left: 3px;
+  width: 4px;
+  min-height: 24px;
+  border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  transition:
+    left 120ms ease,
+    width 120ms ease,
+    background-color 120ms ease;
+}
+
+.structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+.structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  left: 2px;
+  width: 6px;
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
 .structure-horizontal-scrollbar {
@@ -6060,7 +6269,7 @@ watch(
   flex-shrink: 0;
   cursor: pointer;
   touch-action: none;
-  background: var(--background);
+  background: transparent;
 }
 
 .structure-horizontal-scrollbar__thumb {
@@ -6069,6 +6278,7 @@ watch(
   height: 4px;
   min-width: 24px;
   border-radius: 999px;
+  background: rgba(82, 82, 82, 0.3);
   background: color-mix(in oklab, var(--foreground) 30%, transparent);
   transition:
     top 120ms ease,
@@ -6080,6 +6290,7 @@ watch(
 .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb {
   top: 2px;
   height: 6px;
+  background: rgba(82, 82, 82, 0.48);
   background: color-mix(in oklab, var(--foreground) 48%, transparent);
 }
 
@@ -6129,5 +6340,51 @@ watch(
 /* Inputs are bg-transparent; give them a solid surface on the selected row so fields stay readable. */
 .structure-column-search-current :is(input, button, [role="combobox"], [data-slot="select-trigger"]) {
   background-color: var(--background);
+}
+</style>
+
+<style>
+/* Non-scoped so the scrollbar pseudo-elements on CodeMirror's cm-scroller actually match in WebView2.
+   Matches the grid / card scroller scrollbar style (10px track, 4px thumb, 6px on hover). */
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb {
+  background: rgba(82, 82, 82, 0.3);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover {
+  background: rgba(82, 82, 82, 0.48);
+  background: color-mix(in oklab, var(--foreground) 48%, transparent);
+  border-width: 2px;
+  background-clip: padding-box;
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.3);
+}
+
+html.dbx-legacy-webview.dark .structure-ddl-editor .cm-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-card-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-table-scroller::-webkit-scrollbar-thumb:hover,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar:hover .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-horizontal-scrollbar--dragging .structure-horizontal-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar:hover .structure-vertical-scrollbar__thumb,
+html.dbx-legacy-webview.dark .structure-vertical-scrollbar--dragging .structure-vertical-scrollbar__thumb {
+  background: rgba(212, 212, 216, 0.48);
 }
 </style>
