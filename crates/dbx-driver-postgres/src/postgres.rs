@@ -3666,7 +3666,7 @@ async fn completion_assistant_search_inner(
     }
 
     if candidates.len() < limit && kinds.iter().any(CompletionAssistantObjectKind::is_routine_like) {
-        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
+        let has_proc_prokind = postgres_object_capabilities(&client).await?.has_proc_prokind;
         let rows = if has_proc_prokind {
             let prokinds = postgres_completion_prokinds(&kinds);
             let sql = if exclude_package_members {
@@ -6118,6 +6118,225 @@ async fn postgres_proc_has_prosp(client: &deadpool_postgres::Client) -> Result<b
     Ok(pg_row_try_bool(&row, 0).unwrap_or(false))
 }
 
+/// Catalog capabilities a physical PostgreSQL connection needs in order to list
+/// objects. Each field is a property of the server (plus, for
+/// `can_call_pg_stat_file`, of the connected role), so the value is resolved
+/// once per physical connection and then reused for every later call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PostgresObjectCapabilities {
+    /// PostgreSQL 11's `pg_proc.prokind`. GaussDB-compatible catalogs may expose
+    /// `prosp` alongside it, or instead of it.
+    has_proc_prokind: bool,
+    has_proc_prosp: bool,
+    /// `pg_get_function_identity_arguments` (PG 11+); older servers only have
+    /// the argument-name formatter.
+    has_function_identity_arguments: bool,
+    /// Whether this role may call the two-argument `pg_stat_file(text, boolean)`
+    /// that the relations branch uses. It is superuser-only unless the role is a
+    /// member of `pg_read_server_files`.
+    ///
+    /// This governs relations only: it backs `created_at` and the
+    /// `stat.modification` half of `updated_at` there. Routine timestamps come
+    /// from `pg_xact_commit_timestamp()`, which needs no privilege, so a role
+    /// that cannot read file stats must still receive routine timestamps.
+    can_call_pg_stat_file: bool,
+}
+
+impl PostgresObjectCapabilities {
+    /// Capabilities for a listing that reads none of the catalogs the probe
+    /// covers (a type-only request): the three shape bits are forced off by the
+    /// caller anyway, and the timestamp decision is driven by
+    /// `include_relations` being false, so no field here is consulted.
+    ///
+    /// The precondition is asserted because this value states "cannot read file
+    /// stats". If it ever reached a listing that includes relations, the
+    /// timestamp columns would silently disappear instead of a probe deciding.
+    fn unprobed_type_only(include_relations: bool, include_routines: bool) -> Self {
+        debug_assert!(
+            !(include_relations || include_routines),
+            "unprobed capabilities are only valid for a type-only listing"
+        );
+        Self {
+            has_proc_prokind: false,
+            has_proc_prosp: false,
+            has_function_identity_arguments: false,
+            can_call_pg_stat_file: false,
+        }
+    }
+}
+
+/// Whether an object listing should ask the server for timestamps.
+///
+/// `pg_stat_file()` backs the relations branch only, and it is superuser-only,
+/// so timestamps are unsafe to request exactly when relations are in play
+/// without the privilege. Routine timestamps come from
+/// `pg_xact_commit_timestamp()`, which needs no privilege, and the type branch
+/// has no timestamp columns at all - so a listing without relations must keep
+/// asking, or a role without file-stat access silently loses the `Updated`
+/// column that `track_commit_timestamp = on` would have filled in.
+fn object_listing_includes_timestamps(can_call_pg_stat_file: bool, include_relations: bool) -> bool {
+    can_call_pg_stat_file || !include_relations
+}
+
+/// Whether a failed object listing is worth retrying without timestamps.
+///
+/// The two timestamp variants differ only through the relations and routine
+/// branches, so with timestamps off the retry would re-run byte-identical SQL
+/// and fail the same way for every other scope (a type-only listing emits NULL
+/// timestamps either way). Named rather than inlined so the reason is stated
+/// once and both call sites cannot drift apart.
+fn object_listing_retry_can_differ(include_timestamps: bool, include_relations: bool, include_routines: bool) -> bool {
+    include_timestamps && (include_relations || include_routines)
+}
+
+/// Whether an object-listing failure was the server refusing access to file
+/// stats (`pg_stat_file`), rather than some unrelated fault that also happened
+/// to succeed on the timestamp-free retry.
+///
+/// Only a denial may correct the cached privilege. The two variants differ by
+/// more than `pg_stat_file` (a merged listing also drops
+/// `pg_xact_commit_timestamp`, and a retry can win a race against a statement
+/// timeout or a cancelled query), and downgrading on any of those would hide
+/// the timestamp columns for a role that is in fact allowed to read them.
+///
+/// Matching on text is a deliberate trade-off: the failure reaches this call as
+/// an already-flattened `String`. The same approach is used for the openGauss
+/// optional-catalog probes (`opengauss_optional_package_catalog_error`).
+fn pg_error_reports_denied_file_stats(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("permission denied") || lower.contains("insufficient privilege")
+}
+
+/// All four capabilities in one round trip.
+///
+/// The first three predicates are exactly the catalog reads the individual
+/// probes perform, so combining them cannot widen the compatibility surface.
+/// The privilege lookup resolves `pg_stat_file` by oid inside `pg_proc`, so it
+/// never raises a name-resolution error on a server that lacks the function
+/// (the aggregate simply yields NULL, which `COALESCE` turns into `false`).
+///
+/// The privilege predicate deliberately matches `pronargs = 2`: the caller uses
+/// `pg_stat_file(path, true)`, and a role granted only the one-argument overload
+/// must not be reported as able to read file stats. `bool_and` over that single
+/// matching row (and the empty case, which `COALESCE` maps to `false`) keeps the
+/// answer honest either way.
+fn postgres_object_capabilities_sql() -> &'static str {
+    "SELECT \
+       EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_attribute \
+         WHERE attrelid = 'pg_catalog.pg_proc'::regclass \
+           AND attname = 'prokind' AND NOT attisdropped \
+       ), \
+       EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_attribute \
+         WHERE attrelid = 'pg_catalog.pg_proc'::regclass \
+           AND attname = 'prosp' AND NOT attisdropped \
+       ), \
+       EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'pg_catalog' \
+           AND p.proname = 'pg_get_function_identity_arguments' \
+       ), \
+       COALESCE( \
+         ( \
+           SELECT bool_and(pg_catalog.has_function_privilege(p.oid, 'EXECUTE')) \
+           FROM pg_catalog.pg_proc p \
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'pg_catalog' AND p.proname = 'pg_stat_file' \
+             AND p.pronargs = 2 \
+         ), \
+         false \
+       )"
+}
+
+/// Per-physical-connection cache of [`PostgresObjectCapabilities`]. The
+/// statement-cache pointer keys the entry; the weak reference expires it when
+/// the connection is dropped, so a recycled address can never read stale
+/// capabilities.
+type PostgresObjectCapabilityCache =
+    Mutex<HashMap<usize, (Weak<deadpool_postgres::StatementCache>, PostgresObjectCapabilities)>>;
+
+fn postgres_object_capability_clients() -> &'static PostgresObjectCapabilityCache {
+    static CLIENTS: OnceLock<PostgresObjectCapabilityCache> = OnceLock::new();
+    CLIENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_postgres_object_capabilities(client: &deadpool_postgres::Client) -> Option<PostgresObjectCapabilities> {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut clients = postgres_object_capability_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match clients
+        .get(&key)
+        .and_then(|(cached, capabilities)| Weak::upgrade(cached).map(|cached| (cached, *capabilities)))
+    {
+        Some((cached, capabilities)) if Arc::ptr_eq(&cached, statement_cache) => Some(capabilities),
+        _ => {
+            clients.remove(&key);
+            None
+        }
+    }
+}
+
+fn store_postgres_object_capabilities(client: &deadpool_postgres::Client, capabilities: PostgresObjectCapabilities) {
+    let statement_cache = &client.statement_cache;
+    let key = Arc::as_ptr(statement_cache) as usize;
+    let mut clients = postgres_object_capability_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    clients.retain(|_, (cached, _)| cached.strong_count() > 0);
+    clients.insert(key, (Arc::downgrade(statement_cache), capabilities));
+}
+
+/// Resolve (and cache) the catalog capabilities of `client`'s physical
+/// connection.
+///
+/// Before this existed, listing an object group ran three independent catalog
+/// probes (six round trips) and then, for any schema containing relations, a
+/// query that was guaranteed to fail for a non-superuser role followed by an
+/// identical retry without timestamps (two more). All of that is now one
+/// cached round trip, and a relation-including listing only asks for
+/// `pg_stat_file()` stats when the role can actually call it. Routine-only and
+/// type-only listings are unaffected by that privilege: they request their
+/// timestamps unconditionally (or have none), so they cannot fail on it.
+///
+/// On a server where the combined probe is not supported the individual probes
+/// are still used, and timestamps are still attempted, so behaviour degrades to
+/// exactly what it was before.
+async fn postgres_object_capabilities(
+    client: &deadpool_postgres::Client,
+) -> Result<PostgresObjectCapabilities, String> {
+    if let Some(capabilities) = cached_postgres_object_capabilities(client) {
+        return Ok(capabilities);
+    }
+    let capabilities = match postgres_query_one_cached(client, postgres_object_capabilities_sql(), &[]).await {
+        Ok(row) => PostgresObjectCapabilities {
+            has_proc_prokind: pg_row_try_bool(&row, 0).unwrap_or(false),
+            has_proc_prosp: pg_row_try_bool(&row, 1).unwrap_or(false),
+            has_function_identity_arguments: pg_row_try_bool(&row, 2).unwrap_or(false),
+            // Conservative: an undecodable privilege column must not silently
+            // drop the timestamp columns. If the guess is wrong the object-list
+            // fallback records the real answer for this connection.
+            can_call_pg_stat_file: pg_row_try_bool(&row, 3).unwrap_or(true),
+        },
+        Err(error) => {
+            log::warn!(
+                "[postgres][object_capabilities] combined probe failed, falling back to per-catalog probes: {}",
+                pg_error_to_string(error)
+            );
+            PostgresObjectCapabilities {
+                has_proc_prokind: postgres_proc_has_prokind(client).await?,
+                has_proc_prosp: postgres_proc_has_prosp(client).await?,
+                has_function_identity_arguments: postgres_has_function_identity_arguments(client).await?,
+                // The privilege could not be proven, so keep the historical
+                // behaviour of attempting timestamps and falling back on
+                // failure rather than silently dropping the columns.
+                can_call_pg_stat_file: true,
+            }
+        }
+    };
+    store_postgres_object_capabilities(client, capabilities);
+    Ok(capabilities)
+}
+
 async fn list_objects_rows(
     client: &deadpool_postgres::Client,
     schema: &str,
@@ -6145,7 +6364,12 @@ async fn list_objects_rows(
         // cannot serve); skip the round-trip instead of executing empty SQL.
         return Ok(Vec::new());
     }
-    postgres_query_cached(client, &sql, &[&schema]).await.map_err(|e| e.to_string())
+    // `pg_error_to_string_plain`, not `e.to_string()`: the latter renders every
+    // server-side failure as the literal `db error` (tokio-postgres' Display for
+    // its `Db` kind), which hides the reason from both the logs and the
+    // timestamp-fallback decision below. The plain form deliberately omits the
+    // cursor marker, since this SQL is not what the user is editing.
+    postgres_query_cached(client, &sql, &[&schema]).await.map_err(pg_error_to_string_plain)
 }
 
 pub async fn list_objects(
@@ -6159,24 +6383,34 @@ pub async fn list_objects(
     // types are implementation details and are never custom types.
     let include_custom_types = include_custom_types && !is_postgres_system_schema(schema);
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    // Routine catalog probes are only needed when the routine branch runs.
-    // Skipping them for relation/type-only requests avoids three extra
-    // pg_proc/pg_attribute round-trips and keeps compatible catalogs that lack
-    // prokind/prosp from breaking a plain type listing.
+    // One cached round trip resolves every capability this call needs: the
+    // routine catalog columns, the identity-argument formatter, and whether
+    // object timestamps are readable at all. Expanding a sidebar runs this per
+    // object group, so caching it per physical connection is what keeps the
+    // later groups free.
+    // A type-only listing reads none of the catalogs the probe covers, so don't
+    // pay for it or inherit its failure modes.
+    let capabilities = if include_relations || include_routines {
+        postgres_object_capabilities(&client).await?
+    } else {
+        PostgresObjectCapabilities::unprobed_type_only(include_relations, include_routines)
+    };
+    // Routine catalog details are only needed when the routine branch runs;
+    // forcing them off for relation/type-only requests keeps compatible
+    // catalogs that lack prokind/prosp from breaking a plain type listing.
     let (has_proc_prokind, has_proc_prosp, has_function_identity_arguments) = if include_routines {
-        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
-        // Some GaussDB-compatible catalogs expose prosp alongside, or instead of,
-        // PostgreSQL 11's prokind. Treat prosp as an extra procedure signal.
-        let has_proc_prosp = postgres_proc_has_prosp(&client).await?;
-        let has_function_identity_arguments = postgres_has_function_identity_arguments(&client).await?;
-        (has_proc_prokind, has_proc_prosp, has_function_identity_arguments)
+        (capabilities.has_proc_prokind, capabilities.has_proc_prosp, capabilities.has_function_identity_arguments)
     } else {
         (false, false, false)
     };
+    // Timestamps are only unsafe on a relations query without file-stat access;
+    // routine timestamps need no privilege and a type-only listing never had
+    // any, so the decision cannot be a plain copy of the privilege bit.
+    let include_timestamps = object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, include_relations);
     let rows = match list_objects_rows(
         &client,
         schema,
-        true,
+        include_timestamps,
         has_proc_prokind,
         has_proc_prosp,
         has_function_identity_arguments,
@@ -6188,7 +6422,9 @@ pub async fn list_objects(
     .await
     {
         Ok(rows) => rows,
-        Err(primary_error) => {
+        Err(primary_error)
+            if object_listing_retry_can_differ(include_timestamps, include_relations, include_routines) =>
+        {
             log::debug!("[postgres][list_objects:timestamp-fallback] primary_error={}", primary_error);
             match list_objects_rows(
                 &client,
@@ -6204,11 +6440,38 @@ pub async fn list_objects(
             )
             .await
             {
-                Ok(rows) => rows,
+                Ok(rows) => {
+                    // Only a real denial may correct the cached privilege. Any
+                    // other failure that the timestamp-free retry happens to
+                    // survive (a cancelled query, a statement timeout, a merged
+                    // listing whose routine timestamp was at fault) must not
+                    // mark a privileged role as unable to read file stats, or
+                    // its timestamp columns would silently disappear.
+                    if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
+                        store_postgres_object_capabilities(
+                            &client,
+                            PostgresObjectCapabilities { can_call_pg_stat_file: false, ..capabilities },
+                        );
+                    }
+                    rows
+                }
                 Err(fallback_error) => {
                     return Err(format!("{primary_error}; timestamp fallback failed: {fallback_error}"));
                 }
             }
+        }
+        Err(primary_error) => {
+            // The retry would re-run identical SQL, so it is skipped rather than
+            // paid for. Logged because its absence otherwise looks like the
+            // fallback silently stopped working.
+            log::debug!(
+                "[postgres][list_objects:no-timestamp-variant] include_timestamps={} include_relations={} include_routines={} primary_error={}",
+                include_timestamps,
+                include_relations,
+                include_routines,
+                primary_error
+            );
+            return Err(primary_error);
         }
     };
 
@@ -6227,18 +6490,21 @@ pub async fn list_opengauss_objects(
 ) -> Result<Vec<ObjectInfo>, String> {
     let include_custom_types = include_custom_types && !is_postgres_system_schema(schema);
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let capabilities = if include_relations || include_routines {
+        postgres_object_capabilities(&client).await?
+    } else {
+        PostgresObjectCapabilities::unprobed_type_only(include_relations, include_routines)
+    };
     let (has_proc_prokind, has_proc_prosp, has_function_identity_arguments) = if include_routines {
-        let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
-        let has_proc_prosp = postgres_proc_has_prosp(&client).await?;
-        let has_function_identity_arguments = postgres_has_function_identity_arguments(&client).await?;
-        (has_proc_prokind, has_proc_prosp, has_function_identity_arguments)
+        (capabilities.has_proc_prokind, capabilities.has_proc_prosp, capabilities.has_function_identity_arguments)
     } else {
         (false, false, false)
     };
+    let include_timestamps = object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, include_relations);
     let rows = match list_objects_rows(
         &client,
         schema,
-        true,
+        include_timestamps,
         has_proc_prokind,
         has_proc_prosp,
         has_function_identity_arguments,
@@ -6250,7 +6516,9 @@ pub async fn list_opengauss_objects(
     .await
     {
         Ok(rows) => rows,
-        Err(primary_error) => {
+        Err(primary_error)
+            if object_listing_retry_can_differ(include_timestamps, include_relations, include_routines) =>
+        {
             log::debug!("[postgres][list_opengauss_objects:timestamp-fallback] primary_error={}", primary_error);
             match list_objects_rows(
                 &client,
@@ -6266,11 +6534,29 @@ pub async fn list_opengauss_objects(
             )
             .await
             {
-                Ok(rows) => rows,
+                Ok(rows) => {
+                    if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
+                        store_postgres_object_capabilities(
+                            &client,
+                            PostgresObjectCapabilities { can_call_pg_stat_file: false, ..capabilities },
+                        );
+                    }
+                    rows
+                }
                 Err(fallback_error) => {
                     return Err(format!("{primary_error}; timestamp fallback failed: {fallback_error}"));
                 }
             }
+        }
+        Err(primary_error) => {
+            log::debug!(
+                "[postgres][list_opengauss_objects:no-timestamp-variant] include_timestamps={} include_relations={} include_routines={} primary_error={}",
+                include_timestamps,
+                include_relations,
+                include_routines,
+                primary_error
+            );
+            return Err(primary_error);
         }
     };
 
@@ -9527,7 +9813,7 @@ pub async fn list_functions(pool: &Pool, schema: &str) -> Result<Vec<FunctionInf
     // Use pg_proc + pg_get_functiondef() instead of information_schema.routines
     // for reliable function definition retrieval (information_schema.routines.routine_definition
     // is NULL for non-SQL functions like plpgsql)
-    let has_proc_prokind = postgres_proc_has_prokind(&client).await?;
+    let has_proc_prokind = postgres_object_capabilities(&client).await?.has_proc_prokind;
     let rows = postgres_query_cached(&client, postgres_functions_sql(has_proc_prokind), &[&schema])
         .await
         .map_err(|e| e.to_string())?;
@@ -14869,6 +15155,125 @@ mod tests {
         assert!(sql.contains("pg_catalog.pg_attribute"));
         assert!(sql.contains("'pg_catalog.pg_proc'::regclass"));
         assert!(sql.contains("attname = 'prosp'"));
+    }
+
+    #[test]
+    fn object_capabilities_sql_combines_catalog_and_privilege_probes() {
+        let sql = postgres_object_capabilities_sql();
+        // The three catalog questions the individual probes answer.
+        assert!(sql.contains("attname = 'prokind'"));
+        assert!(sql.contains("attname = 'prosp'"));
+        assert!(sql.contains("p.proname = 'pg_get_function_identity_arguments'"));
+        // The privilege question, resolved by oid so it cannot raise a
+        // name-resolution error when pg_stat_file is missing.
+        assert!(sql.contains("pg_catalog.has_function_privilege(p.oid, 'EXECUTE')"));
+        assert!(sql.contains("p.proname = 'pg_stat_file'"));
+        assert!(sql.contains("COALESCE"));
+        // ...and narrowed to the two-argument overload the caller actually
+        // invokes, so a grant on the one-argument overload cannot over-promise.
+        assert!(sql.contains("p.pronargs = 2"));
+        assert!(sql.contains("bool_and("));
+        assert!(!sql.contains("bool_or("));
+    }
+
+    #[test]
+    fn object_listing_retry_is_skipped_when_both_variants_are_identical() {
+        // Timestamps off: the retry re-runs the same SQL, so it must be skipped.
+        assert!(!object_listing_retry_can_differ(false, true, true));
+        assert!(!object_listing_retry_can_differ(false, true, false));
+        assert!(!object_listing_retry_can_differ(false, false, true));
+        // Timestamps on, but a type-only listing: NULL either way, so no retry.
+        assert!(!object_listing_retry_can_differ(true, false, false));
+        // Timestamps on and a branch that actually carries them.
+        assert!(object_listing_retry_can_differ(true, true, false));
+        assert!(object_listing_retry_can_differ(true, false, true));
+        assert!(object_listing_retry_can_differ(true, true, true));
+    }
+
+    #[test]
+    fn denied_file_stats_is_recognised_only_for_privilege_failures() {
+        // The reason the downgrade path exists, in the shape the driver sees it:
+        // pg_error_to_string_plain renders a DbError as "{severity}: {message}".
+        assert!(pg_error_reports_denied_file_stats("ERROR: permission denied for function pg_stat_file"));
+        assert!(pg_error_reports_denied_file_stats("ERROR: insufficient privilege"));
+
+        // The trap this guard avoids: `list_objects_rows` used to flatten every
+        // server error with `tokio_postgres::Error::to_string()`, which renders
+        // the whole `Db` kind as the literal "db error". Matching on text then
+        // silently never fires and the fail-then-retry loop is re-paid forever --
+        // the very regression the capability caching was added to remove.
+        assert!(!pg_error_reports_denied_file_stats("db error"));
+
+        // Unrelated failures must not be mistaken for a denial: downgrading on
+        // them would hide the timestamp columns for a permitted role.
+        assert!(!pg_error_reports_denied_file_stats("ERROR: canceling statement due to statement timeout"));
+        assert!(!pg_error_reports_denied_file_stats("error communicating with the server"));
+        assert!(!pg_error_reports_denied_file_stats("ERROR: relation \"t\" does not exist"));
+    }
+
+    #[test]
+    fn unprobed_capabilities_are_only_accepted_for_type_only_listings() {
+        let capabilities = PostgresObjectCapabilities::unprobed_type_only(false, false);
+        // A type-only listing requests timestamps unconditionally; this value's
+        // privilege bit must not be what decides that.
+        assert!(!capabilities.can_call_pg_stat_file);
+        assert!(object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, false));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unprobed capabilities are only valid for a type-only listing")]
+    fn unprobed_capabilities_are_rejected_for_relation_listings() {
+        // Guards the silent-loss footgun: these capabilities report "cannot read
+        // file stats", so reaching a relations listing would drop its timestamp
+        // columns without ever probing the connection.
+        let _ = PostgresObjectCapabilities::unprobed_type_only(true, false);
+    }
+
+    #[test]
+    fn object_listing_keeps_timestamps_for_routine_only_requests_without_file_stats() {
+        // Regression: gating timestamps on the pg_stat_file privilege alone
+        // dropped routine `updated_at` for non-superusers, even though routine
+        // timestamps come from pg_xact_commit_timestamp() and need no privilege.
+        // It only showed up under `track_commit_timestamp = on`, which is the
+        // single setting that makes the column non-NULL in the first place.
+        assert!(object_listing_includes_timestamps(false, false));
+        assert!(!object_listing_includes_timestamps(false, true));
+        assert!(object_listing_includes_timestamps(true, true));
+        assert!(object_listing_includes_timestamps(true, false));
+    }
+
+    #[test]
+    fn routine_only_sql_timestamps_never_touch_pg_stat_file() {
+        // The assumption behind the test above: the routine branches take their
+        // timestamps from pg_xact_commit_timestamp(), so requesting them cannot
+        // fail on the file-stat privilege. Every variant is checked so a future
+        // routine branch cannot silently reintroduce pg_stat_file.
+        // Routine-only requests: include_relations = false, so pg_stat_file is
+        // not in the statement at all. Each variant differs only in which
+        // pg_proc catalog shape the server exposes.
+        let variants = [(true, true), (true, false), (false, true), (false, false)];
+        for (has_proc_prokind, has_proc_prosp) in variants {
+            let with = list_objects_sql(true, has_proc_prokind, has_proc_prosp, true, false, true, false, false);
+            assert!(with.contains("pg_xact_commit_timestamp"), "variant {has_proc_prokind}/{has_proc_prosp}");
+            assert!(!with.contains("pg_stat_file"), "variant {has_proc_prokind}/{has_proc_prosp}");
+            let without = list_objects_sql(false, has_proc_prokind, has_proc_prosp, true, false, true, false, false);
+            assert!(without.contains("NULL::text AS updated_at"));
+        }
+    }
+
+    #[test]
+    fn object_capabilities_sql_column_order_matches_row_indices() {
+        // `postgres_object_capabilities` reads columns 0..=3 in this order;
+        // swapping two predicates here would silently cross the wires.
+        let sql = postgres_object_capabilities_sql();
+        let prokind = sql.find("attname = 'prokind'").expect("prokind predicate");
+        let prosp = sql.find("attname = 'prosp'").expect("prosp predicate");
+        let identity = sql.find("p.proname = 'pg_get_function_identity_arguments'").expect("identity predicate");
+        let privilege = sql.find("has_function_privilege").expect("privilege predicate");
+        assert!(prokind < prosp, "prokind must be column 0");
+        assert!(prosp < identity, "prosp must be column 1");
+        assert!(identity < privilege, "identity arguments must be column 2");
     }
 
     #[test]
