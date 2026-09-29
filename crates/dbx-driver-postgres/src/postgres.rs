@@ -1508,6 +1508,12 @@ fn pg_error_to_string_plain(err: tokio_postgres::Error) -> String {
     err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
 }
 
+/// Borrowing form of [`pg_error_to_string_plain`], for call sites that must
+/// classify an error before deciding how to own it.
+fn pg_error_message(err: &tokio_postgres::Error) -> String {
+    err.as_db_error().map(ToString::to_string).unwrap_or_else(|| err.to_string())
+}
+
 /// Tries each SQL tier in `tiers` in order (most-capable first), via `run`,
 /// returning the first tier that succeeds. Every driver-compat query in this
 /// module (a "does this server have the newer catalog column" primary/compat
@@ -3647,8 +3653,8 @@ async fn completion_assistant_search_inner(
         .await
         {
             Ok(rows) => rows,
-            Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => Vec::new(),
-            Err(error) => return Err(error.to_string()),
+            Err(error) if opengauss_optional_package_catalog_unusable(&error) => Vec::new(),
+            Err(error) => return Err(pg_error_to_string_plain(error)),
         };
         for row in rows {
             candidates.push(CompletionAssistantCandidate {
@@ -6139,30 +6145,28 @@ struct PostgresObjectCapabilities {
     /// `stat.modification` half of `updated_at` there. Routine timestamps come
     /// from `pg_xact_commit_timestamp()`, which needs no privilege, so a role
     /// that cannot read file stats must still receive routine timestamps.
-    can_call_pg_stat_file: bool,
+    ///
+    /// `None` means the privilege was not probed (a listing that reads none of
+    /// the catalogs the probe covers). That is not the same statement as
+    /// `Some(false)`, and must not be treated as one: see
+    /// [`object_listing_includes_timestamps`].
+    can_call_pg_stat_file: Option<bool>,
 }
 
 impl PostgresObjectCapabilities {
     /// Capabilities for a listing that reads none of the catalogs the probe
     /// covers (a type-only request): the three shape bits are forced off by the
-    /// caller anyway, and the timestamp decision is driven by
-    /// `include_relations` being false, so no field here is consulted.
-    ///
-    /// The precondition is asserted because this value states "cannot read file
-    /// stats". If it ever reached a listing that includes relations, the
-    /// timestamp columns would silently disappear instead of a probe deciding.
-    fn unprobed_type_only(include_relations: bool, include_routines: bool) -> Self {
-        debug_assert!(
-            !(include_relations || include_routines),
-            "unprobed capabilities are only valid for a type-only listing"
-        );
-        Self {
-            has_proc_prokind: false,
-            has_proc_prosp: false,
-            has_function_identity_arguments: false,
-            can_call_pg_stat_file: false,
-        }
-    }
+    /// caller anyway, and `can_call_pg_stat_file` stays unknown, which resolves
+    /// to "attempt timestamps". So even if this value were ever reached by a
+    /// listing that includes relations, it degrades to the pre-probe behaviour
+    /// instead of silently dropping the timestamp columns -- the safety does not
+    /// depend on an assertion that release builds would compile away.
+    const UNPROBED: Self = Self {
+        has_proc_prokind: false,
+        has_proc_prosp: false,
+        has_function_identity_arguments: false,
+        can_call_pg_stat_file: None,
+    };
 }
 
 /// Whether an object listing should ask the server for timestamps.
@@ -6174,8 +6178,11 @@ impl PostgresObjectCapabilities {
 /// has no timestamp columns at all - so a listing without relations must keep
 /// asking, or a role without file-stat access silently loses the `Updated`
 /// column that `track_commit_timestamp = on` would have filled in.
-fn object_listing_includes_timestamps(can_call_pg_stat_file: bool, include_relations: bool) -> bool {
-    can_call_pg_stat_file || !include_relations
+fn object_listing_includes_timestamps(can_call_pg_stat_file: Option<bool>, include_relations: bool) -> bool {
+    // `None` is "not probed", not "denied": attempt the timestamps, which is
+    // the behaviour from before the probe existed. An unknown privilege must
+    // never silently drop the columns.
+    can_call_pg_stat_file.unwrap_or(true) || !include_relations
 }
 
 /// Whether a failed object listing is worth retrying without timestamps.
@@ -6200,11 +6207,17 @@ fn object_listing_retry_can_differ(include_timestamps: bool, include_relations: 
 /// the timestamp columns for a role that is in fact allowed to read them.
 ///
 /// Matching on text is a deliberate trade-off: the failure reaches this call as
-/// an already-flattened `String`. The same approach is used for the openGauss
-/// optional-catalog probes (`opengauss_optional_package_catalog_error`).
+/// an already-flattened `String` (where the SQLSTATE is still in hand, the
+/// typed classifier `opengauss_optional_package_catalog_unusable` is used
+/// instead).
+///
+/// The function identifier is matched as well, and it is the most reliable
+/// token: PostgreSQL localizes messages, so a Chinese server reports
+/// "对函数 pg_stat_file 权限不够", where neither English phrase below appears --
+/// but an identifier is never translated.
 fn pg_error_reports_denied_file_stats(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    lower.contains("permission denied") || lower.contains("insufficient privilege")
+    lower.contains("pg_stat_file") || lower.contains("permission denied") || lower.contains("insufficient privilege")
 }
 
 /// All four capabilities in one round trip.
@@ -6315,7 +6328,7 @@ async fn postgres_object_capabilities(
             // Conservative: an undecodable privilege column must not silently
             // drop the timestamp columns. If the guess is wrong the object-list
             // fallback records the real answer for this connection.
-            can_call_pg_stat_file: pg_row_try_bool(&row, 3).unwrap_or(true),
+            can_call_pg_stat_file: Some(pg_row_try_bool(&row, 3).unwrap_or(true)),
         },
         Err(error) => {
             log::warn!(
@@ -6329,7 +6342,7 @@ async fn postgres_object_capabilities(
                 // The privilege could not be proven, so keep the historical
                 // behaviour of attempting timestamps and falling back on
                 // failure rather than silently dropping the columns.
-                can_call_pg_stat_file: true,
+                can_call_pg_stat_file: Some(true),
             }
         }
     };
@@ -6393,7 +6406,7 @@ pub async fn list_objects(
     let capabilities = if include_relations || include_routines {
         postgres_object_capabilities(&client).await?
     } else {
-        PostgresObjectCapabilities::unprobed_type_only(include_relations, include_routines)
+        PostgresObjectCapabilities::UNPROBED
     };
     // Routine catalog details are only needed when the routine branch runs;
     // forcing them off for relation/type-only requests keeps compatible
@@ -6450,7 +6463,7 @@ pub async fn list_objects(
                     if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
                         store_postgres_object_capabilities(
                             &client,
-                            PostgresObjectCapabilities { can_call_pg_stat_file: false, ..capabilities },
+                            PostgresObjectCapabilities { can_call_pg_stat_file: Some(false), ..capabilities },
                         );
                     }
                     rows
@@ -6493,7 +6506,7 @@ pub async fn list_opengauss_objects(
     let capabilities = if include_relations || include_routines {
         postgres_object_capabilities(&client).await?
     } else {
-        PostgresObjectCapabilities::unprobed_type_only(include_relations, include_routines)
+        PostgresObjectCapabilities::UNPROBED
     };
     let (has_proc_prokind, has_proc_prosp, has_function_identity_arguments) = if include_routines {
         (capabilities.has_proc_prokind, capabilities.has_proc_prosp, capabilities.has_function_identity_arguments)
@@ -6538,7 +6551,7 @@ pub async fn list_opengauss_objects(
                     if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
                         store_postgres_object_capabilities(
                             &client,
-                            PostgresObjectCapabilities { can_call_pg_stat_file: false, ..capabilities },
+                            PostgresObjectCapabilities { can_call_pg_stat_file: Some(false), ..capabilities },
                         );
                     }
                     rows
@@ -6590,8 +6603,8 @@ pub async fn list_opengauss_packages(
     .await
     {
         Ok(rows) => rows,
-        Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => return Ok(Vec::new()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) if opengauss_optional_package_catalog_unusable(&error) => return Ok(Vec::new()),
+        Err(error) => return Err(pg_error_to_string_plain(error)),
     };
     let mut objects = Vec::with_capacity(rows.len() * 2);
     for row in rows {
@@ -6623,7 +6636,36 @@ pub async fn list_opengauss_packages(
     Ok(objects)
 }
 
-fn opengauss_optional_package_catalog_error(error: &str) -> bool {
+/// SQLSTATEs that mean an optional openGauss catalog (`gs_package`,
+/// `gs_source`) cannot be used here: insufficient privilege, undefined
+/// table/column, invalid schema name.
+fn opengauss_optional_package_catalog_sqlstate(code: &str) -> bool {
+    matches!(code, "42501" | "42P01" | "42703" | "3F000")
+}
+
+/// Whether a failed optional openGauss catalog probe means the catalog is not
+/// usable (missing relation/schema, or insufficient privileges), so the caller
+/// should degrade -- return no packages, or fall back to `gs_package` -- instead
+/// of surfacing the error. Connection failures and protocol errors are not
+/// swallowed.
+///
+/// The SQLSTATE is inspected first because PostgreSQL localizes message text: a
+/// Chinese server reports "对模式 dbe_pldeveloper 权限不够", which none of the
+/// English phrases below would match. The code is part of the protocol and is
+/// never localized. The text matcher remains for servers that report no code.
+fn opengauss_optional_package_catalog_unusable(error: &tokio_postgres::Error) -> bool {
+    if let Some(db_error) = error.as_db_error() {
+        if opengauss_optional_package_catalog_sqlstate(db_error.code().code()) {
+            return true;
+        }
+    }
+    opengauss_optional_package_catalog_error_text(&pg_error_message(error))
+}
+
+/// Text-only fallback for [`opengauss_optional_package_catalog_unusable`].
+/// English phrases only, so it cannot classify a localized server; prefer the
+/// typed classifier, which also sees the SQLSTATE.
+fn opengauss_optional_package_catalog_error_text(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("permission denied")
         || lower.contains("insufficient privilege")
@@ -6631,14 +6673,6 @@ fn opengauss_optional_package_catalog_error(error: &str) -> bool {
         || lower.contains("undefined table")
         || lower.contains("undefined column")
         || lower.contains("undefined schema")
-}
-
-/// Whether an openGauss gs_source lookup error means the catalog is not usable
-/// (missing relation/schema, or insufficient privileges) so the gs_package
-/// fallback should be attempted instead of surfacing the error. Connection
-/// failures and protocol errors are not swallowed.
-fn opengauss_gs_source_lookup_should_fallback(error: &str) -> bool {
-    opengauss_optional_package_catalog_error(error)
 }
 
 pub async fn opengauss_package_source(
@@ -6674,11 +6708,10 @@ pub async fn opengauss_package_source(
     {
         Ok(rows) => rows,
         Err(error) => {
-            let error = error.to_string();
-            if opengauss_gs_source_lookup_should_fallback(&error) {
+            if opengauss_optional_package_catalog_unusable(&error) {
                 Vec::new()
             } else {
-                return Err(error);
+                return Err(pg_error_to_string_plain(error));
             }
         }
     };
@@ -6855,14 +6888,14 @@ pub async fn opengauss_package_members(
     let identity_rows =
         match postgres_query_cached(&client, opengauss_package_identity_sql(), &[&schema, &package_name]).await {
             Ok(rows) => rows,
-            Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => {
+            Err(error) if opengauss_optional_package_catalog_unusable(&error) => {
                 return Ok(CompletionAssistantResponse {
                     candidates: Vec::new(),
                     incomplete: false,
                     fallback_used: true,
                 });
             }
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(pg_error_to_string_plain(error)),
         };
     let Some(identity_row) = identity_rows.first() else {
         return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
@@ -6886,10 +6919,10 @@ pub async fn opengauss_package_members(
     .await
     {
         Ok(rows) => rows,
-        Err(error) if opengauss_optional_package_catalog_error(&error.to_string()) => {
+        Err(error) if opengauss_optional_package_catalog_unusable(&error) => {
             return Ok(CompletionAssistantResponse { candidates: Vec::new(), incomplete: false, fallback_used: true });
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(pg_error_to_string_plain(error)),
     };
     let candidates = rows
         .iter()
@@ -10925,14 +10958,14 @@ mod tests {
     }
 
     #[test]
-    fn opengauss_gs_source_error_classification_falls_back_only_for_catalog_issues() {
+    fn opengauss_optional_catalog_text_classification_falls_back_only_for_catalog_issues() {
         for message in [
             "ERROR: permission denied for schema dbe_pldeveloper",
             "ERROR: insufficient privilege to query table gs_source",
             "ERROR: relation \"gs_source\" does not exist",
             "ERROR: schema \"dbe_pldeveloper\" does not exist",
         ] {
-            assert!(opengauss_gs_source_lookup_should_fallback(message), "expected fallback for: {message}");
+            assert!(opengauss_optional_package_catalog_error_text(message), "expected fallback for: {message}");
         }
         for message in [
             "connection refused",
@@ -10941,7 +10974,7 @@ mod tests {
             "canceling statement due to statement timeout",
             "syntax error at or near \"SELECT\"",
         ] {
-            assert!(!opengauss_gs_source_lookup_should_fallback(message), "expected no fallback for: {message}");
+            assert!(!opengauss_optional_package_catalog_error_text(message), "expected no fallback for: {message}");
         }
     }
 
@@ -15196,6 +15229,10 @@ mod tests {
         // pg_error_to_string_plain renders a DbError as "{severity}: {message}".
         assert!(pg_error_reports_denied_file_stats("ERROR: permission denied for function pg_stat_file"));
         assert!(pg_error_reports_denied_file_stats("ERROR: insufficient privilege"));
+        // Localized servers translate the message but never the identifier, so
+        // the identifier token is what keeps this working off en_US.
+        assert!(pg_error_reports_denied_file_stats("错误: 对函数 pg_stat_file 权限不够"));
+        assert!(pg_error_reports_denied_file_stats("ERROR: function pg_stat_file(text, boolean) does not exist"));
 
         // The trap this guard avoids: `list_objects_rows` used to flatten every
         // server error with `tokio_postgres::Error::to_string()`, which renders
@@ -15212,22 +15249,30 @@ mod tests {
     }
 
     #[test]
-    fn unprobed_capabilities_are_only_accepted_for_type_only_listings() {
-        let capabilities = PostgresObjectCapabilities::unprobed_type_only(false, false);
-        // A type-only listing requests timestamps unconditionally; this value's
-        // privilege bit must not be what decides that.
-        assert!(!capabilities.can_call_pg_stat_file);
+    fn unprobed_capabilities_never_silently_drop_timestamps() {
+        // The unprobed value leaves the privilege unknown rather than "denied".
+        // Even a relations listing must therefore degrade to attempting
+        // timestamps, so a stray future caller cannot reproduce the silent
+        // column loss this design removed -- and unlike a debug_assert, that
+        // holds in release builds too.
+        let capabilities = PostgresObjectCapabilities::UNPROBED;
+        assert_eq!(capabilities.can_call_pg_stat_file, None);
         assert!(object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, false));
+        assert!(object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, true));
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "unprobed capabilities are only valid for a type-only listing")]
-    fn unprobed_capabilities_are_rejected_for_relation_listings() {
-        // Guards the silent-loss footgun: these capabilities report "cannot read
-        // file stats", so reaching a relations listing would drop its timestamp
-        // columns without ever probing the connection.
-        let _ = PostgresObjectCapabilities::unprobed_type_only(true, false);
+    fn open_gauss_optional_catalog_sqlstate_covers_catalog_availability_errors() {
+        // The locale-independent half of the classification: on a localized
+        // server the message text is translated, so these codes are what
+        // actually decides whether the optional catalog degrades or the whole
+        // schema expansion fails.
+        for code in ["42501", "42P01", "42703", "3F000"] {
+            assert!(opengauss_optional_package_catalog_sqlstate(code), "expected unusable for {code}");
+        }
+        for code in ["42601", "57014", "08006", "23505", ""] {
+            assert!(!opengauss_optional_package_catalog_sqlstate(code), "expected usable for {code}");
+        }
     }
 
     #[test]
@@ -15237,10 +15282,12 @@ mod tests {
         // timestamps come from pg_xact_commit_timestamp() and need no privilege.
         // It only showed up under `track_commit_timestamp = on`, which is the
         // single setting that makes the column non-NULL in the first place.
-        assert!(object_listing_includes_timestamps(false, false));
-        assert!(!object_listing_includes_timestamps(false, true));
-        assert!(object_listing_includes_timestamps(true, true));
-        assert!(object_listing_includes_timestamps(true, false));
+        assert!(object_listing_includes_timestamps(Some(false), false));
+        assert!(!object_listing_includes_timestamps(Some(false), true));
+        assert!(object_listing_includes_timestamps(Some(true), true));
+        assert!(object_listing_includes_timestamps(Some(true), false));
+        // Unprobed is not denial: attempt, never drop.
+        assert!(object_listing_includes_timestamps(None, true));
     }
 
     #[test]
