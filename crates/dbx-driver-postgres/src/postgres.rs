@@ -6361,7 +6361,12 @@ async fn postgres_object_capabilities(
     if let Some(capabilities) = cached_postgres_object_capabilities(client) {
         return Ok(capabilities);
     }
-    let capabilities = match postgres_query_one_cached(client, postgres_object_capabilities_sql(), &[]).await {
+    // Unnamed and unparameterised, like `list_tables`: this is a constant probe
+    // that runs once per physical connection, so a prepared statement would add
+    // a Parse round trip for nothing and grow the statement cache. Measured on
+    // openGauss (where the probe is the only reason a relations-only listing can
+    // cost more than before): prepared = 2 round trips, unnamed = 1.
+    let capabilities = match client.query_typed_one(postgres_object_capabilities_sql(), &[]).await {
         Ok(row) => PostgresObjectCapabilities {
             has_proc_prokind: pg_row_try_bool(&row, 0).unwrap_or(false),
             has_proc_prosp: pg_row_try_bool(&row, 1).unwrap_or(false),
