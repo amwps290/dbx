@@ -6151,38 +6151,60 @@ struct PostgresObjectCapabilities {
     /// `Some(false)`, and must not be treated as one: see
     /// [`object_listing_includes_timestamps`].
     can_call_pg_stat_file: Option<bool>,
+    /// Whether the functions the timestamp expressions call exist on this
+    /// server: `pg_xact_commit_timestamp(xid)` and the `current_setting(text,
+    /// boolean)` (missing_ok) overload. Both the relation and the routine
+    /// timestamp branches reference them, so neither can ask for timestamps
+    /// without them.
+    ///
+    /// `None` means "not probed", with the same meaning as above.
+    has_timestamp_helpers: Option<bool>,
 }
 
 impl PostgresObjectCapabilities {
     /// Capabilities for a listing that reads none of the catalogs the probe
     /// covers (a type-only request): the three shape bits are forced off by the
-    /// caller anyway, and `can_call_pg_stat_file` stays unknown, which resolves
-    /// to "attempt timestamps". So even if this value were ever reached by a
-    /// listing that includes relations, it degrades to the pre-probe behaviour
-    /// instead of silently dropping the timestamp columns -- the safety does not
-    /// depend on an assertion that release builds would compile away.
+    /// caller anyway, and both timestamp capabilities stay unknown, which
+    /// resolves to "attempt timestamps". So even if this value were ever
+    /// reached by a listing that includes relations, it degrades to the
+    /// pre-probe behaviour instead of silently dropping the timestamp columns --
+    /// the safety does not depend on an assertion that release builds would
+    /// compile away.
     const UNPROBED: Self = Self {
         has_proc_prokind: false,
         has_proc_prosp: false,
         has_function_identity_arguments: false,
         can_call_pg_stat_file: None,
+        has_timestamp_helpers: None,
     };
 }
 
 /// Whether an object listing should ask the server for timestamps.
 ///
-/// `pg_stat_file()` backs the relations branch only, and it is superuser-only,
-/// so timestamps are unsafe to request exactly when relations are in play
-/// without the privilege. Routine timestamps come from
-/// `pg_xact_commit_timestamp()`, which needs no privilege, and the type branch
-/// has no timestamp columns at all - so a listing without relations must keep
-/// asking, or a role without file-stat access silently loses the `Updated`
-/// column that `track_commit_timestamp = on` would have filled in.
-fn object_listing_includes_timestamps(can_call_pg_stat_file: Option<bool>, include_relations: bool) -> bool {
-    // `None` is "not probed", not "denied": attempt the timestamps, which is
-    // the behaviour from before the probe existed. An unknown privilege must
-    // never silently drop the columns.
-    can_call_pg_stat_file.unwrap_or(true) || !include_relations
+/// A single flag covers every selected branch, so it may only be set when each
+/// of them can actually produce timestamps:
+///
+/// - the relations branch needs `pg_stat_file(path, true)` (superuser-only
+///   unless the role is in `pg_read_server_files`) *and* the timestamp helpers
+///   behind its `updated_at` COALESCE;
+/// - the routine branch needs only the helpers -- which is why a role without
+///   file-stat access must still receive routine timestamps, and why gating on
+///   the privilege alone silently dropped them;
+/// - the type branch has no timestamp columns at all, so it constrains nothing.
+///
+/// `None` is "not probed", not "denied": it resolves to attempting the
+/// timestamps, which is the behaviour from before the probe existed. An unknown
+/// capability must never silently drop the columns.
+fn object_listing_includes_timestamps(
+    can_call_pg_stat_file: Option<bool>,
+    has_timestamp_helpers: Option<bool>,
+    include_relations: bool,
+    include_routines: bool,
+) -> bool {
+    let helpers = has_timestamp_helpers.unwrap_or(true);
+    let relations_usable = !include_relations || (can_call_pg_stat_file.unwrap_or(true) && helpers);
+    let routines_usable = !include_routines || helpers;
+    relations_usable && routines_usable
 }
 
 /// Whether a failed object listing is worth retrying without timestamps.
@@ -6220,10 +6242,16 @@ fn pg_error_reports_denied_file_stats(error: &str) -> bool {
     lower.contains("pg_stat_file") || lower.contains("permission denied") || lower.contains("insufficient privilege")
 }
 
-/// All four capabilities in one round trip.
+/// All six capabilities in one round trip.
 ///
 /// The first three predicates are exactly the catalog reads the individual
 /// probes perform, so combining them cannot widen the compatibility surface.
+/// The last three ask whether the expressions the timestamp branches build are
+/// usable at all; they are cheap catalog lookups, and answering them up front
+/// is what keeps a server that cannot run them from paying a doomed statement
+/// plus its retry on every listing (openGauss, and the pre-9.5 lineage it came
+/// from, match none of them).
+///
 /// The privilege lookup resolves `pg_stat_file` by oid inside `pg_proc`, so it
 /// never raises a name-resolution error on a server that lacks the function
 /// (the aggregate simply yields NULL, which `COALESCE` turns into `false`).
@@ -6260,6 +6288,19 @@ fn postgres_object_capabilities_sql() -> &'static str {
              AND p.pronargs = 2 \
          ), \
          false \
+       ), \
+       EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'pg_catalog' \
+           AND p.proname = 'pg_xact_commit_timestamp' \
+       ), \
+       EXISTS ( \
+         SELECT 1 FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = 'pg_catalog' \
+           AND p.proname = 'current_setting' \
+           AND p.pronargs = 2 \
        )"
 }
 
@@ -6329,6 +6370,12 @@ async fn postgres_object_capabilities(
             // drop the timestamp columns. If the guess is wrong the object-list
             // fallback records the real answer for this connection.
             can_call_pg_stat_file: Some(pg_row_try_bool(&row, 3).unwrap_or(true)),
+            // Both are `EXISTS(...)`, so they always decode; a failure here is
+            // treated as "present" (attempt, and let the object-list fallback
+            // correct it) rather than skipping the columns outright.
+            has_timestamp_helpers: Some(
+                pg_row_try_bool(&row, 4).unwrap_or(true) && pg_row_try_bool(&row, 5).unwrap_or(true),
+            ),
         },
         Err(error) => {
             log::warn!(
@@ -6343,6 +6390,7 @@ async fn postgres_object_capabilities(
                 // behaviour of attempting timestamps and falling back on
                 // failure rather than silently dropping the columns.
                 can_call_pg_stat_file: Some(true),
+                has_timestamp_helpers: Some(true),
             }
         }
     };
@@ -6419,7 +6467,12 @@ pub async fn list_objects(
     // Timestamps are only unsafe on a relations query without file-stat access;
     // routine timestamps need no privilege and a type-only listing never had
     // any, so the decision cannot be a plain copy of the privilege bit.
-    let include_timestamps = object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, include_relations);
+    let include_timestamps = object_listing_includes_timestamps(
+        capabilities.can_call_pg_stat_file,
+        capabilities.has_timestamp_helpers,
+        include_relations,
+        include_routines,
+    );
     let rows = match list_objects_rows(
         &client,
         schema,
@@ -6513,7 +6566,12 @@ pub async fn list_opengauss_objects(
     } else {
         (false, false, false)
     };
-    let include_timestamps = object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, include_relations);
+    let include_timestamps = object_listing_includes_timestamps(
+        capabilities.can_call_pg_stat_file,
+        capabilities.has_timestamp_helpers,
+        include_relations,
+        include_routines,
+    );
     let rows = match list_objects_rows(
         &client,
         schema,
@@ -6640,7 +6698,9 @@ pub async fn list_opengauss_packages(
 /// `gs_source`) cannot be used here: insufficient privilege, undefined
 /// table/column, invalid schema name.
 fn opengauss_optional_package_catalog_sqlstate(code: &str) -> bool {
-    matches!(code, "42501" | "42P01" | "42703" | "3F000")
+    // 3F001 is what openGauss reports for `schema ... does not exist` (verified
+    // against openGauss-lite 5.0.1), where PostgreSQL uses 42P01/3F000.
+    matches!(code, "42501" | "42P01" | "42703" | "3F000" | "3F001")
 }
 
 /// Whether a failed optional openGauss catalog probe means the catalog is not
@@ -15207,6 +15267,11 @@ mod tests {
         assert!(sql.contains("p.pronargs = 2"));
         assert!(sql.contains("bool_and("));
         assert!(!sql.contains("bool_or("));
+        // The timestamp helpers the relation and routine branches call: asking
+        // up front is what keeps a server that lacks them (openGauss) from
+        // paying a doomed statement plus its retry on every listing.
+        assert!(sql.contains("p.proname = 'pg_xact_commit_timestamp'"));
+        assert!(sql.contains("p.proname = 'current_setting'"));
     }
 
     #[test]
@@ -15257,8 +15322,41 @@ mod tests {
         // holds in release builds too.
         let capabilities = PostgresObjectCapabilities::UNPROBED;
         assert_eq!(capabilities.can_call_pg_stat_file, None);
-        assert!(object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, false));
-        assert!(object_listing_includes_timestamps(capabilities.can_call_pg_stat_file, true));
+        assert_eq!(capabilities.has_timestamp_helpers, None);
+        for (relations, routines) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(
+                object_listing_includes_timestamps(
+                    capabilities.can_call_pg_stat_file,
+                    capabilities.has_timestamp_helpers,
+                    relations,
+                    routines,
+                ),
+                "unprobed capabilities must not drop timestamps (relations={relations}, routines={routines})"
+            );
+        }
+    }
+
+    #[test]
+    fn open_gauss_optional_catalog_error_text_matches_real_server_messages() {
+        // Messages captured from openGauss-lite 5.0.1 while verifying this. The
+        // server appends "on gaussdb" to relation errors, which the matcher must
+        // still accept; and a localized server would translate them, which is
+        // why the SQLSTATE is consulted first in production.
+        for message in [
+            "ERROR: relation \"pg_catalog.gs_package\" does not exist on gaussdb",
+            "ERROR: schema \"no_such_schema\" does not exist",
+            "ERROR: permission denied for schema dbe_pldeveloper",
+            "ERROR: insufficient privilege to query table gs_source",
+        ] {
+            assert!(opengauss_optional_package_catalog_error_text(message), "expected fallback for: {message}");
+        }
+        // A syntax error is a real failure, not an unavailable catalog: it must
+        // surface instead of silently degrading the schema tree.
+        for message in
+            ["ERROR: syntax error at or near \"FROM\"", "ERROR: canceling statement due to statement timeout"]
+        {
+            assert!(!opengauss_optional_package_catalog_error_text(message), "expected no fallback for: {message}");
+        }
     }
 
     #[test]
@@ -15267,7 +15365,9 @@ mod tests {
         // server the message text is translated, so these codes are what
         // actually decides whether the optional catalog degrades or the whole
         // schema expansion fails.
-        for code in ["42501", "42P01", "42703", "3F000"] {
+        // 3F001 is included because openGauss-lite 5.0.1 reports it for
+        // `schema ... does not exist`, where PostgreSQL uses 42P01/3F000.
+        for code in ["42501", "42P01", "42703", "3F000", "3F001"] {
             assert!(opengauss_optional_package_catalog_sqlstate(code), "expected unusable for {code}");
         }
         for code in ["42601", "57014", "08006", "23505", ""] {
@@ -15282,12 +15382,34 @@ mod tests {
         // timestamps come from pg_xact_commit_timestamp() and need no privilege.
         // It only showed up under `track_commit_timestamp = on`, which is the
         // single setting that makes the column non-NULL in the first place.
-        assert!(object_listing_includes_timestamps(Some(false), false));
-        assert!(!object_listing_includes_timestamps(Some(false), true));
-        assert!(object_listing_includes_timestamps(Some(true), true));
-        assert!(object_listing_includes_timestamps(Some(true), false));
+        let (denied, allowed) = (Some(false), Some(true));
+        // Routines only: the file-stat privilege is irrelevant, so keep them.
+        assert!(object_listing_includes_timestamps(denied, allowed, false, true));
+        // Relations only: the privilege does gate them (the helpers are present
+        // here, as they are on PostgreSQL 9.6+).
+        assert!(!object_listing_includes_timestamps(denied, allowed, true, false));
+        assert!(object_listing_includes_timestamps(allowed, allowed, true, true));
+        // A merged listing still needs file stats for its relations branch.
+        assert!(!object_listing_includes_timestamps(denied, allowed, true, true));
         // Unprobed is not denial: attempt, never drop.
-        assert!(object_listing_includes_timestamps(None, true));
+        assert!(object_listing_includes_timestamps(None, None, true, true));
+    }
+
+    #[test]
+    fn object_listing_skips_timestamps_when_the_timestamp_helpers_are_absent() {
+        // Measured on openGauss-lite 5.0.1: `pg_xact_commit_timestamp` and the
+        // `current_setting(text, boolean)` overload are both missing, so the
+        // relation *and* routine timestamp variants fail outright
+        // ("function current_setting(unknown, boolean) does not exist",
+        // "syntax error at or near CASE" from the LATERAL pg_stat_file join).
+        // Requesting them costs a doomed statement plus its retry every time.
+        let (no_helpers, yes) = (Some(false), Some(true));
+        assert!(!object_listing_includes_timestamps(yes, no_helpers, false, true));
+        assert!(!object_listing_includes_timestamps(yes, no_helpers, true, false));
+        assert!(!object_listing_includes_timestamps(yes, no_helpers, true, true));
+        // A type-only listing carries no timestamps either way, so the missing
+        // helpers must not be the reason it is refused them.
+        assert!(object_listing_includes_timestamps(yes, no_helpers, false, false));
     }
 
     #[test]
@@ -15311,16 +15433,20 @@ mod tests {
 
     #[test]
     fn object_capabilities_sql_column_order_matches_row_indices() {
-        // `postgres_object_capabilities` reads columns 0..=3 in this order;
+        // `postgres_object_capabilities` reads columns 0..=5 in this order;
         // swapping two predicates here would silently cross the wires.
         let sql = postgres_object_capabilities_sql();
         let prokind = sql.find("attname = 'prokind'").expect("prokind predicate");
         let prosp = sql.find("attname = 'prosp'").expect("prosp predicate");
         let identity = sql.find("p.proname = 'pg_get_function_identity_arguments'").expect("identity predicate");
         let privilege = sql.find("has_function_privilege").expect("privilege predicate");
+        let xact = sql.find("p.proname = 'pg_xact_commit_timestamp'").expect("xact predicate");
+        let setting = sql.find("p.proname = 'current_setting'").expect("current_setting predicate");
         assert!(prokind < prosp, "prokind must be column 0");
         assert!(prosp < identity, "prosp must be column 1");
         assert!(identity < privilege, "identity arguments must be column 2");
+        assert!(privilege < xact, "the file-stat privilege must be column 3");
+        assert!(xact < setting, "pg_xact_commit_timestamp must be column 4");
     }
 
     #[test]
