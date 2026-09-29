@@ -6218,28 +6218,30 @@ fn object_listing_retry_can_differ(include_timestamps: bool, include_relations: 
     include_timestamps && (include_relations || include_routines)
 }
 
-/// Whether an object-listing failure was the server refusing access to file
-/// stats (`pg_stat_file`), rather than some unrelated fault that also happened
-/// to succeed on the timestamp-free retry.
+/// Whether a failed object listing implicates the relation branch's file-stat
+/// access, so that this connection should stop asking for relation timestamps.
 ///
-/// Only a denial may correct the cached privilege. The two variants differ by
-/// more than `pg_stat_file` (a merged listing also drops
-/// `pg_xact_commit_timestamp`, and a retry can win a race against a statement
-/// timeout or a cancelled query), and downgrading on any of those would hide
-/// the timestamp columns for a role that is in fact allowed to read them.
+/// The timestamp-free retry succeeding proves the timestamps were at fault, but
+/// not which branch's: a merged listing drops the routine expression too, and the
+/// routine helpers are revocable just like `pg_stat_file` (a REVOKE from PUBLIC
+/// on `pg_xact_commit_timestamp` is enough). Recording a file-stat verdict from a
+/// routine failure would hide the timestamp columns of a role that *can* read
+/// them, so the error has to name the function; a bare "permission denied" is not
+/// evidence, because it would also match the helper functions.
 ///
-/// Matching on text is a deliberate trade-off: the failure reaches this call as
-/// an already-flattened `String` (where the SQLSTATE is still in hand, the
-/// typed classifier `opengauss_optional_package_catalog_unusable` is used
-/// instead).
+/// `pg_stat_file` is the relation branch's only privileged dependency:
+/// `pg_relation_filepath` is PUBLIC-executable (verified on PostgreSQL 16.11:
+/// `proacl` is the default), and the helper functions' privilege is part of
+/// [`PostgresObjectCapabilities::has_timestamp_helpers`], so a listing never asks
+/// for routine timestamps when they are not callable.
 ///
-/// The function identifier is matched as well, and it is the most reliable
-/// token: PostgreSQL localizes messages, so a Chinese server reports
-/// "对函数 pg_stat_file 权限不够", where neither English phrase below appears --
-/// but an identifier is never translated.
-fn pg_error_reports_denied_file_stats(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    lower.contains("pg_stat_file") || lower.contains("permission denied") || lower.contains("insufficient privilege")
+/// Matching the identifier also survives localized servers: PostgreSQL
+/// translates the message ("对函数 pg_stat_file 权限不够") but never an
+/// identifier. Matching on text at all is a deliberate trade-off -- the failure
+/// arrives here as an already-flattened `String`; where the typed error is still
+/// in hand, `opengauss_optional_package_catalog_unusable` classifies by SQLSTATE.
+fn pg_error_implicates_pg_stat_file(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("pg_stat_file")
 }
 
 /// All six capabilities in one round trip.
@@ -6247,10 +6249,12 @@ fn pg_error_reports_denied_file_stats(error: &str) -> bool {
 /// The first three predicates are exactly the catalog reads the individual
 /// probes perform, so combining them cannot widen the compatibility surface.
 /// The last three ask whether the expressions the timestamp branches build are
-/// usable at all; they are cheap catalog lookups, and answering them up front
-/// is what keeps a server that cannot run them from paying a doomed statement
-/// plus its retry on every listing (openGauss, and the pre-9.5 lineage it came
-/// from, match none of them).
+/// actually callable -- the file function by privilege, the helpers by presence
+/// *and* privilege. Asking up front is what keeps a server or a role that cannot
+/// run them from paying a doomed statement plus its retry on every listing
+/// (openGauss, and the pre-9.5 lineage it came from, match none of them), and
+/// checking the helpers' EXECUTE as well means a routine or merged listing can
+/// never fail on a helper privilege and be misread as a file-stat denial.
 ///
 /// The privilege lookup resolves `pg_stat_file` by oid inside `pg_proc`, so it
 /// never raises a name-resolution error on a server that lacks the function
@@ -6289,27 +6293,54 @@ fn postgres_object_capabilities_sql() -> &'static str {
          ), \
          false \
        ), \
-       EXISTS ( \
-         SELECT 1 FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = 'pg_catalog' \
-           AND p.proname = 'pg_xact_commit_timestamp' \
+       COALESCE( \
+         ( \
+           SELECT bool_and(pg_catalog.has_function_privilege(p.oid, 'EXECUTE')) \
+           FROM pg_catalog.pg_proc p \
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'pg_catalog' \
+             AND p.proname = 'pg_xact_commit_timestamp' \
+         ), \
+         false \
        ), \
-       EXISTS ( \
-         SELECT 1 FROM pg_catalog.pg_proc p \
-         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-         WHERE n.nspname = 'pg_catalog' \
-           AND p.proname = 'current_setting' \
-           AND p.pronargs = 2 \
+       COALESCE( \
+         ( \
+           SELECT bool_and(pg_catalog.has_function_privilege(p.oid, 'EXECUTE')) \
+           FROM pg_catalog.pg_proc p \
+           JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+           WHERE n.nspname = 'pg_catalog' \
+             AND p.proname = 'current_setting' \
+             AND p.pronargs = 2 \
+         ), \
+         false \
        )"
+}
+
+/// How long a resolved capability verdict stays valid for one physical
+/// connection.
+///
+/// The catalog-shape fields describe the server, but the privilege fields
+/// describe the *role*, and a role changes while a connection is alive: GRANT /
+/// REVOKE, role membership, and `SET ROLE` run from the SQL editor all change
+/// what the connection may do. Expiring the verdict bounds how long a stale
+/// answer can suppress the timestamp columns, and lets a newly granted privilege
+/// take effect without reconnecting. Expiry costs one catalog round trip per
+/// connection, so the window can afford to be short.
+const POSTGRES_CAPABILITY_TTL: Duration = Duration::from_secs(60);
+
+/// Whether a verdict stored at `stored` is still worth using at `now`. Split out
+/// so the window is testable without a clock.
+fn postgres_capability_is_fresh(stored: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(stored) < POSTGRES_CAPABILITY_TTL
 }
 
 /// Per-physical-connection cache of [`PostgresObjectCapabilities`]. The
 /// statement-cache pointer keys the entry; the weak reference expires it when
 /// the connection is dropped, so a recycled address can never read stale
-/// capabilities.
+/// capabilities. The stored [`Instant`] expires the verdict itself, which is
+/// what makes a privilege change visible -- see [`POSTGRES_CAPABILITY_TTL`].
 type PostgresObjectCapabilityCache =
-    Mutex<HashMap<usize, (Weak<deadpool_postgres::StatementCache>, PostgresObjectCapabilities)>>;
+    Mutex<HashMap<usize, (Weak<deadpool_postgres::StatementCache>, PostgresObjectCapabilities, Instant)>>;
 
 fn postgres_object_capability_clients() -> &'static PostgresObjectCapabilityCache {
     static CLIENTS: OnceLock<PostgresObjectCapabilityCache> = OnceLock::new();
@@ -6319,13 +6350,20 @@ fn postgres_object_capability_clients() -> &'static PostgresObjectCapabilityCach
 fn cached_postgres_object_capabilities(client: &deadpool_postgres::Client) -> Option<PostgresObjectCapabilities> {
     let statement_cache = &client.statement_cache;
     let key = Arc::as_ptr(statement_cache) as usize;
+    let now = Instant::now();
     let mut clients = postgres_object_capability_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     match clients
         .get(&key)
-        .and_then(|(cached, capabilities)| Weak::upgrade(cached).map(|cached| (cached, *capabilities)))
+        .and_then(|(cached, capabilities, stored)| Weak::upgrade(cached).map(|cached| (cached, *capabilities, *stored)))
     {
-        Some((cached, capabilities)) if Arc::ptr_eq(&cached, statement_cache) => Some(capabilities),
+        Some((cached, capabilities, stored))
+            if Arc::ptr_eq(&cached, statement_cache) && postgres_capability_is_fresh(stored, now) =>
+        {
+            Some(capabilities)
+        }
         _ => {
+            // Dropped connection, reused address, or an expired verdict: forget
+            // it so the caller resolves the capabilities again.
             clients.remove(&key);
             None
         }
@@ -6336,8 +6374,8 @@ fn store_postgres_object_capabilities(client: &deadpool_postgres::Client, capabi
     let statement_cache = &client.statement_cache;
     let key = Arc::as_ptr(statement_cache) as usize;
     let mut clients = postgres_object_capability_clients().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    clients.retain(|_, (cached, _)| cached.strong_count() > 0);
-    clients.insert(key, (Arc::downgrade(statement_cache), capabilities));
+    clients.retain(|_, (cached, _, _)| cached.strong_count() > 0);
+    clients.insert(key, (Arc::downgrade(statement_cache), capabilities, Instant::now()));
 }
 
 /// Resolve (and cache) the catalog capabilities of `client`'s physical
@@ -6375,9 +6413,10 @@ async fn postgres_object_capabilities(
             // drop the timestamp columns. If the guess is wrong the object-list
             // fallback records the real answer for this connection.
             can_call_pg_stat_file: Some(pg_row_try_bool(&row, 3).unwrap_or(true)),
-            // Both are `EXISTS(...)`, so they always decode; a failure here is
-            // treated as "present" (attempt, and let the object-list fallback
-            // correct it) rather than skipping the columns outright.
+            // Present *and* executable; both are `COALESCE(bool_and(has_function_privilege(...)), false)`, so
+            // they always decode. A failure to decode is treated as "callable"
+            // (attempt, and let the object-list fallback correct it) rather than
+            // skipping the columns outright.
             has_timestamp_helpers: Some(
                 pg_row_try_bool(&row, 4).unwrap_or(true) && pg_row_try_bool(&row, 5).unwrap_or(true),
             ),
@@ -6512,13 +6551,13 @@ pub async fn list_objects(
             .await
             {
                 Ok(rows) => {
-                    // Only a real denial may correct the cached privilege. Any
-                    // other failure that the timestamp-free retry happens to
-                    // survive (a cancelled query, a statement timeout, a merged
-                    // listing whose routine timestamp was at fault) must not
-                    // mark a privileged role as unable to read file stats, or
-                    // its timestamp columns would silently disappear.
-                    if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
+                    // Only a failure that names the file function may correct the
+                    // verdict. A merged listing drops the routine expression
+                    // too, and a cancelled query or a statement timeout can make
+                    // the retry succeed for reasons unrelated to timestamps;
+                    // blaming file stats for any of those would hide the columns
+                    // on a role that is allowed to read them.
+                    if include_relations && pg_error_implicates_pg_stat_file(&primary_error) {
                         store_postgres_object_capabilities(
                             &client,
                             PostgresObjectCapabilities { can_call_pg_stat_file: Some(false), ..capabilities },
@@ -6611,7 +6650,7 @@ pub async fn list_opengauss_objects(
             .await
             {
                 Ok(rows) => {
-                    if include_relations && pg_error_reports_denied_file_stats(&primary_error) {
+                    if include_relations && pg_error_implicates_pg_stat_file(&primary_error) {
                         store_postgres_object_capabilities(
                             &client,
                             PostgresObjectCapabilities { can_call_pg_stat_file: Some(false), ..capabilities },
@@ -15270,11 +15309,12 @@ mod tests {
         // ...and narrowed to the two-argument overload the caller actually
         // invokes, so a grant on the one-argument overload cannot over-promise.
         assert!(sql.contains("p.pronargs = 2"));
-        assert!(sql.contains("bool_and("));
-        assert!(!sql.contains("bool_or("));
-        // The timestamp helpers the relation and routine branches call: asking
-        // up front is what keeps a server that lacks them (openGauss) from
-        // paying a doomed statement plus its retry on every listing.
+        // The three timestamp questions, each by privilege rather than mere
+        // presence: the relation branch needs `pg_stat_file(path, true)`, and the
+        // helpers must be executable too, or a merged/routine listing could fail
+        // on a helper privilege and look like a file-stat denial.
+        assert_eq!(sql.matches("has_function_privilege(p.oid, 'EXECUTE')").count(), 3);
+        assert_eq!(sql.matches("bool_and(").count(), 3);
         assert!(sql.contains("p.proname = 'pg_xact_commit_timestamp'"));
         assert!(sql.contains("p.proname = 'current_setting'"));
     }
@@ -15294,28 +15334,47 @@ mod tests {
     }
 
     #[test]
-    fn denied_file_stats_is_recognised_only_for_privilege_failures() {
-        // The reason the downgrade path exists, in the shape the driver sees it:
-        // pg_error_to_string_plain renders a DbError as "{severity}: {message}".
-        assert!(pg_error_reports_denied_file_stats("ERROR: permission denied for function pg_stat_file"));
-        assert!(pg_error_reports_denied_file_stats("ERROR: insufficient privilege"));
-        // Localized servers translate the message but never the identifier, so
-        // the identifier token is what keeps this working off en_US.
-        assert!(pg_error_reports_denied_file_stats("错误: 对函数 pg_stat_file 权限不够"));
-        assert!(pg_error_reports_denied_file_stats("ERROR: function pg_stat_file(text, boolean) does not exist"));
+    fn file_stats_blame_requires_the_function_name_not_merely_a_denial() {
+        // The shape the driver sees: pg_error_to_string_plain renders a DbError
+        // as "{severity}: {message}", so a real denial carries the function name.
+        assert!(pg_error_implicates_pg_stat_file("ERROR: permission denied for function pg_stat_file"));
+        // Localized servers translate the message but never the identifier.
+        assert!(pg_error_implicates_pg_stat_file("错误: 对函数 pg_stat_file 权限不够"));
+        assert!(pg_error_implicates_pg_stat_file("ERROR: function pg_stat_file(text, boolean) does not exist"));
+
+        // A denial naming a *different* function must not be read as a file-stat
+        // problem. On a merged listing the retry drops the routine expression
+        // too, so blaming file stats here would record a permanent verdict for a
+        // role that can read file stats and hide its timestamp columns for the
+        // life of the connection.
+        assert!(!pg_error_implicates_pg_stat_file("ERROR: permission denied for function pg_xact_commit_timestamp"));
+        assert!(!pg_error_implicates_pg_stat_file("ERROR: permission denied for function current_setting"));
+        assert!(!pg_error_implicates_pg_stat_file("ERROR: insufficient privilege"));
 
         // The trap this guard avoids: `list_objects_rows` used to flatten every
         // server error with `tokio_postgres::Error::to_string()`, which renders
         // the whole `Db` kind as the literal "db error". Matching on text then
         // silently never fires and the fail-then-retry loop is re-paid forever --
         // the very regression the capability caching was added to remove.
-        assert!(!pg_error_reports_denied_file_stats("db error"));
+        assert!(!pg_error_implicates_pg_stat_file("db error"));
 
-        // Unrelated failures must not be mistaken for a denial: downgrading on
-        // them would hide the timestamp columns for a permitted role.
-        assert!(!pg_error_reports_denied_file_stats("ERROR: canceling statement due to statement timeout"));
-        assert!(!pg_error_reports_denied_file_stats("error communicating with the server"));
-        assert!(!pg_error_reports_denied_file_stats("ERROR: relation \"t\" does not exist"));
+        // Unrelated failures must not be mistaken for a denial either.
+        assert!(!pg_error_implicates_pg_stat_file("ERROR: canceling statement due to statement timeout"));
+        assert!(!pg_error_implicates_pg_stat_file("error communicating with the server"));
+        assert!(!pg_error_implicates_pg_stat_file("ERROR: relation \"t\" does not exist"));
+    }
+
+    #[test]
+    fn capability_verdicts_expire_so_a_late_grant_is_noticed() {
+        // Role privileges are mutable (GRANT/REVOKE, role membership, SET ROLE),
+        // so a verdict may not live as long as the connection does; otherwise a
+        // newly granted EXECUTE would keep being ignored until the connection is
+        // recycled.
+        let now = Instant::now();
+        assert!(postgres_capability_is_fresh(now, now));
+        assert!(postgres_capability_is_fresh(now, now + POSTGRES_CAPABILITY_TTL - Duration::from_secs(1)));
+        assert!(!postgres_capability_is_fresh(now, now + POSTGRES_CAPABILITY_TTL));
+        assert!(!postgres_capability_is_fresh(now, now + POSTGRES_CAPABILITY_TTL * 2));
     }
 
     #[test]
